@@ -1,0 +1,25 @@
+# FastAPI и сервер
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# База данных (async)
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+psycopg2-binary==2.9.9  # Для синхронных скриптов
+alembic==1.13.1
+
+# Конфигурация и валидация
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+email-validator==2.2.0
+
+# HTTP клиенты
+httpx==0.26.0
+aiohttp==3.9.1
+requests==2.31.0  # Для синхронных скриптов
+
+# Утилиты
+python-jose[cryptography]==3.3.0  # Для JWT/OpenID
+passlib[bcrypt]==1.7.4  # Для хеширования паролей (если нужно)

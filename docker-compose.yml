@@ -1,0 +1,10 @@
+services:
+  cons_api:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: cons_api
+    env_file: .env
+    ports:
+      - "7070:7070"
+    restart: unless-stopped
