@@ -9,6 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from .database import Base, engine
 from .config import settings
+# Импортируем все модели для регистрации в Base.metadata
+from . import models  # noqa: F401
 
 # Версия миграции для отслеживания
 MIGRATION_VERSION = "v1.0.0"
@@ -30,11 +32,68 @@ async def create_schemas():
         print(f"✓ Схемы созданы: {', '.join(SCHEMAS)}")
 
 
+async def table_exists(conn, schema: str, table: str) -> bool:
+    """Проверяет существование таблицы в схеме"""
+    result = await conn.execute(text("""
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_schema = :schema 
+            AND table_name = :table
+        )
+    """), {"schema": schema, "table": table})
+    return result.scalar()
+
+
 async def create_tables():
     """Создает все таблицы через SQLAlchemy (идемпотентно)"""
     async with engine.begin() as conn:
         # Создаем все таблицы из метаданных моделей
         await conn.run_sync(Base.metadata.create_all)
+
+        # Гарантируем наличие новых колонок в cons.clients для обратной совместимости
+        # (только если таблица уже существует)
+        if await table_exists(conn, "cons", "clients"):
+            await conn.execute(text("""
+                ALTER TABLE cons.clients
+                ADD COLUMN IF NOT EXISTS name TEXT
+            """))
+            await conn.execute(text("""
+                ALTER TABLE cons.clients
+                ADD COLUMN IF NOT EXISTS contact_name TEXT
+            """))
+            await conn.execute(text("""
+                ALTER TABLE cons.clients
+                ADD COLUMN IF NOT EXISTS code_abonent TEXT
+            """))
+            await conn.execute(text("""
+                ALTER TABLE cons.clients
+                ADD COLUMN IF NOT EXISTS company_name TEXT
+            """))
+            await conn.execute(text("""
+                ALTER TABLE cons.clients
+                ADD COLUMN IF NOT EXISTS source_id TEXT
+            """))
+            await conn.execute(text("""
+                ALTER TABLE cons.clients
+                ADD COLUMN IF NOT EXISTS chatwoot_pubsub_token TEXT
+            """))
+        
+        # Гарантируем наличие chatwoot_user_id в cons.users
+        # (только если таблица уже существует)
+        if await table_exists(conn, "cons", "users"):
+            await conn.execute(text("""
+                ALTER TABLE cons.users
+                ADD COLUMN IF NOT EXISTS chatwoot_user_id INTEGER
+            """))
+        
+        # Гарантируем наличие consultation_type в cons.cons
+        # (только если таблица уже существует)
+        if await table_exists(conn, "cons", "cons"):
+            await conn.execute(text("""
+                ALTER TABLE cons.cons
+                ADD COLUMN IF NOT EXISTS consultation_type TEXT
+            """))
         
         # Создаем служебную таблицу для отслеживания синхронизаций
         await conn.execute(text("""
@@ -50,6 +109,18 @@ async def create_tables():
 async def seed_initial_data():
     """Заполняет начальные справочные данные (идемпотентно)"""
     async with engine.begin() as conn:
+        # Убеждаемся, что таблица sys.db_migrations существует
+        # (она должна создаваться через create_all, но на всякий случай проверяем)
+        if not await table_exists(conn, "sys", "db_migrations"):
+            # Создаём таблицу, если её нет (на случай, если create_all её не создал)
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS sys.db_migrations (
+                    id SERIAL PRIMARY KEY,
+                    version TEXT UNIQUE NOT NULL,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
+        
         # Регистрируем миграцию
         await conn.execute(text("""
             INSERT INTO sys.db_migrations (version)

@@ -1,0 +1,10 @@
+# Убеждаемся, что crontab всегда в формате LF
+crontab text eol=lf
+
+# Остальные текстовые файлы
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+

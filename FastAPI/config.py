@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from pydantic_settings import BaseSettings
 from pydantic import Field, model_validator
 from functools import lru_cache
@@ -14,16 +15,36 @@ class Settings(BaseSettings):
     DB_USER: str = "postgres"
     DB_PASS: str = "qwerty123"
     
+    # Database Connection Pool
+    DB_POOL_SIZE: int = Field(default=20, description="Базовый размер пула соединений к БД")
+    DB_MAX_OVERFLOW: int = Field(default=10, description="Максимальное количество дополнительных соединений при перегрузке")
+    DB_POOL_TIMEOUT: int = Field(default=30, description="Таймаут ожидания свободного соединения из пула (секунды)")
+    DB_POOL_RECYCLE: int = Field(default=3600, description="Время переиспользования соединений (секунды)")
+    
     # Application
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 7070
     ENV: str = "dev"
     DEBUG: bool = False
+    FRONT_SECRET: str = ""
+    FRONT_BEARER_TOKEN: str = ""
+    
+    # CORS
+    ALLOWED_ORIGINS: str = "*"  # Разрешенные источники через запятую, или "*" для всех
+    
+    # Rate Limiting
+    RATE_LIMIT_PER_MINUTE: int = Field(default=100, description="Общий лимит запросов в минуту")
+    RATE_LIMIT_CREATE_PER_MINUTE: int = Field(default=10, description="Лимит создания консультаций в минуту")
+    
+    # Chatwoot Bot ID (опционально, будет определен автоматически если не указан)
+    CHATWOOT_BOT_ID: Optional[int] = None
     
     # Chatwoot API
     CHATWOOT_API_URL: str = ""
     CHATWOOT_API_TOKEN: str = ""
     CHATWOOT_ACCOUNT_ID: str = ""
+    CHATWOOT_INBOX_ID: Optional[int] = None  # ID inbox для создания conversations (Platform API)
+    CHATWOOT_INBOX_IDENTIFIER: Optional[str] = None  # Identifier inbox для Public API (используется для создания contacts и conversations)
     
     # 1C:ЦЛ API
     ONEC_API_URL: str = ""
@@ -48,6 +69,15 @@ class Settings(BaseSettings):
     OPENID_ISSUER: str = ""
     OPENID_CLIENT_ID: str = ""
     OPENID_CLIENT_SECRET: str = ""
+    
+    # Ограничения на создание консультаций
+    MAX_FUTURE_CONSULTATION_DAYS: int = Field(default=30, description="Максимальное количество дней вперед для создания консультации")
+    
+    # Время для аннулирования консультации
+    CANCEL_CONSULTATION_TIMEOUT_MINUTES: int = Field(default=30, description="Время в минутах с момента создания, в течение которого можно аннулировать консультацию")
+    
+    # Автор по умолчанию для создания ТелефонныйЗвонок в ЦЛ
+    ONEC_DEFAULT_AUTHOR_NAME: str = Field(default="<не определено>", description="Название менеджера (description) из справочника users для использования как Автор_Key при создании консультаций в ЦЛ")
     
     class Config:
         env_file = ".env"

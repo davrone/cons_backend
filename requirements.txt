@@ -23,3 +23,5 @@ requests==2.31.0  # Для синхронных скриптов
 # Утилиты
 python-jose[cryptography]==3.3.0  # Для JWT/OpenID
 passlib[bcrypt]==1.7.4  # Для хеширования паролей (если нужно)
+python-dateutil==2.8.2  # Для парсинга дат
+apscheduler==3.10.4  # Планировщик задач (альтернатива cron)

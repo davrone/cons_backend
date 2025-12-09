@@ -1,4 +1,11 @@
-"""Роуты для работы с тикетами (консультациями)"""
+"""
+Роуты для работы с тикетами (консультациями).
+
+⚠️ DEPRECATED: Этот модуль устарел. Используйте routers.consultations вместо него.
+Все endpoints перенесены в /api/consultations.
+
+Этот файл оставлен для обратной совместимости, но будет удален в будущих версиях.
+"""
 import logging
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,8 +16,9 @@ import uuid
 logger = logging.getLogger(__name__)
 
 from ..database import get_db
-from ..models import Consultation, Client
+from ..models import Consultation, Client, User
 from ..schemas.tickets import TicketCreate, TicketRead, TicketListResponse
+from sqlalchemy.orm import aliased
 from ..services.chatwoot_client import ChatwootClient
 from ..services.onec_client import OneCClient
 
@@ -63,9 +71,10 @@ async def create_ticket(
     # 3. Отправляем в Chatwoot
     chatwoot_client = ChatwootClient()
     try:
+        from ..config import settings
         chatwoot_response = await chatwoot_client.create_conversation(
             source_id=str(client_id) if client_id else None,
-            inbox_id=None,  # Нужно получить из настроек
+            inbox_id=settings.CHATWOOT_INBOX_ID,
             message=ticket.comment or "",
         )
         chatwoot_cons_id = str(chatwoot_response.get("id"))
@@ -74,6 +83,7 @@ async def create_ticket(
         consultation.cons_id = chatwoot_cons_id
     except Exception as e:
         # Если Chatwoot недоступен, оставляем temp ID
+        logger.error(f"Failed to create Chatwoot conversation: {e}", exc_info=True)
         # В реальной системе здесь должна быть retry логика
         pass
     
@@ -111,7 +121,18 @@ async def create_ticket(
     await db.commit()
     await db.refresh(consultation)
     
-    return TicketRead.from_model(consultation)
+    # Получаем ФИО менеджера
+    manager_name = None
+    if consultation.manager:
+        manager_result = await db.execute(
+            select(User.description)
+            .where(User.cl_ref_key == consultation.manager)
+            .where(User.deletion_mark == False)
+            .limit(1)
+        )
+        manager_name = manager_result.scalar_one_or_none()
+    
+    return TicketRead.from_model(consultation, manager_name=manager_name)
 
 
 @router.get("/{cons_id}", response_model=TicketRead)
@@ -128,7 +149,18 @@ async def get_ticket(
     if not consultation:
         raise HTTPException(status_code=404, detail="Ticket not found")
     
-    return TicketRead.from_model(consultation)
+    # Получаем ФИО менеджера
+    manager_name = None
+    if consultation.manager:
+        manager_result = await db.execute(
+            select(User.description)
+            .where(User.cl_ref_key == consultation.manager)
+            .where(User.deletion_mark == False)
+            .limit(1)
+        )
+        manager_name = manager_result.scalar_one_or_none()
+    
+    return TicketRead.from_model(consultation, manager_name=manager_name)
 
 
 @router.get("/clients/{client_id}/tickets", response_model=TicketListResponse)
@@ -152,25 +184,32 @@ async def get_client_tickets(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     
-    # Получаем тикеты
+    # Получаем тикеты с JOIN к users для получения ФИО менеджеров
+    user_alias = aliased(User)
     result = await db.execute(
-        select(Consultation)
+        select(Consultation, user_alias.description)
+        .outerjoin(user_alias, (Consultation.manager == user_alias.cl_ref_key) & (user_alias.deletion_mark == False))
         .where(Consultation.client_id == client_uuid)
         .order_by(Consultation.create_date.desc())
         .offset(skip)
         .limit(limit)
     )
-    consultations = result.scalars().all()
+    rows = result.all()
+    
+    # Формируем список тикетов с manager_name
+    tickets_list = []
+    for consultation, manager_name in rows:
+        tickets_list.append(TicketRead.from_model(consultation, manager_name=manager_name))
     
     # Подсчитываем общее количество
     count_result = await db.execute(
         select(func.count(Consultation.cons_id))
         .where(Consultation.client_id == client_uuid)
     )
-    total = count_result.scalar()
+    total = count_result.scalar() or 0
     
     return TicketListResponse(
-        tickets=[TicketRead.from_model(c) for c in consultations],
+        tickets=tickets_list,
         total=total
     )
 

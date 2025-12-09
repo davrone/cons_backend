@@ -188,6 +188,15 @@ def transform_users(
         cl_ref_key = clean_uuid(row.get("Ref_Key"))
         if not cl_ref_key:
             continue
+        
+        # Фильтрация: не загружаем пользователей с DeletionMark=true, Недействителен=true или Служебный=true
+        deletion_mark = bool(row.get("DeletionMark"))
+        invalid = bool(row.get("Недействителен"))
+        service = bool(row.get("Служебный"))
+        
+        if deletion_mark or invalid or service:
+            logger.debug(f"Skipping user {cl_ref_key}: DeletionMark={deletion_mark}, Недействителен={invalid}, Служебный={service}")
+            continue
 
         lang_keys = user_lang_map.get(cl_ref_key, set())
         consultant = consultant_map.get(cl_ref_key, {})
@@ -316,7 +325,16 @@ async def pull_users():
     skill_rows = transform_skills(skills_raw)
     logger.info("Prepared %s users and %s skill links", len(user_rows), len(skill_rows))
 
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    # ВАЖНО: Настраиваем пул соединений для ETL скрипта
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=2,
+        max_overflow=2,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        pool_timeout=30
+    )
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -325,6 +343,19 @@ async def pull_users():
             skills_inserted = await rebuild_user_skills(db, skill_rows)
             await db.commit()
         logger.info("Users sync completed. Inserted=%s, Updated=%s, Skills=%s", inserted, updated, skills_inserted)
+        
+        # После загрузки пользователей синхронизируем их с Chatwoot
+        logger.info("Starting Chatwoot synchronization for users...")
+        try:
+            # Импортируем и запускаем синхронизацию
+            from FastAPI.catalog_scripts.sync_users_to_chatwoot import sync_all_users
+            # sync_all_users - это async функция, запускаем её через asyncio.run
+            # Но так как мы уже в async контексте, используем await
+            await sync_all_users()
+            logger.info("✓ Chatwoot synchronization completed")
+        except Exception as sync_error:
+            logger.error(f"Failed to sync users with Chatwoot: {sync_error}", exc_info=True)
+            # Не прерываем выполнение, так как основная задача (загрузка из ЦЛ) выполнена
     finally:
         await engine.dispose()
 

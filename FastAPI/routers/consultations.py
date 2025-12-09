@@ -1,22 +1,39 @@
 """Роуты для создания консультаций и управления атрибутами (переносы, оценки)."""
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Optional, List
+from datetime import datetime, timezone, timedelta, date, time
+from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Header
-from sqlalchemy import select
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Header, Body
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select, func, cast, Date, case
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import func
+from sqlalchemy.orm import aliased
 
 from ..database import get_db
-from ..models import Consultation, ConsRedate, ConsRatingAnswer, Client
+from ..dependencies.security import verify_front_secret
+from ..models import (
+    Consultation,
+    ConsRedate,
+    ConsRatingAnswer,
+    Client,
+    OnlineQuestionCat,
+    OnlineQuestion,
+    Call,
+    User,
+    UserMapping,
+)
 from ..schemas.tickets import (
     ConsultationWithClient,
     ConsultationCreate,
     ConsultationResponse,
-    TicketRead,
+    ConsultationRead,
+    ConsultationListResponse,
+    ConsultationCreateSimple,  # Алиас для обратной совместимости
+    ConsultationUpdate,
+    parse_datetime_flexible,
 )
 from ..schemas.consultation_meta import (
     ConsultationRedateCreate,
@@ -24,21 +41,734 @@ from ..schemas.consultation_meta import (
     ConsultationRatingRequest,
     ConsultationRatingResponse,
     ConsultationRatingAnswerPayload,
+    CallRead,
 )
 from ..routers.clients import find_or_create_client
-from ..services.chatwoot_client import ChatwootClient
-from ..services.onec_client import OneCClient
+from ..services.chatwoot_client import ChatwootClient, is_valid_email
+from ..services.onec_client import OneCClient, ConsultationLimitExceeded
 from ..services.consultation_ratings import recalc_consultation_ratings
+from ..services.manager_selector import ManagerSelector
+from ..config import get_settings
+from ..utils.idempotency import (
+    check_idempotency_key,
+    store_idempotency_key,
+    generate_request_hash
+)
+from ..exceptions import (
+    ConsultationError,
+    ValidationError,
+    ChatwootError,
+    OneCError
+)
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_front_secret)])
+
+
+async def _get_manager_name(db: AsyncSession, manager_key: Optional[str]) -> Optional[str]:
+    """
+    Получает ФИО менеджера из таблицы users по его cl_ref_key.
+    
+    Args:
+        db: Сессия БД
+        manager_key: cl_ref_key менеджера (UUID из 1C:ЦЛ)
+    
+    Returns:
+        ФИО менеджера (users.description) или None, если менеджер не найден
+    """
+    if not manager_key:
+        return None
+    
+    try:
+        result = await db.execute(
+            select(User.description)
+            .where(User.cl_ref_key == manager_key)
+            .where(User.deletion_mark == False)
+            .limit(1)
+        )
+        manager_name = result.scalar_one_or_none()
+        return manager_name
+    except Exception as e:
+        logger.warning(f"Failed to get manager name for {manager_key}: {e}")
+        return None
+
+
+def normalize_uuid(uuid_str: Optional[str]) -> Optional[str]:
+    """Нормализует пустые UUID: "00000000-0000-0000-0000-000000000000" → None"""
+    if not uuid_str or uuid_str == "00000000-0000-0000-0000-000000000000":
+        return None
+    return uuid_str
+
+
+async def _get_default_manager_key(db: AsyncSession) -> Optional[str]:
+    """
+    Получает cl_ref_key первого активного менеджера из БД для использования по умолчанию.
+    """
+    result = await db.execute(
+        select(User.cl_ref_key)
+        .where(User.cl_ref_key.isnot(None))
+        .where(User.cl_ref_key != "")
+        .where(User.deletion_mark == False)
+        .limit(1)
+    )
+    manager = result.scalar_one_or_none()
+    return manager
+
+
+async def _check_consultation_limit(
+    db: AsyncSession,
+    code_abonent: Optional[str],
+    org_inn: Optional[str],
+    consultation_date: datetime,
+) -> None:
+    """
+    Проверяет лимит консультаций типа "Консультация по ведению учета" в бэкенде перед отправкой в ЦЛ.
+    
+    Лимит: максимум 3 консультации на один день (по дате консультации).
+    Проверка выполняется по code_abonent для всех user_id этого абонента.
+    Проверяет только консультации типа "Консультация по ведению учета", которые были успешно созданы в ЦЛ (имеют cl_ref_key).
+    
+    Логика проверки:
+    1. Приоритетно проверяет по коду абонента (code_abonent), если он есть
+    2. Если код абонента отсутствует, но есть ИНН - проверяет по ИНН (fallback)
+       Это необходимо для случаев создания консультаций через колл-центр или расширение 1С,
+       когда клиент может быть создан без кода абонента, но уже существует в ЦЛ по ИНН
+    
+    ВАЖНО: 
+    - Проверяет ТОЛЬКО консультации типа "Консультация по ведению учета".
+    - Консультации типа "Техническая поддержка" НЕ учитываются в лимите.
+    - Проверка выполняется по коду абонента (приоритетно), так как код абонента выдается системой
+      и не может быть изменен пользователем, в то время как ИНН может быть изменен во фронтенде.
+    - Если код абонента отсутствует, используется проверка по ИНН для случаев создания через
+      колл-центр или расширение 1С, когда клиент уже существует в ЦЛ, но еще не синхронизирован в БД.
+    
+    Args:
+        db: Сессия БД
+        code_abonent: Код абонента владельца клиента (приоритетно)
+        org_inn: ИНН владельца клиента (fallback, если code_abonent отсутствует)
+        consultation_date: Дата консультации (scheduled_at)
+    
+    Raises:
+        HTTPException: Если лимит превышен (429 Too Many Requests)
+    """
+    if not consultation_date:
+        logger.warning("Cannot check consultation limit: consultation_date is empty")
+        return
+    
+    # Преобразуем дату в дату без времени для сравнения по дню
+    # Учитываем timezone: если дата имеет timezone, нормализуем к UTC перед извлечением даты
+    if consultation_date.tzinfo is not None:
+        # Если есть timezone, нормализуем к UTC
+        consultation_date_utc = consultation_date.astimezone(timezone.utc)
+        consultation_date_only = consultation_date_utc.date()
+    else:
+        # Если нет timezone, используем как есть
+        consultation_date_only = consultation_date.date()
+    
+    # Базовые условия для всех запросов
+    # Проверяем ТОЛЬКО консультации типа "Консультация по ведению учета"
+    base_conditions = [
+        Consultation.start_date.isnot(None),
+        cast(Consultation.start_date, Date) == consultation_date_only,
+        Consultation.cl_ref_key.isnot(None),
+        Consultation.cl_ref_key != "",
+        Consultation.consultation_type == "Консультация по ведению учета"
+    ]
+    
+    count = 0
+    
+    # Приоритетно проверяем по коду абонента (если есть)
+    if code_abonent:
+        OwnerClient = aliased(Client)
+        
+        result = await db.execute(
+            select(func.count(Consultation.cons_id))
+            .join(Client, Consultation.client_id == Client.client_id)
+            .outerjoin(OwnerClient, Client.parent_id == OwnerClient.client_id)
+            .where(
+                case(
+                    (Client.parent_id.isnot(None), OwnerClient.code_abonent),
+                    else_=Client.code_abonent
+                ) == code_abonent
+            )
+            .where(*base_conditions)
+        )
+        count = result.scalar() or 0
+        
+        logger.info(
+            f"Consultation limit check for code_abonent {code_abonent} on date {consultation_date_only}: "
+            f"{count} consultations found (limit: 3)"
+        )
+    
+    # Если код абонента отсутствует, проверяем по ИНН (fallback)
+    # Это необходимо для случаев создания через колл-центр или расширение 1С,
+    # когда клиент уже существует в ЦЛ по ИНН, но еще не синхронизирован в БД с кодом абонента
+    # ВАЖНО: Проверяем по ИНН только если код абонента отсутствует, чтобы не дублировать проверку
+    if not code_abonent and org_inn:
+        result = await db.execute(
+            select(func.count(Consultation.cons_id))
+            .where(Consultation.org_inn == org_inn)
+            .where(*base_conditions)
+        )
+        count = result.scalar() or 0
+        
+        logger.info(
+            f"Consultation limit check for org_inn {org_inn} (fallback, code_abonent absent) on date {consultation_date_only}: "
+            f"{count} consultations found (limit: 3)"
+        )
+    
+    # Если ни код абонента, ни ИНН не указаны - пропускаем проверку
+    if not code_abonent and not org_inn:
+        logger.warning(
+            f"Cannot check consultation limit: both code_abonent and org_inn are empty. "
+            f"Skipping limit check."
+        )
+        return
+    
+    # Лимит: максимум 3 консультации в день
+    if count >= 3:
+        identifier = code_abonent or org_inn
+        identifier_type = "коду абонента" if code_abonent else "ИНН"
+        raise HTTPException(
+            status_code=429,  # Too Many Requests
+            detail=(
+                f"Превышен лимит создания консультаций. "
+                f"Максимум 3 консультации на один день (по дате консультации: {consultation_date_only}). "
+                f"Проверка выполнена по {identifier_type}: {identifier}. "
+                f"Попробуйте выбрать другую дату."
+            )
+        )
+
+
+async def _check_technical_support_limit(
+    db: AsyncSession,
+    client_id: uuid.UUID,
+) -> None:
+    """
+    Проверяет ограничение на создание консультаций типа "Техническая поддержка".
+    
+    Ограничение: максимум 1 открытая консультация одновременно для одного user_id.
+    Проверка выполняется по client_id (user_id = client_id создателя консультации).
+    
+    Статусы, считающиеся открытыми: "open", "pending", None (не закрытые).
+    Статусы, считающиеся закрытыми: "closed", "cancelled", "resolved".
+    
+    Args:
+        db: Сессия БД
+        client_id: UUID клиента (user_id), который создает консультацию
+    
+    Raises:
+        HTTPException: Если уже есть открытая консультация (409 Conflict)
+    """
+    # Проверяем наличие открытых консультаций типа "Техническая поддержка" для данного client_id
+    # Открытые статусы: "open", "pending", None (не закрытые)
+    # Закрытые статусы: "closed", "cancelled", "resolved"
+    result = await db.execute(
+        select(func.count(Consultation.cons_id))
+        .where(Consultation.client_id == client_id)
+        .where(Consultation.consultation_type == "Техническая поддержка")
+        .where(
+            (Consultation.status.is_(None)) |
+            (Consultation.status == "open") |
+            (Consultation.status == "pending")
+        )
+    )
+    count = result.scalar() or 0
+    
+    logger.info(
+        f"Technical support limit check for client_id {client_id}: "
+        f"{count} open consultations found (limit: 1)"
+    )
+    
+    if count >= 1:
+        raise HTTPException(
+            status_code=409,  # Conflict
+            detail=(
+                "Нельзя создать новую заявку на техническую поддержку, "
+                "пока не закрыта предыдущая открытая заявка. "
+                "Пожалуйста, закройте существующую заявку перед созданием новой."
+            )
+        )
+
+
+async def _get_owner_client(db: AsyncSession, client: Client) -> Client:
+    """Возвращает владельца абонента (сам клиент или его родитель)."""
+    if not client:
+        raise HTTPException(status_code=400, detail="Client is required")
+    if not client.parent_id:
+        return client
+    result = await db.execute(
+        select(Client).where(Client.client_id == client.parent_id)
+    )
+    owner = result.scalar_one_or_none()
+    if not owner:
+        raise HTTPException(status_code=400, detail="Owner client not found")
+    return owner
+
+
+def _build_client_display_name(client: Client) -> str:
+    """
+    Читаемое имя клиента для 1С по правилу: CLOBUS + Наименование + КодАбонентаClobus + ИНН.
+    
+    Использует company_name если есть, иначе name или contact_name.
+    """
+    # Используем company_name если есть, иначе name или contact_name
+    base_name = client.company_name or client.name or client.contact_name or "Клиент"
+    
+    parts = ["Clobus", base_name]
+    
+    # Добавляем код абонента если есть
+    if client.code_abonent:
+        parts.append(client.code_abonent)
+    
+    # Добавляем ИНН если есть
+    if client.org_inn:
+        parts.append(f"({client.org_inn})")
+    
+    return " ".join(parts)
+
+
+def _build_contact_hint(client: Client, owner: Client, source: Optional[str]) -> Optional[str]:
+    """Формирует строку для поля 'КакСвязаться'."""
+    phone = client.phone_number or owner.phone_number
+    name = (
+        client.contact_name
+        or client.name
+        or owner.contact_name
+        or owner.name
+    )
+    source_label = source or "web"
+    parts = [part for part in (phone, name, source_label) if part]
+    return " / ".join(parts) if parts else None
+
+
+async def _ensure_owner_synced_with_cl(
+    db: AsyncSession,
+    owner: Client,
+    onec_client: OneCClient,
+) -> Client:
+    """Убеждаемся, что владелец создан в 1С и имеет Ref_Key."""
+    logger.info(f"=== Ensuring owner client is synced with 1C ===")
+    logger.info(f"  Owner client_id: {owner.client_id}")
+    logger.info(f"  Owner cl_ref_key: {owner.cl_ref_key}")
+    logger.info(f"  Owner org_inn: {owner.org_inn}")
+    logger.info(f"  Owner code_abonent: {owner.code_abonent}")
+    
+    if owner.cl_ref_key:
+        logger.info(f"✓ Owner already has cl_ref_key: {owner.cl_ref_key}")
+        return owner
+    
+    if not owner.org_inn:
+        logger.error(f"✗ Owner client {owner.client_id} has no org_inn - cannot sync with 1C")
+        raise HTTPException(status_code=400, detail="Owner client requires INN")
+
+    try:
+        logger.info(f"Searching for existing client in 1C by INN: {owner.org_inn}")
+        existing = await onec_client.find_client_by_inn(owner.org_inn)
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch client from 1C by INN %s: %s. Proceeding without sync.",
+            owner.org_inn,
+            e,
+        )
+        return owner
+
+    if existing:
+        ref_key = existing.get("Ref_Key")
+        logger.info(f"✓ Found existing client in 1C with Ref_Key: {ref_key}")
+        owner.cl_ref_key = ref_key
+        owner.code_abonent = owner.code_abonent or existing.get("КодАбонентаClobus")
+        await db.flush()
+        logger.info(f"✓ Saved cl_ref_key to owner: {ref_key}")
+        return owner
+
+    if not owner.code_abonent:
+        logger.warning(
+            "Owner client %s has no code_abonent. Unable to create in 1C.",
+            owner.client_id,
+        )
+        return owner
+
+    try:
+        logger.info(f"Creating new client in 1C: org_inn={owner.org_inn}, code_abonent={owner.code_abonent}")
+        created = await onec_client.create_client_odata(
+            name=_build_client_display_name(owner),
+            org_inn=owner.org_inn,
+            code_abonent=owner.code_abonent,
+            phone=owner.phone_number,
+            email=owner.email,
+        )
+        logger.info(f"✓ Created client in 1C, response: {created}")
+    except Exception as e:
+        logger.error(
+            "Failed to create client in 1C for %s: %s. Proceeding without sync.",
+            owner.client_id,
+            e,
+            exc_info=True
+        )
+        return owner
+
+    ref_key = created.get("Ref_Key")
+    if not ref_key:
+        logger.error(f"✗ 1C returned response without Ref_Key: {created}")
+        return owner
+    
+    owner.cl_ref_key = ref_key
+    owner.code_abonent = created.get("КодАбонентаClobus") or owner.code_abonent
+    await db.flush()
+    logger.info(f"✓ Saved cl_ref_key to owner: {ref_key}")
+    return owner
+
+
+def _map_importance_to_priority(importance: Optional[int]) -> Optional[str]:
+    """Маппинг importance (1-3) в priority Chatwoot (low/medium/high)."""
+    if importance is None:
+        return None
+    if importance >= 3:
+        return "high"
+    elif importance >= 2:
+        return "medium"
+    return "low"
+
+
+async def _build_chatwoot_custom_attrs(
+    db: AsyncSession,
+    owner: Client,
+    payload: ConsultationWithClient,
+    consultation: Optional[Consultation] = None,
+) -> Dict[str, Any]:
+    """
+    Готовим custom attributes для Conversation в Chatwoot.
+    
+    ВАЖНО: 
+    - НЕ включаем org_inn и client_type - они в Contact, не Conversation
+    - Используем только поля, специфичные для Conversation
+    
+    Custom attributes для Conversation:
+    - code_abonent, topic_name (обязательные - всегда присутствуют, даже если пустые)
+    - number_con (опциональное - добавляется после получения из 1C)
+    - category_name, question_name, date_con, con_end, redate_con, retime_con, type_con, closed_without_con (опционально)
+    """
+    # Обязательные поля - всегда присутствуют, даже если пустые
+    attrs: Dict[str, Any] = {
+        "code_abonent": owner.code_abonent or "",  # Всегда строка, не None
+        "topic_name": payload.consultation.topic or "",  # Всегда строка, не None
+    }
+    
+    # Номер из ЦЛ (если есть) - опциональное поле
+    if consultation and consultation.number:
+        attrs["number_con"] = str(consultation.number)
+    
+    # Опциональные поля из payload
+    # Нормализуем пустые UUID
+    question_cat_key = normalize_uuid(payload.consultation.online_question_cat)
+    question_key = normalize_uuid(payload.consultation.online_question)
+    
+    if question_cat_key:
+        result = await db.execute(
+            select(OnlineQuestionCat.description).where(
+                OnlineQuestionCat.ref_key == question_cat_key
+            )
+        )
+        category_name = result.scalar_one_or_none()
+        if category_name:
+            attrs["category_name"] = str(category_name)
+
+    if question_key:
+        result = await db.execute(
+            select(OnlineQuestion.description).where(
+                OnlineQuestion.ref_key == question_key
+            )
+        )
+        question_name = result.scalar_one_or_none()
+        if question_name:
+            attrs["question_name"] = str(question_name)
+    
+    # Поля из consultation (если есть)
+    if consultation:
+        # Дата консультации - форматируем без timezone для Chatwoot
+        # Используем start_date из consultation, или scheduled_at из payload если start_date еще не установлен
+        date_to_use = consultation.start_date
+        if not date_to_use and payload.consultation.scheduled_at:
+            date_to_use = payload.consultation.scheduled_at
+        
+        if date_to_use:
+            # Используем формат без timezone: YYYY-MM-DDTHH:MM:SS
+            # ВАЖНО: Chatwoot может требовать полный формат с секундами
+            from datetime import timezone
+            dt = date_to_use
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            # Форматируем с секундами (даже если они 00)
+            attrs["date_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        # Конец консультации
+        if consultation.end_date:
+            from datetime import timezone
+            dt = consultation.end_date
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            attrs["con_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        # Дата переноса
+        if consultation.redate:
+            from datetime import timezone
+            dt = consultation.redate
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            attrs["redate_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        # Время переноса
+        if consultation.redate_time:
+            attrs["retime_con"] = consultation.redate_time.strftime("%H:%M")
+        
+        # Тип консультации (маппинг статуса)
+        if consultation.status:
+            # Маппинг статуса в тип консультации
+            status_to_type = {
+                "open": "ВОчередьНаКонсультацию",
+                "pending": "ВОчередьНаКонсультацию",
+                "resolved": "КонсультацияИТС",
+                "closed": "КонсультацияИТС",
+            }
+            attrs["type_con"] = status_to_type.get(consultation.status, consultation.status)
+        
+        # Закрыто без консультации - отправляем только если явно установлено
+        # Chatwoot может не принимать None для булевых полей
+        if hasattr(consultation, 'denied') and consultation.denied is not None:
+            attrs["closed_without_con"] = bool(consultation.denied)
+        
+        # Данные о подписке из owner
+        if owner.subs_id:
+            attrs["subs_id"] = str(owner.subs_id)
+        
+        if owner.subs_start:
+            from datetime import timezone
+            dt = owner.subs_start
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            attrs["subs_start"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        if owner.subs_end:
+            from datetime import timezone
+            dt = owner.subs_end
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            attrs["subs_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        if owner.tariff_id:
+            attrs["tariff_id"] = str(owner.tariff_id)
+        
+        if owner.tariffperiod_id:
+            attrs["tariffperiod_id"] = str(owner.tariffperiod_id)
+
+    # Фильтруем только опциональные поля (None, пустые строки, пустые списки)
+    # Обязательные поля (code_abonent, topic_name) всегда остаются
+    filtered = {}
+    for key, value in attrs.items():
+        # Обязательные поля всегда включаем
+        if key in ("code_abonent", "topic_name"):
+            filtered[key] = value
+        # Опциональные поля включаем только если не пустые
+        elif value not in (None, "", []):
+            filtered[key] = value
+    
+    # Валидация размера и количества custom_attributes для Chatwoot
+    # Chatwoot имеет лимиты на количество и размер custom_attributes
+    # Проверяем перед возвратом
+    total_size = sum(len(str(v)) for v in filtered.values())
+    max_size = 10000  # Примерный лимит Chatwoot (может варьироваться)
+    max_fields = 50  # Примерный лимит количества полей
+    
+    if len(filtered) > max_fields:
+        logger.warning(f"Too many custom_attributes ({len(filtered)}), truncating to {max_fields}")
+        # Оставляем обязательные поля и первые N опциональных
+        required_keys = {"code_abonent", "topic_name"}
+        optional_items = [(k, v) for k, v in filtered.items() if k not in required_keys]
+        filtered = {k: v for k, v in filtered.items() if k in required_keys}
+        filtered.update(dict(optional_items[:max_fields - len(required_keys)]))
+    
+    if total_size > max_size:
+        logger.warning(f"Custom_attributes too large ({total_size} bytes), truncating values")
+        # Укорачиваем значения полей
+        for key, value in filtered.items():
+            if key not in ("code_abonent", "topic_name") and len(str(value)) > 500:
+                filtered[key] = str(value)[:500]
+    
+    return filtered
+
+
+def _build_chatwoot_contact_custom_attrs(
+    owner: Client,
+    client: Client
+) -> Dict[str, Any]:
+    """
+    Готовим custom attributes для Contact в Chatwoot.
+    
+    Custom attributes для Contact:
+    - code_abonent, inn_pinfl, client_type (обязательные)
+    - region, country (опционально, если есть в модели)
+    
+    Для пользователей (is_parent=false) используем данные владельца для region и country.
+    """
+    attrs: Dict[str, Any] = {
+        "code_abonent": owner.code_abonent or "",
+        "inn_pinfl": owner.org_inn or "",
+        "client_type": "owner" if not client.parent_id else "user",
+    }
+    
+    # Опциональные поля: для пользователей берем из владельца, для владельцев - из клиента
+    region_to_use = client.region if not client.parent_id else (client.region or owner.region)
+    country_to_use = client.country if not client.parent_id else (client.country or owner.country)
+    
+    if region_to_use:
+        attrs["region"] = str(region_to_use)
+    
+    if country_to_use:
+        attrs["country"] = str(country_to_use)
+    
+    # Фильтруем пустые значения для опциональных полей
+    filtered = {}
+    for key, value in attrs.items():
+        # Обязательные поля всегда включаем (даже если пустые)
+        if key in ("code_abonent", "inn_pinfl", "client_type"):
+            filtered[key] = value if value else ""
+        # Опциональные поля включаем только если не пустые
+        elif value not in (None, "", []):
+            filtered[key] = value
+    
+    return filtered
+
+
+def _build_chatwoot_labels(
+    language: Optional[str],
+    source: Optional[str]
+) -> List[str]:
+    """
+    Формируем labels для Conversation (типовое поле Chatwoot).
+    Используем человеко-читаемые названия вместо кодов.
+    
+    ВАЖНО: Используются человеко-читаемые названия (например, "Русский" вместо "lang_ru").
+    Labels должны быть созданы заранее при инициализации приложения.
+    """
+    labels = []
+    if language:
+        # Маппинг кодов языков в человеко-читаемые названия
+        lang_map = {
+            "ru": "Русский",
+            "uz": "Узбекский",
+        }
+        label_name = lang_map.get(language.lower(), f"Язык: {language}")
+        labels.append(label_name)
+    if source:
+        # Маппинг источников в человеко-читаемые названия
+        source_map = {
+            "site": "Сайт",
+            "web": "Сайт",
+            "telegram": "Telegram",
+            "tg": "Telegram",
+            "phone": "Телефон",
+            "call": "Телефон",
+        }
+        source_lower = source.lower()
+        label_name = source_map.get(source_lower, f"Источник: {source}")
+        labels.append(label_name)
+    return labels
+
+
+async def _process_onec_response(
+    consultation: Consultation,
+    onec_response: Dict[str, Any]
+) -> None:
+    """
+    Обрабатывает ответ от 1C OData при создании/обновлении консультации.
+    Сохраняет все важные поля в объект consultation.
+    
+    Args:
+        consultation: Объект консультации для обновления
+        onec_response: Ответ от 1C OData API
+    """
+    
+    # Обязательные поля
+    if "Ref_Key" in onec_response:
+        consultation.cl_ref_key = onec_response["Ref_Key"]
+    
+    if "Number" in onec_response:
+        consultation.number = onec_response["Number"]
+    
+    # Даты (1C возвращает даты без timezone, добавляем UTC)
+    if "ДатаСоздания" in onec_response:
+        try:
+            # Парсим дату из формата "2025-11-19T09:00:00" (без timezone)
+            date_str = onec_response["ДатаСоздания"]
+            if date_str and date_str != "0001-01-01T00:00:00":
+                # Если нет timezone, добавляем UTC
+                if "Z" in date_str or "+" in date_str or date_str.count("-") > 2:
+                    consultation.create_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                else:
+                    # Без timezone - добавляем UTC
+                    dt = datetime.fromisoformat(date_str)
+                    consultation.create_date = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse ДатаСоздания from 1C: {e}")
+    
+    if "ДатаКонсультации" in onec_response:
+        try:
+            date_str = onec_response["ДатаКонсультации"]
+            if date_str and date_str != "0001-01-01T00:00:00":
+                if "Z" in date_str or "+" in date_str or date_str.count("-") > 2:
+                    consultation.start_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.fromisoformat(date_str)
+                    consultation.start_date = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse ДатаКонсультации from 1C: {e}")
+    
+    if "Конец" in onec_response:
+        try:
+            date_str = onec_response["Конец"]
+            if date_str and date_str != "0001-01-01T00:00:00":
+                if "Z" in date_str or "+" in date_str or date_str.count("-") > 2:
+                    consultation.end_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.fromisoformat(date_str)
+                    consultation.end_date = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse Конец from 1C: {e}")
+    
+    # Статус (маппинг ВидОбращения в наш статус)
+    if "ВидОбращения" in onec_response:
+        vid_obrascheniya = onec_response["ВидОбращения"]
+        # Обратный маппинг: ВидОбращения → наш status
+        vid_to_status = {
+            "ВОчередьНаКонсультацию": "open",
+            "КонсультацияИТС": "resolved",
+            "Другое": "pending",
+        }
+        consultation.status = vid_to_status.get(vid_obrascheniya, consultation.status)
+    
+    # Закрыто без консультации
+    if "ЗакрытоБезКонсультации" in onec_response:
+        consultation.denied = bool(onec_response["ЗакрытоБезКонсультации"])
+    
+    # Описание (если изменилось)
+    if "Описание" in onec_response and onec_response["Описание"]:
+        consultation.comment = onec_response["Описание"]
+    
+    # Тема (если изменилась)
+    if "Тема" in onec_response and onec_response["Тема"]:
+        # Тема хранится в comment или можно добавить отдельное поле
+        pass  # Пока не храним тему отдельно
+    
+    logger.debug(f"Processed 1C response for consultation: Ref_Key={consultation.cl_ref_key}, Number={consultation.number}")
 
 
 @router.post("/create", response_model=ConsultationResponse)
 async def create_consultation(
     payload: ConsultationWithClient,
     db: AsyncSession = Depends(get_db),
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None, description="Bearer токен (опционально)"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key", description="Уникальный ключ для предотвращения дублирования")
 ):
     """
     Создание консультации с данными клиента.
@@ -48,111 +778,1100 @@ async def create_consultation(
     - Данные консультации
     
     Процесс:
-    1. Находит или создает клиента
-    2. Создает консультацию в БД
-    3. Отправляет в Chatwoot
-    4. Отправляет в 1C:ЦЛ
-    5. Обновляет запись с полученными ID
+    1. Проверяет idempotency key (если передан)
+    2. Находит или создает клиента
+    3. Создает консультацию в БД
+    4. Отправляет в Chatwoot
+    5. Отправляет в 1C:ЦЛ
+    6. Обновляет запись с полученными ID
     
     Headers:
     - Authorization: Bearer <token> (опционально, для будущей валидации)
+    - Idempotency-Key: <key> (опционально, для предотвращения дублирования)
     """
-    # 1. Находим или создаем клиента
-    client = None
-    if payload.client:
-        client = await find_or_create_client(db, payload.client)
-    elif payload.consultation.client_id:
-        # Если указан client_id, проверяем существование
-        try:
-            client_uuid = uuid.UUID(payload.consultation.client_id)
-            result = await db.execute(
-                select(Client).where(Client.client_id == client_uuid)
-            )
-            client = result.scalar_one_or_none()
-            if not client:
-                raise HTTPException(status_code=404, detail="Client not found")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid client_id format")
-    
-    if not client:
-        raise HTTPException(
-            status_code=400,
-            detail="Client data or client_id is required"
+    # Проверяем idempotency key если передан
+    if idempotency_key:
+        request_hash = generate_request_hash(payload.dict())
+        cached_response = await check_idempotency_key(
+            db=db,
+            key=idempotency_key,
+            operation_type="create_consultation",
+            request_hash=request_hash
         )
+        if cached_response:
+            logger.info(f"Returning cached response for idempotency key: {idempotency_key}")
+            return ConsultationResponse(**cached_response)
     
-    # 2. Создаем консультацию в БД
-    temp_cons_id = f"temp_{uuid.uuid4()}"
-    consultation = Consultation(
-        cons_id=temp_cons_id,
-        client_id=client.client_id,
-        cl_ref_key=payload.consultation.cl_ref_key,
-        org_inn=payload.consultation.org_inn or client.org_inn,
-        lang=payload.consultation.lang or "ru",
-        comment=payload.consultation.comment or "",
-        online_question_cat=payload.consultation.online_question_cat,
-        online_question=payload.consultation.online_question,
-        importance=payload.consultation.importance,
-        start_date=payload.consultation.scheduled_at,
-        status="new"
-    )
-    db.add(consultation)
-    await db.flush()
-    
-    # 3. Отправляем в Chatwoot
-    chatwoot_client = ChatwootClient()
-    chatwoot_cons_id = None
     try:
-        chatwoot_response = await chatwoot_client.create_conversation(
-            source_id=str(client.client_id),
-            inbox_id=None,  # Нужно получить из настроек
-            message=payload.consultation.comment or "",
-        )
-        chatwoot_cons_id = str(chatwoot_response.get("id"))
-        consultation.cons_id = chatwoot_cons_id
-        logger.info(f"Created Chatwoot conversation: {chatwoot_cons_id}")
-    except Exception as e:
-        logger.error(f"Failed to create Chatwoot conversation: {e}")
-        # Продолжаем без Chatwoot ID
-    
-    # 4. Отправляем в 1C:ЦЛ через OData
-    onec_client = OneCClient()
-    try:
-        # Формируем КонсультацииИТС если есть данные
-        consultations_its = None
-        if payload.consultation.online_question_cat or payload.consultation.comment:
-            consultations_its = [{
-                "LineNumber": "1",
-                "Вопрос": payload.consultation.comment or "",
-                "Ответ": ""
-            }]
-            if payload.consultation.online_question_cat:
-                consultations_its[0]["КатегорияВопроса_Key"] = payload.consultation.online_question_cat
+        # 1. Находим или создаем клиента
+        client = None
+        if payload.client:
+            try:
+                client = await find_or_create_client(db, payload.client)
+            except Exception as e:
+                logger.error(f"Failed to find or create client: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to process client data: {str(e)}"
+                )
+        elif payload.consultation.client_id:
+            # Если указан client_id, проверяем существование
+            try:
+                client_uuid = uuid.UUID(payload.consultation.client_id)
+                result = await db.execute(
+                    select(Client).where(Client.client_id == client_uuid)
+                )
+                client = result.scalar_one_or_none()
+                if not client:
+                    raise HTTPException(status_code=404, detail="Client not found")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid client_id format")
+            except Exception as e:
+                logger.error(f"Database error while fetching client: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Internal server error while fetching client"
+                )
         
-        onec_response = await onec_client.create_consultation_odata(
-            client_key=client.cl_ref_key,  # Абонент_Key из ЦЛ (если есть)
-            description=payload.consultation.comment or "",
-            topic=payload.consultation.topic,
-            scheduled_at=payload.consultation.scheduled_at,
-            question_category_key=payload.consultation.online_question_cat,
-            question_key=payload.consultation.online_question,
-            consultations_its=consultations_its
+        if not client:
+            raise HTTPException(
+                status_code=400,
+                detail="Client data or client_id is required"
+            )
+        
+        try:
+            owner_client = await _get_owner_client(db, client)
+            onec_client = OneCClient()
+            owner_client = await _ensure_owner_synced_with_cl(db, owner_client, onec_client)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to process owner client: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process owner client: {str(e)}"
+            )
+        
+        client_key = owner_client.cl_ref_key
+        if not client_key:
+            logger.error(
+                "✗ Owner client %s is not linked with 1C (cl_ref_key missing). "
+                "This means the client was not created in 1C or sync failed. "
+                "Consultation will be created in DB and Chatwoot, but NOT in 1C.",
+                owner_client.client_id,
+            )
+            logger.error(f"Owner client details: org_inn={owner_client.org_inn}, code_abonent={owner_client.code_abonent}, name={owner_client.name}")
+            logger.error(f"Please check logs above for errors during client creation in 1C")
+
+        contact_hint = _build_contact_hint(client, owner_client, payload.source)
+
+        # Проверка ограничений на создание консультаций в зависимости от типа
+        consultation_type = payload.consultation.consultation_type
+        if consultation_type == "Техническая поддержка":
+            # Проверка: максимум 1 открытая консультация одновременно для одного user_id (client_id)
+            await _check_technical_support_limit(db, client.client_id)
+        elif consultation_type == "Консультация по ведению учета":
+            # Проверка: максимум 3 консультации в день по code_abonent для всех user_id этого абонента
+            if payload.consultation.scheduled_at:
+                await _check_consultation_limit(
+                    db,
+                    code_abonent=owner_client.code_abonent,
+                    org_inn=owner_client.org_inn,
+                    consultation_date=payload.consultation.scheduled_at
+                )
+
+        # Проверка ограничения на создание заявок на будущее
+        if payload.consultation.scheduled_at:
+            settings = get_settings()
+            max_future_date = datetime.now(timezone.utc) + timedelta(days=settings.MAX_FUTURE_CONSULTATION_DAYS)
+            
+            # Нормализуем scheduled_at к UTC (если нет timezone, считаем что это UTC)
+            scheduled_at_utc = payload.consultation.scheduled_at
+            if scheduled_at_utc.tzinfo is None:
+                # Если нет timezone, добавляем UTC
+                scheduled_at_utc = scheduled_at_utc.replace(tzinfo=timezone.utc)
+            else:
+                # Если есть timezone, конвертируем в UTC
+                scheduled_at_utc = scheduled_at_utc.astimezone(timezone.utc)
+            
+            if scheduled_at_utc > max_future_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Нельзя создавать консультации более чем на {settings.MAX_FUTURE_CONSULTATION_DAYS} дней вперед. "
+                           f"Максимальная дата: {max_future_date.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+        # 2. Автоматически выбираем менеджера для консультации
+        manager_selector = ManagerSelector(db)
+        selected_manager_key = None
+        
+        # Получаем раздел программы из консультации (если есть)
+        # Пока используем online_question_cat как category_key для выбора менеджера
+        category_key = normalize_uuid(payload.consultation.online_question_cat)
+        
+        try:
+            selected_manager_key = await manager_selector.select_manager_for_consultation(
+                consultation=None,  # Консультация еще не создана
+                category_key=category_key,
+                current_time=datetime.now(timezone.utc),
+            )
+            
+            if selected_manager_key:
+                logger.info(f"Auto-selected manager {selected_manager_key} for consultation")
+            else:
+                logger.warning("No manager selected automatically, will use default or manual assignment")
+        except Exception as e:
+            logger.error(f"Failed to auto-select manager: {e}", exc_info=True)
+            # Продолжаем без автоматического выбора менеджера
+        
+        # Если менеджер не выбран автоматически, используем дефолтного
+        if not selected_manager_key:
+            selected_manager_key = await _get_default_manager_key(db)
+
+        # 2. Создаем консультацию в БД
+        # ВАЖНО: Используем транзакцию для атомарности операций
+        # При ошибке в Chatwoot/1C - откатываем транзакцию
+        temp_cons_id = f"temp_{uuid.uuid4()}"
+        consultation = Consultation(
+            cons_id=temp_cons_id,
+            client_id=client.client_id,
+            client_key=client_key,
+            cl_ref_key=payload.consultation.cl_ref_key,
+            org_inn=owner_client.org_inn,
+            lang=payload.consultation.lang or "ru",
+            consultation_type=payload.consultation.consultation_type,
+            comment=payload.consultation.comment or "",
+            online_question_cat=normalize_uuid(payload.consultation.online_question_cat),
+            online_question=normalize_uuid(payload.consultation.online_question),
+            importance=payload.consultation.importance,
+            start_date=payload.consultation.scheduled_at,
+            status="open",
+            manager=selected_manager_key,  # Устанавливаем выбранного менеджера
+            source="BACKEND",  # Указываем источник создания
         )
-        # OData возвращает Ref_Key и Number
-        consultation.cl_ref_key = onec_response.get("Ref_Key")
-        consultation.number = onec_response.get("Number")
-        logger.info(f"Created 1C consultation: {consultation.cl_ref_key}, {consultation.number}")
+        db.add(consultation)
+        await db.flush()
+        
+        # Формируем custom_attrs с учетом созданной consultation
+        custom_attrs = await _build_chatwoot_custom_attrs(db, owner_client, payload, consultation=consultation)
+        
+        # Валидация обязательных полей для Chatwoot
+        # Если code_abonent или topic_name пустые, используем дефолтные значения
+        # ВАЖНО: эти поля должны быть непустыми, иначе Chatwoot может вернуть ошибку
+        code_abonent_value = custom_attrs.get("code_abonent")
+        if not code_abonent_value or code_abonent_value == "":
+            logger.warning(f"code_abonent is empty for client {owner_client.client_id}, using default 'N/A'")
+            custom_attrs["code_abonent"] = "N/A"  # Дефолтное значение вместо пустой строки
+        
+        topic_name_value = custom_attrs.get("topic_name")
+        if not topic_name_value or topic_name_value == "":
+            default_topic = payload.consultation.comment[:50] if payload.consultation.comment else "Консультация"
+            logger.warning(f"topic_name is empty for consultation, using default: '{default_topic}'")
+            custom_attrs["topic_name"] = default_topic
+        
+        # Логируем финальные custom_attrs перед отправкой
+        logger.info(f"Final custom_attrs for Chatwoot: {custom_attrs}")
+        
+        # 3. Отправляем в Chatwoot и 1C
+        # Отслеживаем успех создания хотя бы в одной системе
+        chatwoot_success = False
+        onec_success = False
+        
+        chatwoot_client = ChatwootClient()
+        chatwoot_cons_id = None
+        # ВАЖНО: source_id для conversation - это UUID, который МЫ генерируем на нашей стороне
+        # Это уникальный идентификатор беседы для идемпотентности (чтобы Chatwoot не создавал дубликаты)
+        # source_id НЕ берется из contact_inboxes - это разные идентификаторы
+        conversation_source_id = str(uuid.uuid4())  # Генерируем UUID для conversation
+        logger.info(f"Generated conversation source_id (UUID): {conversation_source_id} for consultation")
+        
+        chatwoot_source_id = None  # source_id для подключения виджета (будет установлен после создания conversation)
+        pubsub_token = None  # pubsub_token для WebSocket подключения (будет извлечен из Public API ответа)
+        
+        try:
+            from ..config import settings
+            
+            # 3. Создаем conversation в Chatwoot
+            # ВАЖНО: Application API Chatwoot не позволяет создавать contacts напрямую
+            # Поэтому создаем conversation только с source_id - Chatwoot автоматически создаст contact
+            logger.info(
+                f"Creating Chatwoot conversation: source_id={client.client_id}, "
+                f"inbox_id={settings.CHATWOOT_INBOX_ID}, custom_attrs={custom_attrs}"
+            )
+            
+            # Маппинг importance в priority (типовое поле Chatwoot)
+            priority = _map_importance_to_priority(payload.consultation.importance)
+            
+            # Формируем labels для language и source (типовое поле Chatwoot)
+            labels = _build_chatwoot_labels(
+                language=payload.consultation.lang,
+                source=payload.source
+            )
+            
+            # Подготавливаем данные контакта (используются для поиска, создания контакта и conversation)
+            contact_name = client.name or client.contact_name or owner_client.name or owner_client.contact_name or "Клиент"
+            contact_email = client.email or owner_client.email
+            contact_phone = client.phone_number or owner_client.phone_number
+            
+            # Валидируем email перед использованием
+            if contact_email and not is_valid_email(contact_email):
+                logger.warning(f"Invalid email format '{contact_email}' for client {client.client_id}, skipping email field")
+                contact_email = None  # Не отправляем невалидный email
+            
+            # Разделяем custom_attributes на contact и conversation согласно ТЗ
+            contact_custom_attrs = _build_chatwoot_contact_custom_attrs(owner_client, client)
+            conversation_custom_attrs = custom_attrs
+            
+            # ВАЖНО: Используем source_id из БД клиента, если он уже есть
+            # Контакт должен быть создан при создании клиента, и source_id сохранен в БД
+            contact_id = None
+            contact_source_id = None
+            
+            # Проверяем, есть ли source_id в БД клиента
+            if client.source_id:
+                logger.info(f"Using source_id from DB for client {client.client_id}: {client.source_id}")
+                contact_source_id = client.source_id
+                
+                # Проверяем, что contact существует в Chatwoot (получаем contact_id)
+                try:
+                    existing_contact = await chatwoot_client.find_contact_by_identifier(str(client.client_id))
+                    if existing_contact:
+                        contact_id = existing_contact.get("id")
+                        logger.info(f"Found existing Chatwoot contact by identifier: {contact_id} for client {client.client_id}")
+                        
+                        # ВАЖНО: Получаем pubsub_token для существующего contact через Public API
+                        if not client.chatwoot_pubsub_token:
+                            try:
+                                logger.info(f"Getting pubsub_token for existing contact (found by identifier) via Public API: source_id={client.source_id}")
+                                contact_public_data = await chatwoot_client.get_contact_via_public_api(client.source_id)
+                                
+                                existing_pubsub_token = chatwoot_client._extract_pubsub_token(contact_public_data)
+                                if existing_pubsub_token:
+                                    client.chatwoot_pubsub_token = existing_pubsub_token
+                                    await db.flush()
+                                    logger.info(f"✓ Retrieved pubsub_token for existing contact (found by identifier): {existing_pubsub_token[:20]}...")
+                                else:
+                                    logger.warning(f"⚠ pubsub_token not found in Public API response for existing contact (found by identifier)")
+                            except Exception as get_pubsub_error:
+                                logger.warning(f"Failed to get pubsub_token for existing contact (found by identifier) via Public API: {get_pubsub_error}")
+                    else:
+                        logger.warning(f"source_id exists in DB but contact not found in Chatwoot for client {client.client_id}")
+                        # source_id может быть устаревшим, нужно обновить
+                        contact_source_id = None
+                except Exception as contact_error:
+                    logger.error(f"Failed to verify contact in Chatwoot: {contact_error}", exc_info=True)
+                    contact_source_id = None
+            
+            # Если source_id нет в БД или contact не найден, ищем существующий contact
+            if not contact_source_id:
+                try:
+                    # Ищем контакт по identifier (client_id UUID)
+                    existing_contact = await chatwoot_client.find_contact_by_identifier(str(client.client_id))
+                    if existing_contact:
+                        contact_id = existing_contact.get("id")
+                        logger.info(f"Found existing Chatwoot contact by identifier: {contact_id} for client {client.client_id}")
+                        
+                        # Извлекаем source_id из существующего contact
+                        contact_inboxes = existing_contact.get("contact_inboxes", [])
+                        if isinstance(contact_inboxes, list) and len(contact_inboxes) > 0:
+                            for ci in contact_inboxes:
+                                if ci.get("inbox_id") == settings.CHATWOOT_INBOX_ID:
+                                    contact_source_id = ci.get("source_id")
+                                    break
+                            if not contact_source_id and len(contact_inboxes) > 0:
+                                contact_source_id = contact_inboxes[0].get("source_id")
+                        
+                        # Сохраняем source_id в БД клиента для будущего использования
+                        if contact_source_id:
+                            client.source_id = contact_source_id
+                            await db.flush()
+                            logger.info(f"✓ Saved source_id to DB: {contact_source_id} for client {client.client_id}")
+                    else:
+                        logger.warning(f"Contact not found in Chatwoot for client {client.client_id}. Contact should be created when client is created.")
+                        # Пробуем найти по email или phone как fallback
+                        
+                        if contact_email:
+                            existing_contact = await chatwoot_client.find_contact_by_email(contact_email)
+                            if existing_contact:
+                                contact_id = existing_contact.get("id")
+                                logger.info(f"Found existing Chatwoot contact by email: {contact_id}")
+                                
+                                # Извлекаем source_id
+                                contact_inboxes = existing_contact.get("contact_inboxes", [])
+                                if isinstance(contact_inboxes, list) and len(contact_inboxes) > 0:
+                                    for ci in contact_inboxes:
+                                        if ci.get("inbox_id") == settings.CHATWOOT_INBOX_ID:
+                                            contact_source_id = ci.get("source_id")
+                                            break
+                                    if not contact_source_id and len(contact_inboxes) > 0:
+                                        contact_source_id = contact_inboxes[0].get("source_id")
+                                
+                                if contact_source_id:
+                                    client.source_id = contact_source_id
+                                    
+                                    # ВАЖНО: Получаем pubsub_token для существующего contact через Public API
+                                    if not client.chatwoot_pubsub_token:
+                                        try:
+                                            logger.info(f"Getting pubsub_token for existing contact (found by email) via Public API: source_id={contact_source_id}")
+                                            contact_public_data = await chatwoot_client.get_contact_via_public_api(
+                                                source_id=contact_source_id
+                                            )
+                                            
+                                            existing_pubsub_token = chatwoot_client._extract_pubsub_token(contact_public_data)
+                                            if existing_pubsub_token:
+                                                client.chatwoot_pubsub_token = existing_pubsub_token
+                                                logger.info(f"✓ Retrieved pubsub_token for existing contact (found by email): {existing_pubsub_token[:20]}...")
+                                            else:
+                                                logger.warning(f"⚠ pubsub_token not found in Public API response for existing contact (found by email)")
+                                        except Exception as get_pubsub_error:
+                                            logger.warning(f"Failed to get pubsub_token for existing contact (found by email) via Public API: {get_pubsub_error}")
+                                    
+                                    await db.flush()
+                        
+                        if not contact_id and contact_phone:
+                            existing_contact = await chatwoot_client.find_contact_by_phone(contact_phone)
+                            if existing_contact:
+                                contact_id = existing_contact.get("id")
+                                logger.info(f"Found existing Chatwoot contact by phone: {contact_id}")
+                                
+                                # Извлекаем source_id
+                                contact_inboxes = existing_contact.get("contact_inboxes", [])
+                                if isinstance(contact_inboxes, list) and len(contact_inboxes) > 0:
+                                    for ci in contact_inboxes:
+                                        if ci.get("inbox_id") == settings.CHATWOOT_INBOX_ID:
+                                            contact_source_id = ci.get("source_id")
+                                            break
+                                    if not contact_source_id and len(contact_inboxes) > 0:
+                                        contact_source_id = contact_inboxes[0].get("source_id")
+                                
+                                if contact_source_id:
+                                    client.source_id = contact_source_id
+                                    
+                                    # ВАЖНО: Получаем pubsub_token для существующего contact через Public API
+                                    if not client.chatwoot_pubsub_token:
+                                        try:
+                                            logger.info(f"Getting pubsub_token for existing contact (found by phone) via Public API: source_id={contact_source_id}")
+                                            contact_public_data = await chatwoot_client.get_contact_via_public_api(
+                                                source_id=contact_source_id
+                                            )
+                                            
+                                            existing_pubsub_token = chatwoot_client._extract_pubsub_token(contact_public_data)
+                                            if existing_pubsub_token:
+                                                client.chatwoot_pubsub_token = existing_pubsub_token
+                                                logger.info(f"✓ Retrieved pubsub_token for existing contact (found by phone): {existing_pubsub_token[:20]}...")
+                                            else:
+                                                logger.warning(f"⚠ pubsub_token not found in Public API response for existing contact (found by phone)")
+                                        except Exception as get_pubsub_error:
+                                            logger.warning(f"Failed to get pubsub_token for existing contact (found by phone) via Public API: {get_pubsub_error}")
+                                    
+                                    await db.flush()
+                        
+                        if not contact_id:
+                            logger.warning(f"No contact found in Chatwoot for client {client.client_id}. Will create contact before conversation.")
+                except Exception as contact_error:
+                    logger.error(f"Failed to find contact in Chatwoot: {contact_error}", exc_info=True)
+                    # Продолжаем - попробуем создать контакт явно
+                    contact_id = None
+            
+            # ВАЖНО: Если контакт не найден, создаем его явно перед созданием conversation
+            # Это более надежный подход, чем полагаться на автоматическое создание через payload
+            if not contact_id:
+                try:
+                    logger.info(f"Contact not found, creating new contact in Chatwoot for client {client.client_id}")
+                    # Данные контакта уже подготовлены выше
+                    
+                    # Проверяем, что есть хотя бы email или phone для создания контакта
+                    if contact_email or contact_phone:
+                        # ВАЖНО: Используем Public API для создания contact, чтобы получить pubsub_token
+                        try:
+                            new_contact = await chatwoot_client.create_contact_via_public_api(
+                                name=contact_name,
+                                identifier=str(client.client_id),  # Глобальный внешний ID (UUID)
+                                email=contact_email,
+                                phone_number=contact_phone,
+                                custom_attributes=contact_custom_attrs
+                            )
+                            
+                            # Извлекаем contact_id из ответа Public API
+                            contact_id = new_contact.get("id")
+                            if not contact_id:
+                                contact_id = new_contact.get("payload", {}).get("contact", {}).get("id") if isinstance(new_contact.get("payload"), dict) else None
+                            
+                            # Извлекаем source_id из ответа Public API
+                            # source_id создается автоматически Chatwoot при создании contact через Public API
+                            new_contact_source_id = chatwoot_client._extract_source_id(
+                                new_contact,
+                                inbox_id=settings.CHATWOOT_INBOX_ID
+                            )
+                            
+                            if new_contact_source_id:
+                                logger.info(f"✓ Extracted source_id from Public API response: {new_contact_source_id}")
+                            else:
+                                # Если source_id не найден в ответе создания, получаем contact через GET для извлечения source_id
+                                if contact_id:
+                                    try:
+                                        logger.info(f"source_id not found in create response, fetching contact {contact_id} to get source_id")
+                                        fetched_contact = await chatwoot_client.get_contact(contact_id)
+                                        
+                                        # Извлекаем source_id из ответа GET запроса Platform API
+                                        new_contact_source_id = chatwoot_client._extract_source_id(
+                                            fetched_contact,
+                                            inbox_id=settings.CHATWOOT_INBOX_ID
+                                        )
+                                        
+                                        if new_contact_source_id:
+                                            logger.info(f"✓ Retrieved source_id from GET contact: {new_contact_source_id}")
+                                    except Exception as get_contact_error:
+                                        logger.warning(f"Failed to get contact {contact_id} to extract source_id: {get_contact_error}")
+                            
+                            # Извлекаем pubsub_token из ответа создания contact
+                            # ВАЖНО: pubsub_token принадлежит контакту (Contact), а не беседе (Conversation)
+                            logger.info(f"=== Extracting pubsub_token from contact creation response ===")
+                            logger.info(f"  Contact response keys: {list(new_contact.keys()) if isinstance(new_contact, dict) else 'not a dict'}")
+                            
+                            contact_pubsub_token = chatwoot_client._extract_pubsub_token(new_contact)
+                            if contact_pubsub_token:
+                                logger.info(f"✓ Extracted pubsub_token from contact creation response: {contact_pubsub_token[:20]}...")
+                                # Сохраняем pubsub_token в БД клиента (он принадлежит контакту)
+                                client.chatwoot_pubsub_token = contact_pubsub_token
+                                pubsub_token = contact_pubsub_token  # Используем для ответа
+                                logger.info(f"✓ Saved pubsub_token to client DB: {contact_pubsub_token[:20]}...")
+                            else:
+                                logger.warning(f"⚠ pubsub_token not found in contact creation response")
+                                # Логируем полную структуру ответа для отладки
+                                import json
+                                logger.warning(f"  Full contact response structure: {json.dumps(new_contact, ensure_ascii=False, indent=2)}")
+                            
+                            # Сохраняем source_id в БД клиента
+                            if new_contact_source_id:
+                                contact_source_id = new_contact_source_id
+                                client.source_id = new_contact_source_id
+                                await db.flush()
+                                logger.info(f"✓ Created Chatwoot contact via Public API: {contact_id}, source_id: {new_contact_source_id} for client {client.client_id}")
+                                logger.info(f"✓ Saved source_id to DB: {new_contact_source_id} for client {client.client_id}")
+                            else:
+                                logger.warning(f"Created Chatwoot contact {contact_id} but source_id not found in response or get_contact for client {client.client_id}")
+                                logger.warning(f"Response structure: {list(new_contact.keys()) if isinstance(new_contact, dict) else 'not a dict'}")
+                                logger.warning("source_id will remain null - frontend will handle this case")
+                            
+                            if not contact_id:
+                                logger.warning(f"Failed to extract contact_id from Chatwoot response: {new_contact}")
+                        except httpx.HTTPStatusError as http_error:
+                            # Обработка ошибки 422 - контакт уже существует
+                            if http_error.response.status_code == 422:
+                                logger.warning(f"Contact already exists in Chatwoot (422), trying to find existing contact for client {client.client_id}")
+                                
+                                # Пытаемся найти существующий contact
+                                existing_contact = None
+                                if str(client.client_id):
+                                    existing_contact = await chatwoot_client.find_contact_by_identifier(str(client.client_id))
+                                
+                                if not existing_contact and contact_email:
+                                    existing_contact = await chatwoot_client.find_contact_by_email(contact_email)
+                                
+                                if not existing_contact and contact_phone:
+                                    existing_contact = await chatwoot_client.find_contact_by_phone(contact_phone)
+                                
+                                if existing_contact:
+                                    # Извлекаем contact_id из найденного контакта
+                                    contact_id = existing_contact.get("id")
+                                    if not contact_id:
+                                        contact_id = existing_contact.get("payload", {}).get("contact", {}).get("id")
+                                    
+                                    # Извлекаем source_id из найденного contact
+                                    # Используем универсальный метод для извлечения source_id
+                                    contact_source_id = chatwoot_client._extract_source_id(
+                                        existing_contact,
+                                        inbox_id=settings.CHATWOOT_INBOX_ID
+                                    )
+                                    
+                                    # Если source_id не найден в ответе find, получаем contact через GET
+                                    if not contact_source_id and contact_id:
+                                        try:
+                                            logger.info(f"source_id not found in find response, fetching contact {contact_id} to get source_id")
+                                            fetched_contact = await chatwoot_client.get_contact(contact_id)
+                                            
+                                            # Извлекаем source_id из ответа GET запроса Platform API
+                                            contact_source_id = chatwoot_client._extract_source_id(
+                                                fetched_contact,
+                                                inbox_id=settings.CHATWOOT_INBOX_ID
+                                            )
+                                            
+                                            if contact_source_id:
+                                                logger.info(f"✓ Retrieved source_id from GET contact: {contact_source_id}")
+                                        except Exception as get_contact_error:
+                                            logger.warning(f"Failed to get contact {contact_id} to extract source_id: {get_contact_error}")
+                                    
+                                    # Сохраняем source_id в БД клиента
+                                    if contact_source_id:
+                                        client.source_id = contact_source_id
+                                        
+                                        # ВАЖНО: Для существующего contact нужно получить pubsub_token через GET запрос к Public API
+                                        # pubsub_token не возвращается в Platform API ответе, только в Public API
+                                        if not client.chatwoot_pubsub_token:
+                                            try:
+                                                logger.info(f"Getting pubsub_token for existing contact via Public API: source_id={contact_source_id}")
+                                                contact_public_data = await chatwoot_client.get_contact_via_public_api(
+                                                    source_id=contact_source_id
+                                                )
+                                                
+                                                existing_pubsub_token = chatwoot_client._extract_pubsub_token(contact_public_data)
+                                                if existing_pubsub_token:
+                                                    client.chatwoot_pubsub_token = existing_pubsub_token
+                                                    pubsub_token = existing_pubsub_token
+                                                    logger.info(f"✓ Retrieved pubsub_token for existing contact: {existing_pubsub_token[:20]}...")
+                                                else:
+                                                    logger.warning(f"⚠ pubsub_token not found in Public API response for existing contact")
+                                                    import json
+                                                    logger.warning(f"  Full Public API response: {json.dumps(contact_public_data, ensure_ascii=False, indent=2)}")
+                                            except Exception as get_pubsub_error:
+                                                logger.warning(f"Failed to get pubsub_token for existing contact via Public API: {get_pubsub_error}")
+                                                # Продолжаем без pubsub_token - frontend может получить его сам
+                                        else:
+                                            pubsub_token = client.chatwoot_pubsub_token
+                                            logger.info(f"✓ Using existing pubsub_token from client DB: {pubsub_token[:20]}...")
+                                        
+                                        await db.flush()
+                                        logger.info(f"✓ Found existing Chatwoot contact: {contact_id}, source_id: {contact_source_id} for client {client.client_id}")
+                                        logger.info(f"✓ Saved source_id to DB: {contact_source_id} for client {client.client_id}")
+                                    else:
+                                        logger.warning(f"Found existing contact {contact_id} but source_id not found for client {client.client_id}")
+                                else:
+                                    logger.error(f"Contact exists (422) but cannot be found by identifier/email/phone for client {client.client_id}")
+                                    raise ValueError("Contact exists but cannot be found")
+                            else:
+                                # Другие HTTP ошибки - пробрасываем дальше
+                                raise
+                    else:
+                        logger.warning(f"Cannot create contact: no valid email or phone for client {client.client_id}")
+                except Exception as create_contact_error:
+                    logger.error(f"Failed to create contact in Chatwoot: {create_contact_error}", exc_info=True)
+                    # Продолжаем без contact_id - попробуем создать conversation с объектом contact (fallback)
+                    contact_id = None
+            
+            
+            # Назначаем менеджера в Chatwoot (если выбран)
+            assignee_id = None
+            if selected_manager_key:
+                # Ищем chatwoot_user_id через user_mapping или напрямую в users
+                mapping_result = await db.execute(
+                    select(UserMapping).where(UserMapping.cl_manager_key == selected_manager_key).limit(1)
+                )
+                mapping = mapping_result.scalar_one_or_none()
+                if mapping:
+                    assignee_id = mapping.chatwoot_user_id
+                    logger.info(f"Mapped manager {selected_manager_key} to Chatwoot user {assignee_id}")
+                else:
+                    # Пробуем найти через users
+                    user_result = await db.execute(
+                        select(User).where(User.cl_ref_key == selected_manager_key).limit(1)
+                    )
+                    user = user_result.scalar_one_or_none()
+                    if user and user.chatwoot_user_id:
+                        assignee_id = user.chatwoot_user_id
+                        logger.info(f"Found Chatwoot user {assignee_id} for manager {selected_manager_key}")
+            
+            # ВАЖНО: Для Public API используем source_id из contact (contact_source_id)
+            # Public API требует source_id контакта для создания conversation
+            if not contact_source_id:
+                raise ValueError("contact_source_id is required for creating conversation via Public API")
+            
+            logger.info(f"=== Creating conversation via Public API ===")
+            logger.info(f"  Contact source_id: {contact_source_id}")
+            logger.info(f"  Inbox identifier: {settings.CHATWOOT_INBOX_IDENTIFIER}")
+            logger.info(f"  Message preview: {(payload.consultation.comment or '')[:100]}")
+            
+            # Создаем conversation через Public API
+            # ВАЖНО: Public API использует source_id контакта, а не UUID conversation
+            chatwoot_response = await chatwoot_client.create_conversation_via_public_api(
+                source_id=contact_source_id,  # source_id из contact (не UUID conversation)
+                message=payload.consultation.comment or "",
+                custom_attributes=conversation_custom_attrs,  # Атрибуты беседы (тикета)
+            )
+            # Извлекаем conversation_id из ответа Public API
+            chatwoot_cons_id = str(chatwoot_response.get("id"))
+            if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                # Пробуем извлечь из payload
+                chatwoot_cons_id = str(chatwoot_response.get("payload", {}).get("id", "")) if isinstance(chatwoot_response.get("payload"), dict) else None
+                if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                    raise ValueError(f"Chatwoot returned invalid conversation ID: {chatwoot_response}")
+            
+            # ВАЖНО: pubsub_token НЕ возвращается в ответе создания conversation
+            # pubsub_token возвращается ТОЛЬКО в ответе POST создания contact через Public API
+            # pubsub_token уже сохранен в БД клиента при создании contact выше
+            # Используем pubsub_token из БД клиента
+            if client.chatwoot_pubsub_token:
+                logger.info(f"✓ Using pubsub_token from client DB (saved during contact creation): {client.chatwoot_pubsub_token[:20]}...")
+            else:
+                logger.warning(f"⚠ pubsub_token not found in client DB - contact may not have been created via Public API or pubsub_token was not in response")
+            
+            # Извлекаем source_id из ответа создания conversation
+            # Обычно это тот же source_id контакта, но проверяем ответ на всякий случай
+            conversation_source_id_from_response = chatwoot_client._extract_source_id(
+                chatwoot_response,
+                inbox_id=settings.CHATWOOT_INBOX_ID
+            )
+            
+            # Используем source_id из ответа, если он есть, иначе используем source_id контакта
+            chatwoot_source_id = conversation_source_id_from_response if conversation_source_id_from_response else contact_source_id
+            
+            if conversation_source_id_from_response and conversation_source_id_from_response != contact_source_id:
+                logger.info(f"✓ Found different source_id in conversation response: {conversation_source_id_from_response} (contact source_id: {contact_source_id})")
+            else:
+                logger.info(f"✓ Using contact source_id for conversation: {chatwoot_source_id}")
+            
+            # Дополнительная проверка: убеждаемся, что conversation действительно создана
+            try:
+                verify_conversation = await chatwoot_client.get_conversation(chatwoot_cons_id)
+                if not verify_conversation:
+                    raise ValueError(f"Chatwoot conversation {chatwoot_cons_id} was not found after creation")
+                logger.debug(f"Verified Chatwoot conversation exists: {chatwoot_cons_id}")
+            except Exception as verify_error:
+                logger.warning(f"Failed to verify Chatwoot conversation: {verify_error}")
+                # Не прерываем выполнение, но логируем предупреждение
+            
+            # Добавляем labels и assignee через Platform API (если нужно)
+            # Public API не поддерживает эти параметры при создании
+            if labels or assignee_id:
+                try:
+                    update_payload = {}
+                    if labels:
+                        # Добавляем labels через Platform API
+                        await chatwoot_client.add_conversation_labels(
+                            conversation_id=chatwoot_cons_id,
+                            labels=labels
+                        )
+                        logger.info(f"✓ Added labels to conversation {chatwoot_cons_id} via Platform API")
+                    
+                    if assignee_id:
+                        # Назначаем менеджера через Platform API
+                        await chatwoot_client.update_conversation(
+                            conversation_id=chatwoot_cons_id,
+                            assignee_id=assignee_id
+                        )
+                        logger.info(f"✓ Assigned manager {assignee_id} to conversation {chatwoot_cons_id} via Platform API")
+                except Exception as update_error:
+                    logger.warning(f"Failed to add labels/assignee via Platform API: {update_error}")
+                    # Не прерываем выполнение - conversation уже создана
+            
+            # Сохраняем данные из ответа создания conversation
+            consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
+            consultation.chatwoot_source_id = chatwoot_source_id  # source_id из contact (для виджета)
+            
+            # ВАЖНО: pubsub_token принадлежит контакту и уже сохранен в БД клиента при создании contact
+            # pubsub_token НЕ возвращается в ответе создания conversation
+            # Используем pubsub_token из БД клиента
+            if client.chatwoot_pubsub_token:
+                logger.info(f"✓ Using pubsub_token from client DB (saved during contact creation): {client.chatwoot_pubsub_token[:20]}...")
+            else:
+                logger.warning(f"⚠ pubsub_token not found in client DB - contact may not have been created via Public API or pubsub_token was not in response")
+            
+            await db.flush()  # Сохраняем обновленный cons_id и source_id
+            chatwoot_success = True
+            logger.info(f"✓ Created Chatwoot conversation via Public API: {chatwoot_cons_id}, source_id: {chatwoot_source_id}, contact_id: {contact_id}")
+        except Exception as e:
+            logger.error(
+                f"✗ Failed to create Chatwoot conversation: {e}",
+                exc_info=True
+            )
+            # ВАЖНО: Если Chatwoot упал, conversation НЕ создана
+            # chatwoot_cons_id остается None, и это будет возвращено в ответе API
+            # Фронтенд должен проверить chatwoot_conversation_id перед попыткой найти conversation
+            chatwoot_cons_id = None  # Явно устанавливаем None, чтобы не было случайных значений
+            logger.warning(
+                f"⚠ Chatwoot conversation creation failed. "
+                f"chatwoot_cons_id is None. "
+                f"Frontend will receive chatwoot_conversation_id=None in API response. "
+                f"Frontend should NOT attempt to find conversation by ID."
+            )
+            
+            # ВАЖНО: Если Chatwoot упал, используем source_id из contact (если есть)
+            # Для Public API source_id должен быть из contact, а не UUID conversation
+            if not chatwoot_source_id:
+                # Используем source_id из contact для будущей попытки создания через Public API
+                chatwoot_source_id = contact_source_id if contact_source_id else None
+                if chatwoot_source_id:
+                    logger.warning(f"Chatwoot conversation creation failed. Will use contact source_id: {chatwoot_source_id} for retry")
+                else:
+                    logger.warning(f"Chatwoot conversation creation failed and no contact_source_id available")
+            
+            # Сохраняем source_id для будущего использования
+            # Если conversation создана - это source_id из ответа или contact_source_id
+            # Если не создана - это contact_source_id (для будущей попытки создания через Public API)
+            consultation.chatwoot_source_id = chatwoot_source_id
+            await db.flush()
+            # Продолжаем - попробуем создать в 1C
+        
+        # 4. Отправляем в 1C:ЦЛ через OData
+        # ВАЖНО: Отправляем в ЦЛ только консультации с типом "Консультация по ведению учёта"
+        consultation_type = payload.consultation.consultation_type
+        should_send_to_cl = consultation_type == "Консультация по ведению учёта"
+        
+        logger.info(f"=== Preparing to send consultation to 1C ===")
+        logger.info(f"  consultation_type: {consultation_type}")
+        logger.info(f"  should_send_to_cl: {should_send_to_cl}")
+        logger.info(f"  client_key: {client_key}")
+        logger.info(f"  owner_client.cl_ref_key: {owner_client.cl_ref_key}")
+        logger.info(f"  owner_client.client_id: {owner_client.client_id}")
+        logger.info(f"  owner_client.org_inn: {owner_client.org_inn}")
+        logger.info(f"  owner_client.code_abonent: {owner_client.code_abonent}")
+        
+        if client_key and should_send_to_cl:
+            try:
+                # Проверяем лимит консультаций в бэкенде перед отправкой в ЦЛ
+                # ВАЖНО: Приоритетно проверяем по code_abonent (выдается системой и не может быть изменен),
+                # если код абонента отсутствует - проверяем по ИНН (fallback для случаев создания через
+                # колл-центр или расширение 1С, когда клиент уже существует в ЦЛ, но еще не синхронизирован в БД)
+                if payload.consultation.scheduled_at:
+                    try:
+                        await _check_consultation_limit(
+                            db=db,
+                            code_abonent=owner_client.code_abonent,
+                            org_inn=owner_client.org_inn,
+                            consultation_date=payload.consultation.scheduled_at,
+                        )
+                        identifier = owner_client.code_abonent or owner_client.org_inn
+                        identifier_type = "code_abonent" if owner_client.code_abonent else "org_inn"
+                        logger.info(f"✓ Consultation limit check passed for {identifier_type}: {identifier}")
+                    except HTTPException:
+                        # Пробрасываем HTTPException как есть (это наш лимит)
+                        raise
+                    except Exception as limit_check_error:
+                        # Если проверка лимита упала с другой ошибкой, логируем и продолжаем
+                        # (не блокируем создание консультации из-за ошибки проверки)
+                        logger.warning(
+                            f"Failed to check consultation limit by INN: {limit_check_error}. "
+                            f"Proceeding with 1C creation (1C will check limit anyway)."
+                        )
+                
+                # Используем выбранного менеджера (или дефолтного если не выбран)
+                manager_key = selected_manager_key or await _get_default_manager_key(db)
+                if not manager_key:
+                    logger.warning("No manager found, consultation will be created without manager_key")
+                
+                # СпособСвязи - пока используем маппинг из source (TODO: добавить preferred_contact_method в Client)
+                from ..services.onec_client import map_source_to_contact_method
+                contact_method = map_source_to_contact_method(payload.source) if payload.source else "ПоТелефону"
+                
+                # Название клиента для АбонентПредставление
+                client_display_name = _build_client_display_name(owner_client)
+                
+                # Валидация перед отправкой в 1C
+                if not client_key or len(client_key) != 36 or client_key.count("-") != 4:
+                    raise ValueError(f"Invalid client_key format: '{client_key}'. Must be a valid GUID.")
+                
+                if manager_key and (len(manager_key) != 36 or manager_key.count("-") != 4):
+                    logger.warning(f"Invalid manager_key format: '{manager_key}', proceeding without manager")
+                    manager_key = None
+                
+                logger.info(f"Creating 1C consultation: client_key={client_key}, manager_key={manager_key}, client_display_name={client_display_name}")
+                
+                onec_response = await onec_client.create_consultation_odata(
+                    client_key=client_key,
+                    manager_key=manager_key,  # Менеджер из БД
+                    description=payload.consultation.comment or "",
+                    topic=payload.consultation.topic,
+                    scheduled_at=payload.consultation.scheduled_at,
+                    question_category_key=normalize_uuid(payload.consultation.online_question_cat),  # Нормализуем пустые UUID
+                    question_key=normalize_uuid(payload.consultation.online_question),  # Нормализуем пустые UUID
+                    language_code=payload.consultation.lang,
+                    contact_method=contact_method,
+                    contact_hint=contact_hint,
+                    client_display_name=client_display_name,
+                    importance=payload.consultation.importance,
+                    comment=payload.consultation.comment,
+                    db_session=db,  # Передаем сессию БД для поиска автора по имени
+                )
+                
+                # Проверяем, что ответ от 1C содержит обязательные поля
+                if not onec_response:
+                    raise ValueError("1C returned empty response")
+                
+                if "Ref_Key" not in onec_response:
+                    logger.warning(f"1C response missing Ref_Key: {onec_response}")
+                else:
+                    logger.debug(f"1C consultation created with Ref_Key: {onec_response.get('Ref_Key')}")
+                
+                # Обрабатываем полный ответ от 1C и сохраняем все важные поля
+                await _process_onec_response(consultation, onec_response)
+                await db.flush()  # Сохраняем данные из 1C
+                
+                # Проверяем, что cl_ref_key сохранен
+                if not consultation.cl_ref_key:
+                    logger.warning("cl_ref_key was not set from 1C response, consultation may not be properly synced")
+                
+                # Обновляем custom_attrs с номером из 1C
+                if consultation.number:
+                    custom_attrs["number_con"] = consultation.number
+                    # Обновляем в Chatwoot если conversation уже создан
+                    if chatwoot_success and chatwoot_cons_id:
+                        try:
+                            # Обновляем custom_attributes в Chatwoot
+                            await chatwoot_client.update_conversation(
+                                conversation_id=chatwoot_cons_id,
+                                # Можно добавить метод для обновления custom_attributes если нужно
+                            )
+                            logger.debug(f"Updated Chatwoot conversation {chatwoot_cons_id} with 1C number: {consultation.number}")
+                        except Exception as e:
+                            logger.warning(f"Failed to update Chatwoot conversation with 1C data: {e}")
+                
+                onec_success = True
+                logger.info(f"✓ Created 1C consultation: cl_ref_key={consultation.cl_ref_key}, number={consultation.number}, client_key={client_key}")
+            except ConsultationLimitExceeded as e:
+                # Специальная обработка ошибки превышения лимита консультаций
+                logger.error(f"✗ Consultation limit exceeded in 1C: {e}")
+                # Пробрасываем исключение дальше, чтобы вернуть понятное сообщение пользователю
+                raise HTTPException(
+                    status_code=429,  # Too Many Requests
+                    detail=str(e)
+                ) from e
+            except Exception as e:
+                logger.error(f"✗ Failed to create 1C consultation: {e}", exc_info=True)
+        else:
+            logger.warning("⚠ Skipping 1C consultation creation because client is not synced with 1C yet.")
+            logger.warning(f"  Owner client {owner_client.client_id} has no cl_ref_key (client_key is None or empty)")
+            logger.warning(f"  This means the client was not created in 1C or cl_ref_key was not saved to DB")
+            logger.warning(f"  Owner client details: org_inn={owner_client.org_inn}, code_abonent={owner_client.code_abonent}, name={owner_client.name}")
+        
+        # ВАЖНО: Консультация всегда сохраняется в БД, даже если внешние сервисы недоступны
+        # Это позволяет системе продолжать работать при проблемах с внешними сервисами
+        # Синхронизация с внешними сервисами будет выполнена позже через retry механизм
+        
+        if not chatwoot_success and not onec_success:
+            # Обе системы упали - сохраняем консультацию в БД с предупреждением
+            logger.warning("Both Chatwoot and 1C failed to create consultation. Consultation will be saved in DB and synced later.")
+            logger.warning("External services are unavailable, but consultation data is preserved in database.")
+            
+            # Генерируем UUID для консультации, если еще не создан
+            if consultation.cons_id.startswith("temp_"):
+                consultation.cons_id = str(uuid.uuid4())
+                await db.flush()
+                logger.info(f"Generated UUID for consultation: {consultation.cons_id} (external services failed)")
+        
+        elif not chatwoot_success:
+            # Chatwoot упал - сохраняем консультацию в БД
+            logger.warning("Chatwoot failed to create consultation. Consultation will be saved in DB and synced later.")
+            
+            # Генерируем UUID для консультации, если еще не создан
+            if consultation.cons_id.startswith("temp_"):
+                consultation.cons_id = str(uuid.uuid4())
+                await db.flush()
+                logger.info(f"Generated UUID for consultation: {consultation.cons_id} (Chatwoot failed)")
+        
+        # Если хотя бы одна система успешна, генерируем нормальный ID если нужно
+        if not chatwoot_success and consultation.cons_id.startswith("temp_"):
+            # Генерируем UUID вместо temp_ ID
+            consultation.cons_id = str(uuid.uuid4())
+            await db.flush()
+            logger.info(f"Generated UUID for consultation: {consultation.cons_id} (Chatwoot failed, but 1C succeeded)")
+        
+        # ВАЖНО: Если chatwoot_source_id не установлен, используем source_id из contact (если есть)
+        # Для Public API source_id должен быть из contact, а не UUID conversation
+        if not consultation.chatwoot_source_id:
+            # Используем contact_source_id для будущей попытки создания через Public API
+            consultation.chatwoot_source_id = contact_source_id if contact_source_id else None
+            if consultation.chatwoot_source_id:
+                logger.info(f"Set chatwoot_source_id to contact source_id: {consultation.chatwoot_source_id} (for future retry via Public API)")
+            else:
+                logger.warning(f"chatwoot_source_id is null - Chatwoot conversation was not created and no contact_source_id available")
+                logger.warning("Frontend will need to handle null chatwoot_source_id case")
+            await db.flush()
+        
+        # Убеждаемся, что переменная chatwoot_source_id установлена для ответа
+        if chatwoot_source_id is None:
+            chatwoot_source_id = consultation.chatwoot_source_id
+            logger.debug(f"Using chatwoot_source_id from consultation: {chatwoot_source_id}")
+        
+        # ВАЖНО: Коммитим транзакцию только если хотя бы одна внешняя система успешна
+        # Если обе системы упали, все равно сохраняем в БД для последующей синхронизации
+        try:
+            await db.commit()
+            await db.refresh(consultation)
+        except Exception as e:
+            logger.error(f"Failed to commit consultation to database: {e}", exc_info=True)
+            try:
+                await db.rollback()
+                # Если была ошибка коммита, пытаемся откатить изменения в Chatwoot/1C
+                if chatwoot_success and chatwoot_cons_id:
+                    try:
+                        logger.warning(f"Attempting to delete Chatwoot conversation {chatwoot_cons_id} due to DB commit failure")
+                        # Можно добавить удаление conversation если нужно
+                    except Exception as cleanup_error:
+                        logger.error(f"Failed to cleanup Chatwoot conversation: {cleanup_error}")
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback after commit error: {rollback_error}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save consultation to database: {str(e)}"
+            )
+    
+        # Сохраняем idempotency key если передан
+        if idempotency_key:
+            request_hash = generate_request_hash(payload.dict())
+            # Убеждаемся что pubsub_token это строка, а не bytes
+            pubsub_token_str = None
+            if pubsub_token:
+                if isinstance(pubsub_token, bytes):
+                    pubsub_token_str = pubsub_token.decode('utf-8')
+                else:
+                    pubsub_token_str = str(pubsub_token)
+            
+            # Формируем response_data с обязательным полем client_id
+            # Получаем ФИО менеджера
+            manager_name = await _get_manager_name(db, consultation.manager)
+            consultation_read = ConsultationRead.from_model(consultation, manager_name=manager_name)
+            response_data = ConsultationResponse(
+                consultation=consultation_read,
+                client_id=str(client.client_id),  # Добавляем обязательное поле client_id
+                chatwoot_source_id=chatwoot_source_id,
+                pubsub_token=pubsub_token_str
+            ).dict()
+            try:
+                await store_idempotency_key(
+                    db=db,
+                    key=idempotency_key,
+                    operation_type="create_consultation",
+                    resource_id=consultation.cons_id,
+                    request_hash=request_hash,
+                    response_data=response_data
+                )
+            except Exception as e:
+                # Если ошибка при сохранении idempotency key, логируем но не прерываем выполнение
+                logger.warning(f"Failed to store idempotency key: {e}")
+                # Откатываем только изменения idempotency key, не всю транзакцию
+                try:
+                    await db.rollback()
+                    # Продолжаем работу - консультация уже создана
+                except Exception:
+                    pass
+        
+        # Отправляем информационное сообщение от имени компании в Chatwoot
+        if chatwoot_success and chatwoot_cons_id:
+            try:
+                # Формируем информационное сообщение
+                info_message_parts = ["Ваша заявка на консультацию принята."]
+                
+                if consultation.number:
+                    info_message_parts.append(f"Номер заявки: {consultation.number}.")
+                
+                if consultation.start_date:
+                    date_str = consultation.start_date.strftime("%d.%m.%Y %H:%M")
+                    info_message_parts.append(f"Запланированная дата консультации: {date_str}.")
+                
+                # Добавляем информацию об очереди и времени ожидания
+                if selected_manager_key:
+                    try:
+                        wait_info = await manager_selector.calculate_wait_time(selected_manager_key)
+                        queue_position = wait_info["queue_position"]
+                        wait_hours = wait_info["estimated_wait_hours"]
+                        
+                        if queue_position > 1:
+                            info_message_parts.append(
+                                f"Вы в очереди #{queue_position}. "
+                                f"Примерное время ожидания: {wait_hours} {'час' if wait_hours == 1 else 'часа' if wait_hours < 5 else 'часов'}."
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate wait time: {e}")
+                
+                info_message = " ".join(info_message_parts)
+                
+                # Отправляем как note (служебное сообщение, видно клиенту)
+                await chatwoot_client.send_note(
+                    conversation_id=chatwoot_cons_id,
+                    content=info_message,
+                    private=False  # Видно клиенту
+                )
+                logger.info(f"Sent info message to Chatwoot conversation {chatwoot_cons_id}")
+            except Exception as e:
+                logger.warning(f"Failed to send info message to Chatwoot: {e}", exc_info=True)
+        
+        # Формируем сообщение об успехе
+        success_parts = []
+        if chatwoot_success:
+            success_parts.append("Chatwoot")
+        if onec_success:
+            success_parts.append("1C:ЦЛ")
+        
+        message = f"Consultation created successfully in: {', '.join(success_parts) if success_parts else 'database only'}"
+        
+        # Получаем настройки Chatwoot для виджета
+        from ..config import settings
+        chatwoot_account_id = str(settings.CHATWOOT_ACCOUNT_ID) if settings.CHATWOOT_ACCOUNT_ID else None
+        chatwoot_inbox_id = settings.CHATWOOT_INBOX_ID if settings.CHATWOOT_INBOX_ID else None
+        
+        # ВАЖНО: pubsub_token возвращается ТОЛЬКО в ответе POST создания contact через Public API
+        # pubsub_token сохраняется в БД клиента при создании contact и больше не меняется
+        # Берем pubsub_token из БД клиента (он был сохранен при создании contact)
+        # Убеждаемся что pubsub_token это строка, а не bytes
+        final_pubsub_token = None
+        if client.chatwoot_pubsub_token:
+            if isinstance(client.chatwoot_pubsub_token, bytes):
+                final_pubsub_token = client.chatwoot_pubsub_token.decode('utf-8')
+            else:
+                final_pubsub_token = str(client.chatwoot_pubsub_token)
+        
+        # ВАЖНО ДЛЯ ФРОНТЕНДА:
+        # - chatwoot_conversation_id возвращается ТОЛЬКО если conversation успешно создана в Chatwoot
+        # - Если conversation не создана (chatwoot_cons_id is None), НЕ пытайтесь найти conversation по этому ID
+        # - Используйте chatwoot_conversation_id из ответа, НЕ используйте consultation.cons_id для поиска conversation
+        # - consultation.cons_id - это ID консультации в нашей БД, а не ID conversation в Chatwoot
+        # - Если chatwoot_conversation_id is None, conversation будет создана позже через retry механизм
+        if not chatwoot_success:
+            logger.warning(
+                f"⚠ Chatwoot conversation was NOT created. "
+                f"chatwoot_conversation_id will be None in response. "
+                f"Frontend should NOT attempt to find conversation. "
+                f"Consultation cons_id: {consultation.cons_id}"
+            )
+        
+        # Получаем ФИО менеджера
+        manager_name = await _get_manager_name(db, consultation.manager)
+        
+        # Формируем ответ
+        response = ConsultationResponse(
+            consultation=ConsultationRead.from_model(consultation, manager_name=manager_name),
+            client_id=str(client.client_id),
+            message=message,
+            # Поля для подключения чат-виджета Chatwoot
+            # ВАЖНО: chatwoot_conversation_id будет None если conversation не создана
+            chatwoot_conversation_id=chatwoot_cons_id if chatwoot_success else None,  # ID conversation (только если создана)
+            chatwoot_source_id=chatwoot_source_id,  # source_id из contact (для идентификации пользователя)
+            chatwoot_account_id=chatwoot_account_id,  # account_id для подключения виджета
+            chatwoot_inbox_id=chatwoot_inbox_id,  # inbox_id для подключения виджета
+            chatwoot_pubsub_token=final_pubsub_token,  # pubsub_token для WebSocket подключения (из контакта, не из беседы)
+        )
+        
+        # Сохраняем idempotency key если передан (после успешного создания)
+        if idempotency_key:
+            try:
+                request_hash = generate_request_hash(payload.dict())
+                await store_idempotency_key(
+                    db=db,
+                    key=idempotency_key,
+                    operation_type="create_consultation",
+                    resource_id=consultation.cons_id,
+                    request_hash=request_hash,
+                    response_data=response.dict()
+                )
+                logger.debug(f"Stored idempotency key: {idempotency_key} for consultation {consultation.cons_id}")
+            except Exception as e:
+                logger.warning(f"Failed to store idempotency key: {e}")
+        
+        return response
+    except HTTPException:
+        # Пробрасываем HTTPException как есть
+        raise
     except Exception as e:
-        logger.error(f"Failed to create 1C consultation: {e}")
-        # Продолжаем без ЦЛ данных
-    
-    await db.commit()
-    await db.refresh(consultation)
-    
-    return ConsultationResponse(
-        consultation=TicketRead.from_model(consultation),
-        client_id=str(client.client_id),
-        message="Consultation created successfully"
-    )
+        # Логируем все остальные ошибки и возвращаем 500 с деталями
+        logger.error(f"Unexpected error in create_consultation: {e}", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception as rollback_error:
+            logger.error(f"Failed to rollback after unexpected error: {rollback_error}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
 
 
 @router.post("/simple", response_model=ConsultationResponse)
@@ -187,6 +1906,32 @@ async def _get_consultation_or_404(db: AsyncSession, cons_id: str) -> Consultati
     return consultation
 
 
+@router.get("/{cons_id}/calls", response_model=List[CallRead])
+async def list_calls(
+    cons_id: str,
+    db: AsyncSession = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100
+):
+    """
+    Получение списка попыток дозвона для консультации.
+    
+    Возвращает список попыток дозвона, отсортированных по дате (новые первыми).
+    Поддерживает пагинацию через параметры skip и limit.
+    """
+    consultation = await _get_consultation_or_404(db, cons_id)
+    
+    # Получаем дозвоны по cons_id или cons_key
+    query = select(Call).where(
+        (Call.cons_id == cons_id) | (Call.cons_key == consultation.cl_ref_key)
+    ).order_by(Call.period.desc()).offset(skip).limit(limit)
+    
+    result = await db.execute(query)
+    calls = result.scalars().all()
+    
+    return [CallRead.model_validate(call) for call in calls]
+
+
 @router.get("/{cons_id}/redates", response_model=List[ConsultationRedateRead])
 async def list_redates(cons_id: str, db: AsyncSession = Depends(get_db)):
     consultation = await _get_consultation_or_404(db, cons_id)
@@ -209,14 +1954,31 @@ async def create_redate(
         raise HTTPException(status_code=400, detail="Consultation not yet synced with 1C")
 
     clients_key = consultation.client_key or (str(consultation.client_id) if consultation.client_id else consultation.cl_ref_key)
-    manager_key = payload.manager_key or consultation.manager or "FRONT"
+    
+    # Получаем менеджера - используем из payload, consultation или дефолтного из БД
+    manager_key = payload.manager_key or consultation.manager
+    if not manager_key:
+        # Получаем менеджера по умолчанию из БД
+        manager_key = await _get_default_manager_key(db)
+    
+    # Валидация: manager_key должен быть валидным GUID, не "FRONT" или пустой строкой
+    if not manager_key or manager_key == "FRONT" or len(manager_key) != 36 or manager_key.count("-") != 4:
+        logger.warning(f"Invalid manager_key '{manager_key}' for consultation {cons_id}, using default manager")
+        manager_key = await _get_default_manager_key(db)
+        if not manager_key:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid manager found. Please specify manager_key or ensure default manager exists in database."
+            )
+    
+    old_date = consultation.start_date
 
     redate = ConsRedate(
         cons_key=consultation.cl_ref_key,
         clients_key=clients_key,
         manager_key=manager_key,
         period=datetime.now(timezone.utc),
-        old_date=consultation.start_date,
+        old_date=old_date,
         new_date=payload.new_date,
         comment=payload.comment,
     )
@@ -225,8 +1987,53 @@ async def create_redate(
     if payload.new_date:
         consultation.redate = payload.new_date.date()
         consultation.redate_time = payload.new_date.time()
+        consultation.start_date = payload.new_date
         consultation.updated_at = datetime.now(timezone.utc)
 
+    await db.flush()
+    
+    # Отправляем в 1C:ЦЛ
+    onec_client = OneCClient()
+    try:
+        await onec_client.create_redate_odata(
+            cons_key=consultation.cl_ref_key,
+            client_key=clients_key,
+            manager_key=manager_key,
+            old_date=old_date,
+            new_date=payload.new_date,
+            comment=payload.comment,
+            period=redate.period,
+        )
+        # Также обновляем дату в самом документе
+        onec_response = await onec_client.update_consultation_odata(
+            ref_key=consultation.cl_ref_key,
+            start_date=payload.new_date,
+        )
+        # Обрабатываем ответ от 1C и обновляем локальную БД
+        await _process_onec_response(consultation, onec_response)
+        await db.flush()
+        logger.info(f"Created redate in 1C for consultation {cons_id}")
+    except Exception as e:
+        logger.error(f"Failed to create redate in 1C: {e}", exc_info=True)
+    
+    # Отправляем note в Chatwoot
+    chatwoot_client = ChatwootClient()
+    try:
+        old_date_str = old_date.strftime("%d.%m.%Y %H:%M") if old_date else "не указана"
+        new_date_str = payload.new_date.strftime("%d.%m.%Y %H:%M") if payload.new_date else "не указана"
+        note_content = f"📅 Консультация перенесена\nСтарая дата: {old_date_str}\nНовая дата: {new_date_str}"
+        if payload.comment:
+            note_content += f"\nКомментарий: {payload.comment}"
+        
+        await chatwoot_client.send_note(
+            conversation_id=cons_id,
+            content=note_content,
+            private=False
+        )
+        logger.info(f"Sent redate note to Chatwoot for consultation {cons_id}")
+    except Exception as e:
+        logger.error(f"Failed to send redate note to Chatwoot: {e}", exc_info=True)
+    
     await db.commit()
     await db.refresh(redate)
     return redate
@@ -284,6 +2091,7 @@ async def submit_ratings(
     client_id = str(consultation.client_id) if consultation.client_id else None
 
     rows = []
+    rating_date = datetime.now(timezone.utc)  # Текущая дата для ДатаОценки
     for answer in payload.answers:
         rows.append(
             {
@@ -297,6 +2105,7 @@ async def submit_ratings(
                 "question_text": answer.question,
                 "comment": answer.comment,
                 "sent_to_base": False,
+                "rating_date": rating_date,  # Сохраняем дату оценки
             }
         )
 
@@ -308,10 +2117,660 @@ async def submit_ratings(
             "question_text": stmt.excluded.question_text,
             "comment": stmt.excluded.comment,
             "manager_key": stmt.excluded.manager_key,
+            "rating_date": stmt.excluded.rating_date,  # Обновляем дату оценки
             "updated_at": func.now(),
         },
     )
     await db.execute(stmt)
     await recalc_consultation_ratings(db, {consultation.cl_ref_key})
+    await db.flush()
+    
+    # Отправляем оценки в 1C:ЦЛ
+    onec_client = OneCClient()
+    for answer in payload.answers:
+        try:
+            # Валидация manager_key - должен быть валидным GUID
+            answer_manager_key = answer.manager_key or consultation.manager
+            if not answer_manager_key or answer_manager_key == "FRONT" or len(answer_manager_key) != 36 or answer_manager_key.count("-") != 4:
+                # Получаем менеджера по умолчанию из БД
+                answer_manager_key = await _get_default_manager_key(db)
+                if not answer_manager_key:
+                    logger.warning(f"Invalid manager_key for rating question {answer.question_number}, skipping 1C sync")
+                    continue
+            
+            await onec_client.create_rating_odata(
+                cons_key=consultation.cl_ref_key,
+                client_key=client_key or "",
+                manager_key=answer_manager_key,
+                question_number=answer.question_number,
+                rating=answer.rating,
+                question_text=answer.question,
+                comment=answer.comment,
+                period=datetime.now(timezone.utc),
+            )
+        except Exception as e:
+            logger.error(f"Failed to create rating in 1C for question {answer.question_number}: {e}", exc_info=True)
+    
+    # Отправляем note в Chatwoot
+    chatwoot_client = ChatwootClient()
+    try:
+        avg_rating = sum(a.rating for a in payload.answers if a.rating) / len([a for a in payload.answers if a.rating]) if payload.answers else None
+        note_content = f"⭐ Оценка консультации получена\nСредняя оценка: {avg_rating:.1f}" if avg_rating else "⭐ Оценка консультации получена"
+        if len(payload.answers) > 1:
+            note_content += f"\nКоличество вопросов: {len(payload.answers)}"
+        
+        # Используем send_message вместо send_note, так как note сообщения не видны клиенту
+        await chatwoot_client.send_message(
+            conversation_id=cons_id,
+            content=note_content,
+            message_type="outgoing"
+        )
+        logger.info(f"Sent rating message to Chatwoot for consultation {cons_id}")
+    except Exception as e:
+        logger.error(f"Failed to send rating note to Chatwoot: {e}", exc_info=True)
+    
     await db.commit()
     return await _build_rating_response(db, consultation.cl_ref_key)
+
+
+@router.put("/{cons_id}", response_model=ConsultationRead)
+async def update_consultation(
+    cons_id: str,
+    payload: ConsultationUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Обновление консультации.
+    
+    Поддерживаемые поля:
+    - status: Статус консультации
+    - start_date: Дата консультации (ISO 8601 формат, например: "2025-12-04T11:40:00Z")
+    - end_date: Конец консультации (ISO 8601 формат, например: "2025-12-04T11:40:00Z")
+    - comment: Описание/комментарий
+    - topic: Тема
+    - importance: Важность (1-3)
+    
+    Обновляет данные в БД и синхронизирует с 1C:ЦЛ (если cl_ref_key есть).
+    """
+    consultation = await _get_consultation_or_404(db, cons_id)
+    
+    # Обновляем поля в БД (используем model_dump для получения только установленных полей)
+    update_data = payload.model_dump(exclude_unset=True)
+    
+    if "status" in update_data:
+        consultation.status = update_data["status"]
+    if "start_date" in update_data:
+        consultation.start_date = update_data["start_date"]
+    if "end_date" in update_data:
+        consultation.end_date = update_data["end_date"]
+    if "comment" in update_data:
+        consultation.comment = update_data["comment"]
+    if "importance" in update_data:
+        consultation.importance = update_data["importance"]
+    
+    await db.flush()
+    
+    # Синхронизируем с 1C:ЦЛ если есть cl_ref_key
+    if consultation.cl_ref_key:
+        onec_client = OneCClient()
+        try:
+            # Маппим данные для 1C
+            status = update_data.get("status")
+            start_date = update_data.get("start_date")
+            end_date = update_data.get("end_date")
+            description = update_data.get("comment")
+            
+            onec_response = await onec_client.update_consultation_odata(
+                ref_key=consultation.cl_ref_key,
+                status=status,
+                start_date=start_date,
+                end_date=end_date,
+                description=description,
+                is_chatwoot_status=True if status else False,
+            )
+            # Обрабатываем ответ от 1C и обновляем локальную БД
+            await _process_onec_response(consultation, onec_response)
+            await db.flush()
+            logger.info(f"Updated consultation {cons_id} in 1C:ЦЛ")
+        except Exception as e:
+            logger.error(f"Failed to update consultation {cons_id} in 1C:ЦЛ: {e}", exc_info=True)
+            # Продолжаем - данные в БД уже обновлены
+    
+    await db.commit()
+    await db.refresh(consultation)
+    
+    # Получаем ФИО менеджера
+    manager_name = await _get_manager_name(db, consultation.manager)
+    return ConsultationRead.from_model(consultation, manager_name=manager_name)
+
+
+@router.get("/{cons_id}", response_model=ConsultationRead)
+async def get_consultation(
+    cons_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Получение консультации по ID (cons_id из Chatwoot)"""
+    consultation = await _get_consultation_or_404(db, cons_id)
+    # Получаем ФИО менеджера
+    manager_name = await _get_manager_name(db, consultation.manager)
+    return ConsultationRead.from_model(consultation, manager_name=manager_name)
+
+
+@router.post("/{cons_id}/cancel", response_model=ConsultationRead)
+async def cancel_consultation(
+    cons_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Аннулирование консультации пользователем.
+    
+    Аннулирование доступно только если:
+    - Прошло не более CANCEL_CONSULTATION_TIMEOUT_MINUTES минут с момента создания консультации
+    - Консультация еще не завершена (end_date не установлен)
+    - Статус консультации позволяет аннулирование (open или pending)
+    - Консультация не была ранее отменена или закрыта
+    
+    При аннулировании:
+    - Документ ТелефонныйЗвонок удаляется в 1C:ЦЛ (освобождает лимит)
+    - В Chatwoot беседа закрывается со статусом "resolved" и custom attribute "closed_without_con": true
+    - Отправляется сообщение в чат о том, что заявка аннулирована
+    - Статус консультации в БД обновляется на "cancelled"
+    - Устанавливается флаг denied = True
+    
+    Настройка:
+    - Время для аннулирования настраивается через переменную окружения CANCEL_CONSULTATION_TIMEOUT_MINUTES (по умолчанию 30 минут)
+    """
+    consultation = await _get_consultation_or_404(db, cons_id)
+    now = datetime.now(timezone.utc)
+    settings = get_settings()
+    
+    # Проверка 1: Консультация уже отменена или закрыта
+    if consultation.status in ("cancelled", "closed", "resolved"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Консультация уже имеет статус '{consultation.status}' и не может быть аннулирована. "
+                   f"Аннулирование возможно только для консультаций со статусом 'open' или 'pending'."
+        )
+    
+    # Проверка 2: Консультация уже завершена (end_date установлен)
+    if consultation.end_date:
+        # Если end_date без timezone, добавляем UTC
+        end_date = consultation.end_date
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        
+        raise HTTPException(
+            status_code=400,
+            detail=f"Консультация уже завершена (дата завершения: {end_date.strftime('%Y-%m-%d %H:%M:%S UTC')}) "
+                   f"и не может быть аннулирована."
+        )
+    
+    # Проверка 3: Статус консультации позволяет аннулирование
+    if consultation.status not in ("open", "pending", None):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Консультация со статусом '{consultation.status}' не может быть аннулирована. "
+                   f"Аннулирование возможно только для консультаций со статусом 'open' или 'pending'."
+        )
+    
+    # Проверка 4: Время с момента создания не превышает лимит
+    create_date = consultation.create_date or consultation.created_at
+    
+    if not create_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось определить дату создания консультации"
+        )
+    
+    # Если create_date без timezone, добавляем UTC
+    if create_date.tzinfo is None:
+        create_date = create_date.replace(tzinfo=timezone.utc)
+    
+    time_since_creation = now - create_date
+    cancel_timeout = timedelta(minutes=settings.CANCEL_CONSULTATION_TIMEOUT_MINUTES)
+    
+    if time_since_creation > cancel_timeout:
+        minutes_passed = int(time_since_creation.total_seconds() / 60)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Время для аннулирования консультации истекло. "
+                   f"Аннулирование возможно только в течение {settings.CANCEL_CONSULTATION_TIMEOUT_MINUTES} минут с момента создания. "
+                   f"Прошло: {minutes_passed} минут"
+        )
+    
+    logger.info(
+        f"Annulling consultation {cons_id}: "
+        f"status={consultation.status}, "
+        f"time_since_creation={time_since_creation.total_seconds() / 60:.1f} minutes, "
+        f"cl_ref_key={consultation.cl_ref_key}"
+    )
+    
+    # Удаляем документ в 1C:ЦЛ (освобождает лимит)
+    if consultation.cl_ref_key:
+        onec_client = OneCClient()
+        try:
+            await onec_client.delete_consultation_odata(consultation.cl_ref_key)
+            logger.info(f"✓ Deleted 1C consultation: Ref_Key={consultation.cl_ref_key} for annulled consultation {cons_id}")
+        except Exception as e:
+            logger.error(f"✗ Failed to delete 1C consultation {consultation.cl_ref_key}: {e}", exc_info=True)
+            # Продолжаем выполнение даже если удаление в 1C не удалось
+    
+    # Закрываем беседу в Chatwoot и отправляем сообщение
+    chatwoot_client = ChatwootClient()
+    try:
+        # Закрываем беседу со статусом "resolved" и пометкой "closed_without_con": true
+        await chatwoot_client.update_conversation(
+            conversation_id=cons_id,
+            status="resolved",
+            custom_attributes={"closed_without_con": True}
+        )
+        logger.info(f"✓ Closed Chatwoot conversation {cons_id} with 'closed_without_con' flag")
+        
+        # Отправляем сообщение в чат о том, что заявка аннулирована
+        try:
+            await chatwoot_client.send_message(
+                conversation_id=cons_id,
+                content="Заявка аннулирована клиентом.",
+                message_type="outgoing"
+            )
+            logger.info(f"✓ Sent cancellation message to Chatwoot conversation {cons_id}")
+        except Exception as msg_error:
+            logger.warning(f"Failed to send cancellation message to Chatwoot conversation {cons_id}: {msg_error}")
+            # Не критично, продолжаем выполнение
+    except Exception as e:
+        logger.error(f"✗ Failed to update Chatwoot conversation {cons_id}: {e}", exc_info=True)
+        # Продолжаем выполнение даже если обновление в Chatwoot не удалось
+    
+    # Обновляем статус в БД
+    consultation.status = "cancelled"
+    consultation.denied = True  # Флаг "закрыто без консультации"
+    consultation.end_date = now  # Устанавливаем дату завершения при аннулировании
+    
+    await db.commit()
+    await db.refresh(consultation)
+    
+    logger.info(f"✓ Annulled consultation {cons_id}: deleted from 1C, closed in Chatwoot, sent message, updated in DB")
+    
+    # Получаем ФИО менеджера
+    manager_name = await _get_manager_name(db, consultation.manager)
+    return ConsultationRead.from_model(consultation, manager_name=manager_name)
+
+
+@router.get("/clients/{client_id}/consultations", response_model=ConsultationListResponse)
+async def get_client_consultations(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100
+):
+    """Получение всех консультаций клиента"""
+    try:
+        client_uuid = uuid.UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid client_id format")
+    
+    # Проверяем существование клиента
+    result = await db.execute(
+        select(Client).where(Client.client_id == client_uuid)
+    )
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    # Получаем консультации с JOIN к users для получения ФИО менеджеров
+    user_alias = aliased(User)
+    result = await db.execute(
+        select(Consultation, user_alias.description)
+        .outerjoin(user_alias, (Consultation.manager == user_alias.cl_ref_key) & (user_alias.deletion_mark == False))
+        .where(Consultation.client_id == client_uuid)
+        .order_by(Consultation.create_date.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    rows = result.all()
+    
+    # Формируем список консультаций с manager_name
+    consultations_list = []
+    for consultation, manager_name in rows:
+        consultations_list.append(ConsultationRead.from_model(consultation, manager_name=manager_name))
+    
+    # Подсчитываем общее количество
+    count_result = await db.execute(
+        select(func.count(Consultation.cons_id))
+        .where(Consultation.client_id == client_uuid)
+    )
+    total = count_result.scalar() or 0
+    
+    return ConsultationListResponse(
+        consultations=consultations_list,
+        total=total
+    )
+
+
+@router.post(
+    "/{cons_id}/sync",
+    response_model=ConsultationRead,
+    summary="Принудительная синхронизация консультации",
+    description="""
+    Принудительная синхронизация консультации с Chatwoot и 1C:ЦЛ.
+    
+    Получает актуальные данные из обеих систем, обновляет БД и возвращает актуальное состояние.
+    
+    **Использование:**
+    Вызывайте этот endpoint при необходимости принудительно обновить данные консультации,
+    например, если заметили рассинхронизацию между системами.
+    
+    **Процесс:**
+    1. Получает актуальные данные из Chatwoot (статус, менеджер, custom_attributes)
+    2. Получает актуальные данные из 1C:ЦЛ (если доступно)
+    3. Обновляет БД с полученными данными
+    4. Возвращает обновленную консультацию
+    """
+)
+async def sync_consultation(
+    cons_id: str = ...,
+    db: AsyncSession = Depends(get_db)
+):
+    # Получаем консультацию из БД
+    result = await db.execute(
+        select(Consultation).where(Consultation.cons_id == cons_id)
+    )
+    consultation = result.scalar_one_or_none()
+    
+    if not consultation:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Consultation {cons_id} not found"
+        )
+    
+    chatwoot_client = ChatwootClient()
+    onec_client = OneCClient()
+    
+    sync_changes = []
+    
+    try:
+        # Синхронизация с Chatwoot
+        if consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+            try:
+                # Получаем актуальные данные из Chatwoot
+                conversation_response = await chatwoot_client._request(
+                    "GET",
+                    f"/api/v1/accounts/{chatwoot_client.account_id}/conversations/{cons_id}"
+                )
+                
+                if conversation_response:
+                    conversation = conversation_response
+                    old_status = consultation.status
+                    new_status = conversation.get("status")
+                    
+                    # Обновляем статус
+                    if new_status and old_status != new_status:
+                        consultation.status = new_status
+                        sync_changes.append(f"status: {old_status} -> {new_status}")
+                        
+                        # Логируем изменение
+                        from ..utils.change_log import log_consultation_change
+                        await log_consultation_change(
+                            db=db,
+                            cons_id=cons_id,
+                            field_name="status",
+                            old_value=old_status,
+                            new_value=new_status,
+                            source="API_SYNC"
+                        )
+                    
+                    # Обновляем менеджера
+                    assignee = conversation.get("assignee")
+                    if assignee:
+                        chatwoot_user_id = assignee.get("id")
+                        if chatwoot_user_id:
+                            # Пытаемся найти маппинг
+                            mapping_result = await db.execute(
+                                select(UserMapping).where(UserMapping.chatwoot_user_id == chatwoot_user_id).limit(1)
+                            )
+                            mapping = mapping_result.scalar_one_or_none()
+                            if mapping:
+                                old_manager = consultation.manager
+                                consultation.manager = mapping.cl_manager_key
+                                if old_manager != consultation.manager:
+                                    sync_changes.append(f"manager: {old_manager} -> {consultation.manager}")
+                    
+                    # Обновляем custom_attributes
+                    custom_attrs = conversation.get("custom_attributes", {})
+                    if custom_attrs:
+                        # Обновляем даты из custom_attributes
+                        if "date_con" in custom_attrs and custom_attrs["date_con"]:
+                            try:
+                                from dateutil import parser as date_parser
+                                date_str = str(custom_attrs["date_con"])
+                                parsed_date = date_parser.parse(date_str)
+                                if parsed_date.tzinfo is None:
+                                    parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+                                if consultation.start_date != parsed_date:
+                                    consultation.start_date = parsed_date
+                                    sync_changes.append(f"start_date updated")
+                            except Exception as e:
+                                logger.warning(f"Failed to parse date_con: {e}")
+                
+                logger.info(f"Synced consultation {cons_id} from Chatwoot. Changes: {', '.join(sync_changes) if sync_changes else 'none'}")
+            except Exception as e:
+                logger.warning(f"Failed to sync from Chatwoot: {e}")
+        
+        # Синхронизация с 1C:ЦЛ
+        if consultation.cl_ref_key:
+            try:
+                # Получаем актуальные данные из 1C через OData
+                # Здесь можно добавить запрос к 1C API для получения актуальных данных
+                # Пока просто логируем
+                logger.info(f"Consultation {cons_id} has cl_ref_key={consultation.cl_ref_key}, 1C sync would be performed here")
+            except Exception as e:
+                logger.warning(f"Failed to sync from 1C: {e}")
+        
+        await db.commit()
+        
+        # Уведомляем WebSocket клиентов об обновлении
+        try:
+            from ..routers.websocket import notify_consultation_update
+            await notify_consultation_update(cons_id, consultation)
+        except Exception as ws_error:
+            logger.debug(f"Failed to notify WebSocket clients: {ws_error}")
+        
+        # Возвращаем обновленную консультацию
+        await db.refresh(consultation)
+        # Получаем ФИО менеджера
+        manager_name = await _get_manager_name(db, consultation.manager)
+        return ConsultationRead.from_model(consultation, manager_name=manager_name)
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error syncing consultation {cons_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to sync consultation: {str(e)}"
+        )
+
+
+@router.get(
+    "/{cons_id}/updates",
+    response_model=Dict[str, Any],
+    summary="Polling обновлений консультации",
+    description="""
+    Polling endpoint для получения обновлений консультации.
+    
+    Возвращает только изменения с момента `last_updated`.
+    Используется фронтендом для периодического обновления данных.
+    
+    **Рекомендуется:** Использовать SSE (`/stream`) или WebSocket (`/ws/consultations/{cons_id}`) для real-time обновлений.
+    Polling endpoint предназначен как fallback или для простых случаев.
+    
+    **Query параметры:**
+    - `last_updated` (опционально): ISO timestamp последнего обновления
+    
+    **Ответ:**
+    - `has_updates: true` - есть обновления, поле `consultation` содержит актуальные данные
+    - `has_updates: false` - обновлений нет с момента `last_updated`
+    """
+)
+async def get_consultation_updates(
+    cons_id: str = ...,
+    last_updated: Optional[datetime] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    # Получаем консультацию
+    result = await db.execute(
+        select(Consultation).where(Consultation.cons_id == cons_id)
+    )
+    consultation = result.scalar_one_or_none()
+    
+    if not consultation:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Consultation {cons_id} not found"
+        )
+    
+    # Если last_updated не указан, возвращаем все данные
+    if not last_updated:
+        # Получаем ФИО менеджера
+        manager_name = await _get_manager_name(db, consultation.manager)
+        return {
+            "has_updates": True,
+            "consultation": ConsultationRead.from_model(consultation, manager_name=manager_name).dict(),
+            "updated_at": consultation.updated_at.isoformat() if consultation.updated_at else None
+        }
+    
+    # Нормализуем last_updated к UTC
+    if last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=timezone.utc)
+    else:
+        last_updated = last_updated.astimezone(timezone.utc)
+    
+    # Проверяем, были ли изменения
+    consultation_updated_at = consultation.updated_at
+    if consultation_updated_at:
+        if consultation_updated_at.tzinfo is None:
+            consultation_updated_at = consultation_updated_at.replace(tzinfo=timezone.utc)
+        else:
+            consultation_updated_at = consultation_updated_at.astimezone(timezone.utc)
+        
+        if consultation_updated_at <= last_updated:
+            return {
+                "has_updates": False,
+                "updated_at": consultation_updated_at.isoformat()
+            }
+    
+    # Есть изменения - возвращаем обновленные данные
+    # Получаем ФИО менеджера
+    manager_name = await _get_manager_name(db, consultation.manager)
+    return {
+        "has_updates": True,
+        "consultation": ConsultationRead.from_model(consultation, manager_name=manager_name).dict(),
+        "updated_at": consultation_updated_at.isoformat() if consultation_updated_at else None
+    }
+
+
+@router.get(
+    "/{cons_id}/stream",
+    summary="SSE stream обновлений консультации",
+    description="""
+    Server-Sent Events (SSE) endpoint для real-time обновлений консультации.
+    
+    **Использование:**
+    ```javascript
+    const eventSource = new EventSource('/api/consultations/12345/stream');
+    eventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'update') {
+        // Обновить UI
+      }
+    };
+    ```
+    
+    **Формат сообщений:**
+    - `{"type": "initial", "data": {...}}` - Начальное состояние консультации
+    - `{"type": "update", "data": {...}}` - Обновление консультации
+    - `{"type": "error", "message": "..."}` - Ошибка
+    - `: heartbeat` - Keep-alive сообщения (каждые 3 секунды)
+    
+    **Альтернативы:**
+    - WebSocket: `WS /ws/consultations/{cons_id}` - двусторонняя связь
+    - Polling: `GET /api/consultations/{cons_id}/updates` - простой fallback
+    """
+)
+async def stream_consultation_updates(
+    cons_id: str = ...,
+    db: AsyncSession = Depends(get_db)
+):
+    import asyncio
+    import json
+    
+    async def event_generator():
+        last_updated = None
+        
+        try:
+            while True:
+                # Получаем консультацию
+                result = await db.execute(
+                    select(Consultation).where(Consultation.cons_id == cons_id)
+                )
+                consultation = result.scalar_one_or_none()
+                
+                if not consultation:
+                    yield f"data: {json.dumps({'error': 'Consultation not found'})}\n\n"
+                    break
+                
+                # Проверяем изменения
+                current_updated_at = consultation.updated_at
+                if current_updated_at:
+                    if current_updated_at.tzinfo is None:
+                        current_updated_at = current_updated_at.replace(tzinfo=timezone.utc)
+                    else:
+                        current_updated_at = current_updated_at.astimezone(timezone.utc)
+                    
+                    if last_updated is None or current_updated_at > last_updated:
+                        # Есть обновления
+                        def json_serializer(obj):
+                            """Кастомный сериализатор для JSON (поддержка datetime, date, time, bytes)"""
+                            if isinstance(obj, datetime):
+                                return obj.isoformat()
+                            elif isinstance(obj, date):
+                                return obj.isoformat()
+                            elif isinstance(obj, time):
+                                return obj.isoformat()
+                            elif isinstance(obj, bytes):
+                                return obj.decode('utf-8')
+                            raise TypeError(f"Type {type(obj)} not serializable")
+                        
+                        # Получаем ФИО менеджера
+                        manager_name = await _get_manager_name(db, consultation.manager)
+                        consultation_dict = ConsultationRead.from_model(consultation, manager_name=manager_name).dict()
+                        data = {
+                            "has_updates": True,
+                            "consultation": consultation_dict,
+                            "updated_at": current_updated_at.isoformat()
+                        }
+                        yield f"data: {json.dumps(data, ensure_ascii=False, default=json_serializer)}\n\n"
+                        last_updated = current_updated_at
+                    else:
+                        # Нет обновлений - отправляем heartbeat
+                        yield f": heartbeat\n\n"
+                else:
+                    yield f": heartbeat\n\n"
+                
+                # Ждем перед следующей проверкой (2-5 секунд)
+                await asyncio.sleep(3)
+                
+        except asyncio.CancelledError:
+            logger.info(f"SSE stream cancelled for consultation {cons_id}")
+        except Exception as e:
+            logger.error(f"Error in SSE stream for consultation {cons_id}: {e}", exc_info=True)
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Отключаем буферизацию в nginx
+        }
+    )

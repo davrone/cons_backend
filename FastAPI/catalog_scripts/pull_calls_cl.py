@@ -11,6 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
+from urllib.parse import quote
 import requests
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -20,7 +21,10 @@ from sqlalchemy.dialects.postgresql import insert
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from FastAPI.config import settings
-from FastAPI.models import Call, Consultation, Client
+from FastAPI.models import Call, Consultation, Client, User
+from FastAPI.services.chatwoot_client import ChatwootClient
+from FastAPI.utils.notification_helpers import check_and_log_notification
+from FastAPI.utils.etl_logging import ETLLogger
 
 # Конфигурация
 LOG_LEVEL = os.getenv("ETL_LOG_LEVEL", "INFO")
@@ -63,33 +67,37 @@ def clean_datetime(dt_str: Optional[str]) -> Optional[datetime]:
 
 
 def http_get_with_backoff(url: str, auth: tuple, max_retries: int = 6, timeout: int = 120):
-    """HTTP GET с retry и backoff"""
+    """HTTP GET с retry и backoff. Детальное логирование только для ошибок."""
     headers = {
         "User-Agent": "ETL-Calls/1.0",
         "Accept": "application/json",
     }
     s = requests.Session()
     attempt = 0
+    
     while True:
         try:
             r = s.get(url, auth=auth, headers=headers, timeout=timeout)
+            
             if r.status_code in (429, 502, 503, 504):
                 if attempt >= max_retries:
                     r.raise_for_status()
                 wait = min(2 ** attempt, 60)
-                logger.warning("HTTP %s — retry in %s sec (attempt %s)", r.status_code, wait, attempt+1)
+                logger.warning("⚠ HTTP %s — retry in %s sec (attempt %s/%s)", r.status_code, wait, attempt+1, max_retries+1)
                 import time
                 time.sleep(wait)
                 attempt += 1
                 continue
+            
             r.raise_for_status()
             return r
         except requests.RequestException as ex:
             if attempt >= max_retries:
-                logger.error("HTTP error after %s attempts: %s", attempt+1, ex)
+                logger.error("✗ HTTP error after %s attempts: %s", attempt+1, ex)
+                logger.error("  URL: %s", url[:500])
                 raise
             wait = min(2 ** attempt, 60)
-            logger.warning("Request failed: %s — retry in %s sec (attempt %s)", ex, wait, attempt+1)
+            logger.debug("Request failed (attempt %s/%s): %s — retry in %s sec", attempt+1, max_retries+1, ex, wait)
             import time
             time.sleep(wait)
             attempt += 1
@@ -119,7 +127,7 @@ async def save_sync_date(db: AsyncSession, sync_date: datetime):
     )
 
 
-async def process_call_item(db: AsyncSession, item: Dict[str, Any]):
+async def process_call_item(db: AsyncSession, item: Dict[str, Any], chatwoot_client: Optional[ChatwootClient] = None):
     """Обработать одну запись дозвона"""
     period = clean_datetime(item.get("Period"))
     doc_key = clean_uuid(item.get("ДокументОбращения_Key"))  # cons_key
@@ -140,6 +148,13 @@ async def process_call_item(db: AsyncSession, item: Dict[str, Any]):
     
     cons_id = consultation.cons_id if consultation else None
     
+    # ВАЖНО: Если консультация не найдена, это может быть потому что:
+    # 1. Консультация еще не загружена из 1C (ETL еще не успел)
+    # 2. Консультация не относится к нашему сервису (нет Parent_Key)
+    # В любом случае, сохраняем дозвон, но без cons_id (для статистики)
+    if not consultation:
+        logger.debug(f"Consultation not found for call: doc_key={doc_key[:20] if doc_key else 'N/A'}, period={period}")
+    
     # Находим клиента по client_key
     client_id = None
     if client_key:
@@ -149,6 +164,16 @@ async def process_call_item(db: AsyncSession, item: Dict[str, Any]):
         row = result.first()
         if row:
             client_id = row[0]
+    
+    # Проверяем, существует ли уже такая запись
+    existing_call = await db.execute(
+        select(Call).where(
+            Call.period == period,
+            Call.cons_key == doc_key,
+            Call.manager == manager_key
+        ).limit(1)
+    )
+    is_new = existing_call.scalar_one_or_none() is None
     
     # Подготавливаем данные для вставки
     values = {
@@ -163,16 +188,88 @@ async def process_call_item(db: AsyncSession, item: Dict[str, Any]):
     stmt = insert(Call).values(**values)
     stmt = stmt.on_conflict_do_nothing(index_elements=["period", "cons_key", "manager"])
     await db.execute(stmt)
+    
+    # Если это новая запись и есть cons_id, отправляем note в Chatwoot
+    if is_new and cons_id and chatwoot_client:
+        # Проверяем, не было ли уже отправлено такое уведомление
+        # ВАЖНО: Используем отдельную транзакцию для сохранения NotificationLog,
+        # чтобы запись не потерялась при rollback основной транзакции
+        notification_data = {
+            "period": period.isoformat() if period else None,
+            "cons_key": doc_key,
+            "manager_key": manager_key
+        }
+        already_sent = await check_and_log_notification(
+            db=db,
+            notification_type="call",
+            entity_id=cons_id,
+            data=notification_data,
+            use_separate_transaction=True  # Используем отдельную транзакцию для надежности
+        )
+        if already_sent:
+            logger.debug(f"Call notification already sent for cons_id={cons_id}, period={period}, skipping")
+            return
+        
+        try:
+            # Получаем ФИО менеджера из БД
+            manager_name = None
+            if manager_key:
+                try:
+                    manager_result = await db.execute(
+                        select(User.description)
+                        .where(User.cl_ref_key == manager_key)
+                        .where(User.deletion_mark == False)
+                        .limit(1)
+                    )
+                    manager_name = manager_result.scalar_one_or_none()
+                except Exception as e:
+                    logger.warning(f"Failed to get manager name for {manager_key}: {e}")
+            
+            period_str = period.strftime("%d.%m.%Y %H:%M")
+            note_content = f"📞 Попытка дозвона\nДата/время: {period_str}"
+            if manager_name:
+                note_content += f"\nМенеджер: {manager_name}"
+            elif manager_key:
+                # Fallback на UUID, если не удалось получить ФИО
+                note_content += f"\nМенеджер: {manager_key[:8]}..."
+            
+            # Используем send_message вместо send_note, так как note сообщения не видны клиенту
+            await chatwoot_client.send_message(
+                conversation_id=cons_id,
+                content=note_content,
+                message_type="outgoing"
+            )
+            logger.debug(f"[pull_calls_cl] Sent call message to Chatwoot for consultation {cons_id}")
+        except Exception as e:
+            logger.debug(f"[pull_calls_cl] Failed to send call note to Chatwoot for consultation {cons_id}: {e}")
 
 
 async def pull_calls():
     """Основная функция загрузки дозвонов"""
+    etl_logger = ETLLogger("pull_calls_cl", ENTITY)
+    
     if not (ODATA_BASEURL and ODATA_USER and ODATA_PASSWORD):
-        logger.error("ODATA config missing. Check ODATA_BASEURL_CL, ODATA_USER, ODATA_PASSWORD")
+        etl_logger.critical_error("ODATA config missing. Check ODATA_BASEURL_CL, ODATA_USER, ODATA_PASSWORD")
         sys.exit(1)
     
+    etl_logger.start({
+        "ODATA_BASEURL": ODATA_BASEURL,
+        "ENTITY": ENTITY,
+        "INITIAL_FROM_DATE": INITIAL_FROM_DATE,
+        "PAGE_SIZE": PAGE_SIZE
+    })
+    
     auth = (ODATA_USER, ODATA_PASSWORD)
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    # ВАЖНО: Настраиваем пул соединений для ETL скрипта
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=2,
+        max_overflow=2,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        pool_timeout=30
+    )
     AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
     
     try:
@@ -181,74 +278,132 @@ async def pull_calls():
             last_sync = await get_last_sync_date(db)
             
             if last_sync:
-                # Инкрементальная загрузка: -7 дней буфер
-                from_date = (last_sync - timedelta(days=7)).strftime("%Y-%m-%d")
-                logger.info("Incremental sync from %s (last sync: %s)", from_date, last_sync)
+                from_dt = last_sync - timedelta(hours=12)
+                from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                etl_logger.sync_info(last_sync, from_date, buffer_days=None)  # Буфер в часах, не днях
             else:
-                from_date = INITIAL_FROM_DATE
-                logger.info("First run — loading from %s", from_date)
+                from_date = f"{INITIAL_FROM_DATE}T00:00:00"
+                etl_logger.sync_info(None, from_date)
             
-            total_processed = 0
             skip = 0
             error_logs = 0
+            last_processed_period: Optional[datetime] = last_sync
+            
+            # Инициализируем ChatwootClient для отправки уведомлений
+            chatwoot_client = None
+            try:
+                if settings.CHATWOOT_API_URL and settings.CHATWOOT_API_TOKEN:
+                    chatwoot_client = ChatwootClient()
+                    logger.debug("[pull_calls_cl] Chatwoot client initialized")
+                else:
+                    logger.debug("[pull_calls_cl] Chatwoot credentials not configured, skipping call notes")
+            except Exception as e:
+                logger.warning(f"[pull_calls_cl] Failed to initialize Chatwoot client: {e}")
+            
+            batch_created = 0
+            batch_errors = 0
             
             while True:
-                # Формируем фильтр по дате
-                filter_part = f"Period ge datetime'{from_date}T00:00:00'"
+                batch_num = skip // PAGE_SIZE + 1
+                filter_part = f"Period ge datetime'{from_date}'"
                 
                 url = (
                     f"{ODATA_BASEURL}{ENTITY}?$format=json"
-                    f"&$filter={filter_part}"
+                    f"&$filter={quote(filter_part)}"
                     f"&$orderby=Period asc"
                     f"&$top={PAGE_SIZE}&$skip={skip}"
                 )
                 
+                etl_logger.batch_start(batch_num, skip, PAGE_SIZE)
+                
                 try:
                     resp = http_get_with_backoff(url, auth, timeout=120)
                 except Exception as e:
-                    logger.exception("Failed to fetch batch: %s", e)
+                    etl_logger.batch_error(batch_num, e, skip)
                     break
                 
-                batch = resp.json().get("value", [])
+                try:
+                    response_data = resp.json()
+                    batch = response_data.get("value", [])
+                except Exception as json_error:
+                    etl_logger.batch_error(batch_num, json_error, skip)
+                    break
+                
                 if not batch:
                     break
                 
-                logger.info("Processing batch: %s items (skip=%s)", len(batch), skip)
+                batch_created = 0
+                batch_errors = 0
                 
                 # Обрабатываем каждый дозвон
                 for item in batch:
                     try:
-                        await process_call_item(db, item)
+                        await process_call_item(db, item, chatwoot_client)
+                        batch_created += 1
+                        
+                        # Отслеживаем последний обработанный период
+                        period = clean_datetime(item.get("Period"))
+                        if period:
+                            if period.tzinfo is None:
+                                period = period.replace(tzinfo=timezone.utc)
+                            if last_processed_period is None or period > last_processed_period:
+                                last_processed_period = period
                     except Exception as e:
+                        batch_errors += 1
                         if error_logs < MAX_ERROR_LOGS:
-                            logger.error("Error processing call %s: %s", item.get("Period"), e)
+                            etl_logger.item_error(item.get("Period", "N/A"), e, "call")
                         elif error_logs == MAX_ERROR_LOGS:
-                            logger.error("Further call processing errors suppressed to avoid log spam")
+                            logger.warning("[pull_calls_cl] Further call processing errors suppressed")
                         error_logs += 1
-                        await db.rollback()
                         continue
                 
-                await db.commit()
-                total_processed += len(batch)
-                logger.info("Processed %s calls (total: %s)", len(batch), total_processed)
+                # Коммитим транзакцию после обработки всего батча
+                try:
+                    await db.commit()
+                except Exception as commit_error:
+                    etl_logger.batch_error(batch_num, commit_error, skip)
+                    await db.rollback()
+                    raise
+                
+                # Логируем прогресс батча
+                etl_logger.batch_progress(batch_num, len(batch), created=batch_created, errors=batch_errors)
+                
+                # Сохраняем sync_state после каждого батча
+                if last_processed_period:
+                    try:
+                        await save_sync_date(db, last_processed_period)
+                        await db.commit()
+                        etl_logger.sync_state_saved(last_processed_period, batch_num)
+                    except Exception as sync_error:
+                        logger.warning(f"[pull_calls_cl] Failed to save sync state after batch: {sync_error}")
                 
                 if len(batch) < PAGE_SIZE:
                     break
                 
                 skip += PAGE_SIZE
             
-            # Сохраняем дату синхронизации
-            await save_sync_date(db, datetime.now(timezone.utc))
+            # Финальное сохранение даты синхронизации
+            sync_date_to_save = last_processed_period or datetime.now(timezone.utc)
+            await save_sync_date(db, sync_date_to_save)
             await db.commit()
-            
-            logger.info("✓ Sync completed. Total processed: %s", total_processed)
+            etl_logger.sync_state_saved(sync_date_to_save)
+            etl_logger.finish(success=True)
+    except Exception as e:
+        etl_logger.finish(success=False, error=e)
+        sys.exit(1)
     finally:
         await engine.dispose()
 
 
 async def ensure_support_tables():
     """Создаем вспомогательные таблицы и индексы при необходимости."""
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=1,
+        max_overflow=1,
+        pool_pre_ping=True
+    )
     async with engine.begin() as conn:
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sys.sync_state (

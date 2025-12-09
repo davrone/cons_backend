@@ -1,8 +1,9 @@
 """Схемы для переноса и оценок консультаций."""
 from datetime import datetime
 from typing import Optional, List
+from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class ConsultationRedateCreate(BaseModel):
@@ -42,3 +43,23 @@ class ConsultationRatingResponse(BaseModel):
     count: int = 0
     answers: List[ConsultationRatingAnswerPayload] = []
 
+
+class CallRead(BaseModel):
+    """Схема для чтения попытки дозвона"""
+    period: datetime
+    cons_key: Optional[str] = None
+    cons_id: Optional[str] = None
+    client_key: Optional[str] = None
+    client_id: Optional[str] = None
+    manager: Optional[str] = None
+
+    @field_validator('client_id', mode='before')
+    @classmethod
+    def convert_uuid_to_str(cls, v):
+        """Конвертирует UUID в строку, если это необходимо"""
+        if isinstance(v, UUID):
+            return str(v)
+        return v
+
+    class Config:
+        from_attributes = True

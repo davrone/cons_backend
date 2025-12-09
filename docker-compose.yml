@@ -8,3 +8,29 @@ services:
     ports:
       - "7070:7070"
     restart: unless-stopped
+    # Переменные для управления автоматизацией (можно переопределить в .env)
+    environment:
+      - LOAD_DICTS_ON_START=${LOAD_DICTS_ON_START:-true}
+      - SYNC_USERS_ON_START=${SYNC_USERS_ON_START:-true}
+      - ENABLE_SCHEDULER=${ENABLE_SCHEDULER:-false}  # Отключаем scheduler в API контейнере, если запущен отдельный
+  
+  cons_scheduler:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: cons_scheduler
+    env_file: .env
+    restart: unless-stopped
+    entrypoint: ["bash", "/app/scheduler_entrypoint.sh"]
+    environment:
+      - ETL_LOG_LEVEL=${ETL_LOG_LEVEL:-INFO}
+      - ODATA_PAGE_SIZE=${ODATA_PAGE_SIZE:-1000}
+      - ETL_INITIAL_FROM_DATE=${ETL_INITIAL_FROM_DATE:-2025-01-01}
+      - LOAD_DICTS_ON_START=false  # Отключаем загрузку справочников в scheduler
+      - SYNC_USERS_ON_START=false  # Отключаем синхронизацию пользователей в scheduler
+    # Логи scheduler будут видны отдельно
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

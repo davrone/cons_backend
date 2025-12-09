@@ -231,7 +231,16 @@ async def load_consultation_interference(client: ODataAsyncClient, session: Asyn
 
 
 async def pull_dicts():
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    # ВАЖНО: Настраиваем пул соединений для ETL скрипта
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=2,
+        max_overflow=2,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        pool_timeout=30
+    )
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     try:

@@ -18,6 +18,7 @@ import time
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set
+from urllib.parse import quote
 
 import requests
 from sqlalchemy import select, text, func
@@ -31,8 +32,11 @@ from FastAPI.models import (
     ConsRatingAnswer,
     Consultation,
     Client,
+    User,
 )
 from FastAPI.services.consultation_ratings import recalc_consultation_ratings
+from FastAPI.services.chatwoot_client import ChatwootClient
+from FastAPI.utils.notification_helpers import check_and_log_notification
 
 LOG_LEVEL = os.getenv("ETL_LOG_LEVEL", "INFO")
 PAGE_SIZE = int(os.getenv("ODATA_PAGE_SIZE", "1000"))
@@ -111,7 +115,13 @@ def http_get_with_backoff(url: str, auth: tuple, max_retries: int = 6, timeout: 
 
 
 async def ensure_support_objects():
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=1,
+        max_overflow=1,
+        pool_pre_ping=True
+    )
     async with engine.begin() as conn:
         await conn.execute(
             text(
@@ -178,9 +188,25 @@ async def fetch_client_map(db: AsyncSession, client_keys: Set[str]) -> Dict[str,
     return {row[0]: str(row[1]) if row[1] else None for row in result.all()}
 
 
-async def upsert_answers(db: AsyncSession, rows: List[Dict[str, Any]]):
+async def upsert_answers(db: AsyncSession, rows: List[Dict[str, Any]]) -> Set[tuple]:
+    """Вставляет/обновляет записи оценок и возвращает множество ключей новых записей"""
     if not rows:
-        return
+        return set()
+    
+    # Проверяем, какие записи уже существуют
+    existing_keys = set()
+    for row in rows:
+        result = await db.execute(
+            select(ConsRatingAnswer).where(
+                ConsRatingAnswer.cons_key == row["cons_key"],
+                ConsRatingAnswer.manager_key == row["manager_key"],
+                ConsRatingAnswer.question_number == row["question_number"]
+            ).limit(1)
+        )
+        if result.scalar_one_or_none():
+            existing_keys.add((row["cons_key"], row["manager_key"], row["question_number"]))
+    
+    # Вставляем/обновляем записи
     stmt = insert(ConsRatingAnswer).values(rows)
     stmt = stmt.on_conflict_do_update(
         constraint="uq_cons_rating_answer",
@@ -189,12 +215,103 @@ async def upsert_answers(db: AsyncSession, rows: List[Dict[str, Any]]):
             "question_text": stmt.excluded.question_text,
             "comment": stmt.excluded.comment,
             "sent_to_base": stmt.excluded.sent_to_base,
+            "rating_date": stmt.excluded.rating_date,  # Обновляем ДатаОценки
             "cons_id": stmt.excluded.cons_id,
             "client_id": stmt.excluded.client_id,
             "updated_at": func.now(),
         },
     )
     await db.execute(stmt)
+    
+    # Возвращаем ключи новых записей для отправки уведомлений
+    return {(row["cons_key"], row["manager_key"], row["question_number"]) for row in rows if (row["cons_key"], row["manager_key"], row["question_number"]) not in existing_keys}
+
+
+async def notify_chatwoot_rating(
+    cons_id: str,
+    rating: Optional[int],
+    question_text: Optional[str] = None,
+    manager_key: Optional[str] = None,
+    db: Optional[AsyncSession] = None,
+):
+    """
+    Отправка уведомления об оценке консультации в Chatwoot (как note).
+    
+    Args:
+        cons_id: ID консультации
+        rating: Оценка (1-5)
+        question_text: Текст вопроса (опционально)
+        manager_key: UUID менеджера (cl_ref_key)
+        db: Сессия БД для получения ФИО менеджера (опционально)
+    """
+    if not cons_id or cons_id.startswith(("temp_", "cl_")):
+        # Пропускаем временные ID
+        return
+    
+    if rating is None:
+        return
+    
+    # Проверяем, не было ли уже отправлено такое уведомление
+    if db:
+        # ВАЖНО: Нормализуем manager_key для стабильного хеша (None -> "")
+        # Ограничиваем question_text до 100 символов для стабильности хеша
+        normalized_manager_key = manager_key if manager_key else ""
+        normalized_question_text = question_text[:100] if question_text else None
+        
+        notification_data = {
+            "rating": rating,
+            "question_text": normalized_question_text,
+            "manager_key": normalized_manager_key
+        }
+        # ВАЖНО: Используем отдельную транзакцию для сохранения NotificationLog,
+        # чтобы запись не потерялась при rollback основной транзакции ETL
+        already_sent = await check_and_log_notification(
+            db=db,
+            notification_type="rating",
+            entity_id=cons_id,
+            data=notification_data,
+            use_separate_transaction=True  # Используем отдельную транзакцию для надежности
+        )
+        if already_sent:
+            logger.debug(f"Rating notification already sent for cons_id={cons_id}, rating={rating}, skipping")
+            return
+    
+    try:
+        chatwoot_client = ChatwootClient()
+        
+        # Получаем ФИО менеджера из БД
+        manager_name = None
+        if manager_key and db:
+            try:
+                manager_result = await db.execute(
+                    select(User.description)
+                    .where(User.cl_ref_key == manager_key)
+                    .where(User.deletion_mark == False)
+                    .limit(1)
+                )
+                manager_name = manager_result.scalar_one_or_none()
+            except Exception as e:
+                logger.warning(f"Failed to get manager name for {manager_key}: {e}")
+        
+        # Формируем сообщение об оценке
+        message = f"⭐ Оценка консультации получена\nОценка: {rating}/5"
+        if question_text:
+            message += f"\nВопрос: {question_text[:100]}"  # Ограничиваем длину
+        if manager_name:
+            message += f"\nМенеджер: {manager_name}"
+        elif manager_key:
+            # Fallback на UUID, если не удалось получить ФИО
+            message += f"\nМенеджер: {manager_key[:8]}..."
+        
+        # Используем send_message вместо send_note, так как note сообщения не видны клиенту
+        await chatwoot_client.send_message(
+            conversation_id=cons_id,
+            content=message,
+            message_type="outgoing"
+        )
+        logger.info(f"Sent rating message to Chatwoot for cons_id={cons_id}, rating={rating}")
+    except Exception as e:
+        logger.warning(f"Failed to notify Chatwoot about rating (cons_id={cons_id}): {e}")
 
 
 async def process_batch(
@@ -232,7 +349,18 @@ async def process_batch(
         client_key = clean_uuid(item.get("Контрагент_Key"))
         manager_key = clean_uuid(item.get("Менеджер_Key"))
         question_number = clean_int(item.get("НомерВопроса"))
-        period_dt = clean_datetime(item.get("Period"))
+        
+        # ВАЖНО: У сущности InformationRegister_ОценкаКонсультацийПоЗаявкам НЕТ поля Period
+        # Используем только ДатаОценки (может быть "0001-01-01T00:00:00" если не заполнена)
+        rating_date_dt = clean_datetime(item.get("ДатаОценки"))
+        
+        # Для синхронизации используем ДатаОценки
+        # Если ДатаОценки не валидна (0001-01-01), используем текущую дату как fallback
+        sync_date = rating_date_dt
+        if not sync_date or sync_date.year == 1:
+            # Если ДатаОценки не заполнена, используем текущую дату для синхронизации
+            sync_date = datetime.now(timezone.utc)
+            rating_date_dt = None  # Не сохраняем невалидную дату
 
         if not cons_key:
             stats["skipped_missing_cons"] += 1
@@ -240,16 +368,16 @@ async def process_batch(
         if question_number is None:
             stats["skipped_missing_question"] += 1
             continue
-        if not period_dt:
+        if not sync_date:
             stats["skipped_missing_period"] += 1
             continue
 
-        if min_period and period_dt < min_period:
+        if min_period and sync_date < min_period:
             stats["skipped_before_min"] += 1
             continue
 
-        if latest_period is None or period_dt > latest_period:
-            latest_period = period_dt
+        if latest_period is None or sync_date > latest_period:
+            latest_period = sync_date
 
         rating_value = clean_int(item.get("Оценка"))
         cons_info = cons_map.get(cons_key, (None, None))
@@ -268,6 +396,7 @@ async def process_batch(
                 "question_text": item.get("Вопрос"),
                 "comment": item.get("Комментарий"),
                 "sent_to_base": item.get("ОтправленаБаза"),
+                "rating_date": rating_date_dt,  # Сохраняем ДатаОценки
                 "created_at": datetime.now(timezone.utc),
                 "updated_at": datetime.now(timezone.utc),
             }
@@ -277,8 +406,24 @@ async def process_batch(
     if not rows:
         return 0, latest_period, stats
 
-    await upsert_answers(db, rows)
+    # Вставляем/обновляем записи и получаем ключи новых записей
+    new_keys = await upsert_answers(db, rows)
     await recalc_consultation_ratings(db, affected_cons_keys)
+    
+    # Отправляем уведомления в Chatwoot для новых оценок
+    for row in rows:
+        row_key = (row["cons_key"], row["manager_key"], row["question_number"])
+        if row_key in new_keys:
+            cons_id = row.get("cons_id")
+            if cons_id:
+                await notify_chatwoot_rating(
+                    cons_id=cons_id,
+                    rating=row.get("rating"),
+                    question_text=row.get("question_text"),
+                    manager_key=row.get("manager_key"),
+                    db=db
+                )
+    
     return len(rows), latest_period, stats
 
 
@@ -288,7 +433,16 @@ async def pull_cons_rates():
         sys.exit(1)
 
     auth = (ODATA_USER, ODATA_PASSWORD)
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    # ВАЖНО: Настраиваем пул соединений для ETL скрипта
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=2,
+        max_overflow=2,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        pool_timeout=30
+    )
     AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -307,8 +461,12 @@ async def pull_cons_rates():
             last_period_processed: Optional[datetime] = None
 
             while True:
+                # ВАЖНО: У сущности InformationRegister_ОценкаКонсультацийПоЗаявкам НЕТ поля Period для фильтрации
+                # Загружаем все записи без фильтра по дате (фильтрация происходит в process_batch по min_period)
+                # Используем только сортировку по ДатаОценки
                 url = (
                     f"{ODATA_BASEURL}{ENTITY}?$format=json"
+                    f"&$orderby=ДатаОценки asc"
                     f"&$top={PAGE_SIZE}&$skip={skip}"
                 )
 
@@ -366,10 +524,21 @@ async def pull_cons_rates():
                 ):
                     last_period_processed = latest_period
 
+                # ВАЖНО: Сохраняем sync_state после каждого батча для устойчивости при прерывании
+                if last_period_processed:
+                    try:
+                        await save_sync_date(db, last_period_processed)
+                        await db.commit()
+                        logger.debug(f"✓ Sync state saved after batch: {last_period_processed}")
+                    except Exception as sync_error:
+                        logger.warning(f"Failed to save sync state after batch: {sync_error}")
+                        # Не прерываем выполнение, продолжаем обработку
+
                 if len(batch) < PAGE_SIZE:
                     break
                 skip += PAGE_SIZE
 
+            # Финальное сохранение даты синхронизации (на случай если последний батч не сохранил)
             if last_period_processed:
                 await save_sync_date(db, last_period_processed)
                 await db.commit()
