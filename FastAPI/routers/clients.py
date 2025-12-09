@@ -733,6 +733,13 @@ async def find_or_create_client(
                 # ВАЖНО: Обновляем company_name только если это владелец
                 if client_data.company_name and final_is_parent:
                     client.company_name = client_data.company_name.strip() if client_data.company_name else None
+                # Обновляем географические поля
+                if client_data.country is not None:
+                    client.country = client_data.country
+                if client_data.region is not None:
+                    client.region = client_data.region
+                if client_data.city is not None:
+                    client.city = client_data.city
                 # Обновляем is_parent и parent_id согласно запросу
                 client.is_parent = final_is_parent
                 client.parent_id = parent_uuid
@@ -801,6 +808,13 @@ async def find_or_create_client(
             # ВАЖНО: Обновляем company_name только если это владелец
             if client_data.company_name and final_is_parent:
                 client.company_name = client_data.company_name.strip() if client_data.company_name else None
+            # Обновляем географические поля
+            if client_data.country is not None:
+                client.country = client_data.country
+            if client_data.region is not None:
+                client.region = client_data.region
+            if client_data.city is not None:
+                client.city = client_data.city
             client.is_parent = final_is_parent
             client.parent_id = parent_uuid
             return client
@@ -881,6 +895,13 @@ async def find_or_create_client(
         # ВАЖНО: Обновляем company_name только если это владелец
         if client_data.company_name and final_is_parent:
             client.company_name = client_data.company_name.strip() if client_data.company_name else None
+        # Обновляем географические поля
+        if client_data.country is not None:
+            client.country = client_data.country
+        if client_data.region is not None:
+            client.region = client_data.region
+        if client_data.city is not None:
+            client.city = client_data.city
         client.is_parent = final_is_parent
         client.parent_id = parent_uuid
         return client
@@ -956,6 +977,13 @@ async def find_or_create_client(
             # ВАЖНО: Обновляем company_name только если это владелец
             if client_data.company_name and final_is_parent:
                 client_by_code.company_name = client_data.company_name.strip() if client_data.company_name else None
+            # Обновляем географические поля
+            if client_data.country is not None:
+                client_by_code.country = client_data.country
+            if client_data.region is not None:
+                client_by_code.region = client_data.region
+            if client_data.city is not None:
+                client_by_code.city = client_data.city
             client_by_code.code_abonent = normalized_code_abonent
             client_by_code.is_parent = final_is_parent
             client_by_code.parent_id = parent_uuid
@@ -1012,6 +1040,13 @@ async def find_or_create_client(
                 # Заполняем code_abonent
                 if normalized_code_abonent:
                     existing_owner.code_abonent = normalized_code_abonent
+                # Обновляем географические поля
+                if client_data.country is not None:
+                    existing_owner.country = client_data.country
+                if client_data.region is not None:
+                    existing_owner.region = client_data.region
+                if client_data.city is not None:
+                    existing_owner.city = client_data.city
                 existing_owner.org_inn = normalized_inn
                 existing_owner.is_parent = True
                 existing_owner.parent_id = None
@@ -1117,8 +1152,10 @@ async def get_client(
     """
     Получение клиента по ID.
     
-    Если клиент является пользователем (is_parent=false), 
-    возвращает данные с полями company_name, org_inn, region, city из владельца.
+    Для владельца (is_parent=true): возвращает все поля клиента, включая country, region, city из БД.
+    
+    Для пользователя (is_parent=false): возвращает данные с полями company_name, org_inn, country, region, city из владельца.
+    Остальные поля (name, email, phone_number и т.д.) возвращаются из самого пользователя.
     """
     try:
         client_uuid = uuid.UUID(client_id)
@@ -1141,13 +1178,14 @@ async def get_client(
         owner = owner_result.scalar_one_or_none()
         
         if owner:
-            # Создаем временный объект с данными владельца для полей company_name, org_inn, region, city
+            # Создаем временный объект с данными владельца для полей company_name, org_inn, country, region, city
             # Для пользователей всегда используем данные владельца для этих полей
             client_data = ClientRead.model_validate(client)
             
             # Заменяем поля из владельца (всегда для пользователей)
             client_data.company_name = owner.company_name
             client_data.org_inn = owner.org_inn
+            client_data.country = owner.country
             client_data.region = owner.region
             client_data.city = owner.city
             
@@ -1161,7 +1199,12 @@ async def get_client_by_hash(
     client_hash: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Получение клиента по хешу"""
+    """
+    Получение клиента по хешу.
+    
+    Если клиент является пользователем (is_parent=false), 
+    возвращает данные с полями company_name, org_inn, country, region, city из владельца.
+    """
     result = await db.execute(
         select(Client).where(Client.client_id_hash == client_hash)
     )
@@ -1169,6 +1212,27 @@ async def get_client_by_hash(
     
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
+    
+    # Если это пользователь (is_parent=false), получаем данные владельца
+    if not client.is_parent and client.parent_id:
+        owner_result = await db.execute(
+            select(Client).where(Client.client_id == client.parent_id)
+        )
+        owner = owner_result.scalar_one_or_none()
+        
+        if owner:
+            # Создаем временный объект с данными владельца для полей company_name, org_inn, country, region, city
+            # Для пользователей всегда используем данные владельца для этих полей
+            client_data = ClientRead.model_validate(client)
+            
+            # Заменяем поля из владельца (всегда для пользователей)
+            client_data.company_name = owner.company_name
+            client_data.org_inn = owner.org_inn
+            client_data.country = owner.country
+            client_data.region = owner.region
+            client_data.city = owner.city
+            
+            return client_data
     
     return ClientRead.model_validate(client)
 

@@ -147,16 +147,50 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
     """
     Создать или обновить клиента.
     Возвращает (is_new, is_updated)
+    
+    ВАЖНО: Обрабатывает дубли по code_abonent:
+    - Если клиент с таким code_abonent уже существует, обновляем его вместо создания нового
+    - Это предотвращает потерю истории заявок из-за дублей
     """
     ref_key = clean_uuid(item.get("Ref_Key"))
     if not ref_key:
         return False, False
     
-    # Проверяем, существует ли клиент
+    # Извлекаем code_abonent для проверки дублей
+    code_abonent = item.get("КодАбонентаClobus")
+    if code_abonent == "0" or not code_abonent:
+        code_abonent = None
+    
+    # Проверяем, существует ли клиент по cl_ref_key
     result = await db.execute(
         select(Client).where(Client.cl_ref_key == ref_key).limit(1)
     )
     existing_client = result.scalar_one_or_none()
+    
+    # ВАЖНО: Если клиент не найден по cl_ref_key, но есть code_abonent,
+    # проверяем, нет ли уже клиента с таким code_abonent (дубль)
+    if not existing_client and code_abonent:
+        result = await db.execute(
+            select(Client).where(
+                Client.code_abonent == code_abonent,
+                Client.is_parent == True
+            ).order_by(Client.created_at.asc()).limit(1)
+        )
+        existing_client_by_code = result.scalar_one_or_none()
+        
+        if existing_client_by_code:
+            # Найден дубль по code_abonent - обновляем существующего клиента
+            # вместо создания нового, чтобы сохранить историю заявок
+            logger.warning(
+                f"Duplicate code_abonent '{code_abonent}' detected: "
+                f"client with cl_ref_key={ref_key} will update existing client "
+                f"client_id={existing_client_by_code.client_id} (cl_ref_key={existing_client_by_code.cl_ref_key})"
+            )
+            existing_client = existing_client_by_code
+            # Обновляем cl_ref_key на новый, если он более свежий
+            # (приоритет отдаем клиенту из ЦЛ с более свежими данными)
+            if not existing_client.cl_ref_key or existing_client.cl_ref_key != ref_key:
+                existing_client.cl_ref_key = ref_key
     
     # Извлекаем данные
     email, phone = extract_contact_info(item.get("КонтактнаяИнформация", []))

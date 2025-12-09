@@ -783,7 +783,7 @@ setInterval(() => ws.send('ping'), 30000);
 #### GET `/clients/{client_id}`
 Получение клиента по ID.
 
-Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `region`, `city` из владельца.
+Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `country`, `region`, `city` из владельца.
 
 **ВАЖНО:** В ответе всегда присутствуют поля `is_parent` и `parent_id`, которые определяют права доступа:
 - `is_parent=true` и `parent_id=null` → владелец (может изменять ИНН и название организации)
@@ -799,6 +799,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "country": "Россия",
   "region": "Москва",
   "city": "Москва",
   "source_id": "chatwoot-source-id",
@@ -818,6 +819,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "country": "Россия",
   "region": "Москва",
   "city": "Москва",
   "source_id": "chatwoot-source-id",
@@ -835,11 +837,41 @@ setInterval(() => ws.send('ping'), 30000);
 #### GET `/clients/by-hash/{hash}`
 Получение клиента по хешу.
 
-**Response (200):**
+Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `country`, `region`, `city` из владельца.
+
+**Response (200) - для владельца:**
 ```json
 {
   "client_id": "uuid-клиента",
-  "name": "Иван Иванов"
+  "name": "Иван Иванов",
+  "email": "ivan@example.com",
+  "phone_number": "+79991234567",
+  "code_abonent": "12345",
+  "org_inn": "1234567890",
+  "company_name": "ООО Компания",
+  "country": "Россия",
+  "region": "Москва",
+  "city": "Москва",
+  "is_parent": true,
+  "parent_id": null
+}
+```
+
+**Response (200) - для пользователя:**
+```json
+{
+  "client_id": "uuid-пользователя",
+  "name": "Петр Петров",
+  "email": "petr@example.com",
+  "phone_number": "+79991234568",
+  "code_abonent": "12345",
+  "org_inn": "1234567890",
+  "company_name": "ООО Компания",
+  "country": "Россия",
+  "region": "Москва",
+  "city": "Москва",
+  "is_parent": false,
+  "parent_id": "uuid-владельца"
 }
 ```
 
@@ -871,6 +903,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "country": "Россия",
   "region": "Москва",
   "city": "Москва",
   "is_parent": true,
@@ -888,6 +921,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "country": "Россия",
   "region": "Москва",
   "city": "Москва",
   "is_parent": true,

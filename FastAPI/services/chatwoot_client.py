@@ -595,13 +595,26 @@ class ChatwootClient:
             }
         
         # Custom attributes для беседы (conversation)
+        # ВАЖНО: Обязательные поля (code_abonent, topic_name) должны быть переданы всегда
         if custom_attributes:
             cleaned_custom_attrs = self._clean_custom_attributes(
                 custom_attributes,
                 required_fields=("code_abonent", "topic_name")
             )
+            # Передаем custom_attributes даже если остались только обязательные поля
+            # Обязательные поля должны быть всегда переданы в Chatwoot
             if cleaned_custom_attrs:
                 payload["custom_attributes"] = cleaned_custom_attrs
+            else:
+                # Если после очистки словарь пустой, но обязательные поля должны быть,
+                # создаем минимальный словарь с обязательными полями
+                required_attrs = {}
+                if "code_abonent" in custom_attributes:
+                    required_attrs["code_abonent"] = str(custom_attributes.get("code_abonent", ""))
+                if "topic_name" in custom_attributes:
+                    required_attrs["topic_name"] = str(custom_attributes.get("topic_name", ""))
+                if required_attrs:
+                    payload["custom_attributes"] = required_attrs
         
         import json
         logger.info(f"=== Creating Chatwoot conversation via Public API ===")
