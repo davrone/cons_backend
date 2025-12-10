@@ -367,19 +367,27 @@ async def process_consultation_item(
             consultation.status = status
             has_changes = True
             
-            # ВАЖНО: Автоматически закрываем заявку в Chatwoot при закрытии в ЦЛ
-            # Если статус изменился на "closed" и есть cons_id (не временный), закрываем в Chatwoot
-            if status == "closed" and old_status != "closed" and consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+            # ВАЖНО: Синхронизируем статус с Chatwoot при изменении
+            # Если статус изменился и есть cons_id (не временный), обновляем в Chatwoot
+            if consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
                 try:
                     chatwoot_client = ChatwootClient()
-                    await chatwoot_client.update_conversation(
-                        conversation_id=consultation.cons_id,
-                        status="resolved"  # Chatwoot использует "resolved" для закрытых бесед
-                    )
-                    # Логируем только на уровне debug - это не критично для мониторинга
-                    logger.debug(f"Automatically closed consultation {consultation.cons_id} in Chatwoot (closed in 1C:ЦЛ)")
-                except Exception as close_error:
-                    logger.warning(f"Failed to close consultation {consultation.cons_id} in Chatwoot: {close_error}")
+                    # Если статус "closed" - закрываем в Chatwoot
+                    if status == "closed" and old_status != "closed":
+                        await chatwoot_client.update_conversation(
+                            conversation_id=consultation.cons_id,
+                            status="resolved"  # Chatwoot использует "resolved" для закрытых бесед
+                        )
+                        logger.info(f"Automatically closed consultation {consultation.cons_id} in Chatwoot (closed in 1C:ЦЛ)")
+                    # Если статус "open" (КонсультацияИТС с пустым Конец) - открываем в Chatwoot
+                    elif status == "open" and old_status != "open":
+                        await chatwoot_client.update_conversation(
+                            conversation_id=consultation.cons_id,
+                            status="open"  # Открываем заявку в Chatwoot
+                        )
+                        logger.info(f"Automatically opened consultation {consultation.cons_id} in Chatwoot (opened in 1C:ЦЛ)")
+                except Exception as sync_error:
+                    logger.warning(f"Failed to sync consultation status {consultation.cons_id} in Chatwoot: {sync_error}")
         
         if client_key and consultation.client_key != client_key:
             consultation.client_key = client_key

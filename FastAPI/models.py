@@ -46,6 +46,7 @@ class Client(Base):
     name = Column(Text, nullable=True)
     contact_name = Column(Text, nullable=True)
     company_name = Column(Text, nullable=True)  # Название компании клиента для формирования имени в 1C (НЕ обслуживающая организация)
+    partner = Column(Text, nullable=True)  # Обслуживающая организация (partner) для передачи в Chatwoot
     code_abonent = Column(Text, nullable=True)
     source_id = Column(Text, nullable=True)  # source_id из Chatwoot (для идентификации контакта)
     chatwoot_pubsub_token = Column(Text, nullable=True)  # pubsub_token из Chatwoot (для WebSocket подключения виджета, принадлежит контакту)
@@ -140,6 +141,7 @@ class User(Base):
     con_limit = Column(Integer, nullable=True)
     start_hour = Column(Time, nullable=True)  # TIME
     end_hour = Column(Time, nullable=True)  # TIME
+    consultation_enabled = Column(Boolean, default=True, nullable=False)  # Разрешение на участие в консультациях
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

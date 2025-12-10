@@ -51,10 +51,11 @@ class ManagerSelector:
         if current_time is None:
             current_time = datetime.now(timezone.utc)
         
-        # Базовый запрос: активные менеджеры с лимитами
+        # Базовый запрос: активные менеджеры с лимитами и разрешением на консультации
         query = select(User).where(
             User.deletion_mark == False,
             User.invalid == False,
+            User.consultation_enabled == True,  # Только менеджеры с разрешением на консультации
             User.con_limit.isnot(None),
             User.con_limit > 0,
         )

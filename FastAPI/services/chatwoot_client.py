@@ -488,7 +488,8 @@ class ChatwootClient:
         identifier: Optional[str] = None,
         email: Optional[str] = None,
         phone_number: Optional[str] = None,
-        custom_attributes: Optional[Dict[str, Any]] = None
+        custom_attributes: Optional[Dict[str, Any]] = None,
+        additional_attributes: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Создание контакта через Public API.
@@ -538,6 +539,10 @@ class ChatwootClient:
             )
             if cleaned_custom_attrs:
                 payload["custom_attributes"] = cleaned_custom_attrs
+        
+        if additional_attributes:
+            # Типовые атрибуты Chatwoot
+            payload["additional_attributes"] = additional_attributes
         
         import json
         logger.info(f"=== Creating Chatwoot contact via Public API ===")
@@ -595,24 +600,22 @@ class ChatwootClient:
             }
         
         # Custom attributes для беседы (conversation)
-        # ВАЖНО: Обязательные поля (code_abonent, topic_name) должны быть переданы всегда
+        # ВАЖНО: Обязательное поле (code_abonent) должно быть передано всегда
         if custom_attributes:
             cleaned_custom_attrs = self._clean_custom_attributes(
                 custom_attributes,
-                required_fields=("code_abonent", "topic_name")
+                required_fields=("code_abonent",)
             )
-            # Передаем custom_attributes даже если остались только обязательные поля
-            # Обязательные поля должны быть всегда переданы в Chatwoot
+            # Передаем custom_attributes даже если осталось только обязательное поле
+            # Обязательное поле должно быть всегда передано в Chatwoot
             if cleaned_custom_attrs:
                 payload["custom_attributes"] = cleaned_custom_attrs
             else:
-                # Если после очистки словарь пустой, но обязательные поля должны быть,
-                # создаем минимальный словарь с обязательными полями
+                # Если после очистки словарь пустой, но обязательное поле должно быть,
+                # создаем минимальный словарь с обязательным полем
                 required_attrs = {}
                 if "code_abonent" in custom_attributes:
                     required_attrs["code_abonent"] = str(custom_attributes.get("code_abonent", ""))
-                if "topic_name" in custom_attributes:
-                    required_attrs["topic_name"] = str(custom_attributes.get("topic_name", ""))
                 if required_attrs:
                     payload["custom_attributes"] = required_attrs
         
@@ -840,6 +843,47 @@ class ChatwootClient:
             payload["assignee_id"] = int(assignee_id)
         if team_id:
             payload["team_id"] = int(team_id)
+    
+    async def get_teams(self) -> List[Dict[str, Any]]:
+        """
+        Получить список всех команд в Chatwoot.
+        
+        Returns:
+            Список команд с полями id, name и т.д.
+        """
+        endpoint = f"/api/v1/accounts/{self.account_id}/teams"
+        return await self._request("GET", endpoint)
+    
+    async def find_team_by_name(self, team_name: str) -> Optional[int]:
+        """
+        Найти команду по имени.
+        
+        Args:
+            team_name: Название команды
+            
+        Returns:
+            ID команды или None если не найдена
+        """
+        try:
+            teams = await self.get_teams()
+            # teams может быть списком или словарем с ключом "payload"
+            if isinstance(teams, dict) and "payload" in teams:
+                teams_list = teams["payload"]
+            elif isinstance(teams, list):
+                teams_list = teams
+            else:
+                logger.warning(f"Unexpected teams response format: {type(teams)}")
+                return None
+            
+            for team in teams_list:
+                if isinstance(team, dict) and team.get("name") == team_name:
+                    return team.get("id")
+            
+            logger.debug(f"Team '{team_name}' not found in Chatwoot")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to find team '{team_name}' in Chatwoot: {e}")
+            return None
         
         # Labels - метки беседы (используем для language и source)
         # ВАЖНО: Согласно ТЗ, labels лучше добавлять отдельным запросом после создания
@@ -850,7 +894,7 @@ class ChatwootClient:
         # Custom attributes для беседы (conversation)
         # ВАЖНО: Это атрибуты беседы, не контакта!
         if custom_attributes:
-            cleaned_custom_attrs = self._clean_custom_attributes(custom_attributes, required_fields=("code_abonent", "topic_name"))
+            cleaned_custom_attrs = self._clean_custom_attributes(custom_attributes, required_fields=("code_abonent",))
             if cleaned_custom_attrs:
                 payload["custom_attributes"] = cleaned_custom_attrs
                 logger.info(f"Conversation custom attributes ({len(cleaned_custom_attrs)} fields): {list(cleaned_custom_attrs.keys())}")
@@ -1018,6 +1062,7 @@ class ChatwootClient:
         conversation_id: str,
         status: Optional[str] = None,
         assignee_id: Optional[int] = None,
+        team_id: Optional[int] = None,
         custom_attributes: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -1027,6 +1072,7 @@ class ChatwootClient:
             conversation_id: ID консультации
             status: Статус консультации
             assignee_id: ID назначенного агента
+            team_id: ID команды
             custom_attributes: Кастомные атрибуты для обновления
         """
         payload = {}
@@ -1034,6 +1080,8 @@ class ChatwootClient:
             payload["status"] = status
         if assignee_id:
             payload["assignee_id"] = assignee_id
+        if team_id:
+            payload["team_id"] = team_id
         if custom_attributes:
             # Применяем ту же очистку, что и при создании
             cleaned_custom_attrs = {}
@@ -1473,7 +1521,8 @@ class ChatwootClient:
         email: Optional[str] = None,
         phone_number: Optional[str] = None,
         custom_attributes: Optional[Dict[str, Any]] = None,
-        inbox_id: Optional[int] = None
+        inbox_id: Optional[int] = None,
+        additional_attributes: Optional[Dict[str, Any]] = None
         # source_id НЕ передается - Chatwoot создает его автоматически
     ) -> Dict[str, Any]:
         """
@@ -1528,6 +1577,9 @@ class ChatwootClient:
             )
             if cleaned_custom_attrs:
                 payload["custom_attributes"] = cleaned_custom_attrs
+        
+        if additional_attributes:
+            payload["additional_attributes"] = additional_attributes
         
         logger.info(f"Creating Chatwoot contact: {payload}")
         return await self._request(

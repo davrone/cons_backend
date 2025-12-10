@@ -14,6 +14,7 @@ class ClientCreate(BaseModel):
     name: Optional[str] = None
     contact_name: Optional[str] = None
     company_name: Optional[str] = None  # Название компании клиента (для формирования имени в 1C, НЕ обслуживающая организация)
+    partner: Optional[str] = None  # Обслуживающая организация (для Chatwoot и витрин)
     subscriber_id: Optional[str] = Field(default=None, alias="subscriberId")
     
     # География
@@ -54,6 +55,7 @@ class ClientRead(BaseModel):
     name: Optional[str] = None
     contact_name: Optional[str] = None
     company_name: Optional[str] = None
+    partner: Optional[str] = None
     subscriber_id: Optional[str] = Field(default=None, alias="subscriberId")
     country: Optional[str] = None
     region: Optional[str] = None

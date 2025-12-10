@@ -204,10 +204,20 @@ def transform_users(
 
         email, phone = extract_contact_info(row.get("КонтактнаяИнформация", []))
 
+        # Определяем команду (team) на основе department
+        department_name = dept_map.get(dept_key)
+        chatwoot_team = None
+        if department_name:
+            # Маппинг department -> команда в Chatwoot
+            # "ИТС консультанты" и "1С:УК 3.0 и Розница 3.0" -> "консультация по ведению учета"
+            if department_name in ("ИТС консультанты", "1С:УК 3.0 и Розница 3.0"):
+                chatwoot_team = "консультация по ведению учета"
+            # Для технической поддержки можно не назначать команду, Chatwoot сам назначит
+        
         transformed.append(
             {
                 "user_id": row.get("Code") or row.get("Description"),
-                "chatwoot_team": None,
+                "chatwoot_team": chatwoot_team,
                 "avatar_url": None,
                 "confirmed": False,
                 "cl_ref_key": cl_ref_key,
@@ -216,7 +226,7 @@ def transform_users(
                 "invalid": bool(row.get("Недействителен")),
                 "ru": LANG_RU in lang_keys,
                 "uz": LANG_UZ in lang_keys,
-                "department": dept_map.get(dept_key),
+                "department": department_name,
                 "con_limit": consultant.get("con_limit"),
                 "start_hour": consultant.get("start_hour"),
                 "end_hour": consultant.get("end_hour"),
@@ -263,7 +273,7 @@ async def upsert_users(db: AsyncSession, users: List[Dict[str, Any]]) -> Tuple[i
                 .where(User.account_id == existing_map[cl_ref_key])
                 .values(
                     user_id=payload["user_id"],
-                    chatwoot_team=None,
+                    chatwoot_team=payload["chatwoot_team"],
                     avatar_url=None,
                     confirmed=False,
                     deletion_mark=payload["deletion_mark"],
@@ -283,7 +293,7 @@ async def upsert_users(db: AsyncSession, users: List[Dict[str, Any]]) -> Tuple[i
             db.add(
                 User(
                     user_id=payload["user_id"],
-                    chatwoot_team=None,
+                    chatwoot_team=payload["chatwoot_team"],
                     avatar_url=None,
                     confirmed=False,
                     cl_ref_key=cl_ref_key,

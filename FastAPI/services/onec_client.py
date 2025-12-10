@@ -532,6 +532,16 @@ class OneCClient:
         await self._odata_request("DELETE", endpoint)
         logger.info(f"Deleted 1C consultation: Ref_Key={ref_key}")
 
+    async def mark_consultation_deleted(self, ref_key: str) -> Dict[str, Any]:
+        """
+        Пометить консультацию на удаление (DeletionMark = true) вместо физического удаления.
+        """
+        endpoint = f"/{self.entity}(guid'{ref_key}')"
+        payload = {"DeletionMark": True}
+        response = await self._odata_request("PATCH", endpoint, data=payload)
+        logger.info(f"Marked 1C consultation as deleted (DeletionMark=true): Ref_Key={ref_key}")
+        return response
+
     async def find_client_by_inn(self, org_inn: Optional[str]) -> Optional[Dict[str, Any]]:
         """Поиск клиента (Catalog_Контрагенты) по ИНН."""
         if not org_inn:

@@ -445,14 +445,13 @@ async def _build_chatwoot_custom_attrs(
     - Используем только поля, специфичные для Conversation
     
     Custom attributes для Conversation:
-    - code_abonent, topic_name (обязательные - всегда присутствуют, даже если пустые)
-    - number_con (опциональное - добавляется после получения из 1C)
-    - category_name, question_name, date_con, con_end, redate_con, retime_con, type_con, closed_without_con (опционально)
+    - code_abonent (обязательное - всегда присутствует, даже если пустое)
+    - number_con, category_name, question_name, date_con, con_end, redate_con, retime_con, 
+      consultation_type, closed_without_con, subs_id, subs_start, subs_end, tariff_id, tariffperiod_id (опционально)
     """
-    # Обязательные поля - всегда присутствуют, даже если пустые
+    # Обязательное поле - всегда присутствует, даже если пустое
     attrs: Dict[str, Any] = {
         "code_abonent": owner.code_abonent or "",  # Всегда строка, не None
-        "topic_name": payload.consultation.topic or "",  # Всегда строка, не None
     }
     
     # Номер из ЦЛ (если есть) - опциональное поле
@@ -485,89 +484,91 @@ async def _build_chatwoot_custom_attrs(
             attrs["question_name"] = str(question_name)
     
     # Поля из consultation (если есть)
-    if consultation:
-        # Дата консультации - форматируем без timezone для Chatwoot
-        # Используем start_date из consultation, или scheduled_at из payload если start_date еще не установлен
-        date_to_use = consultation.start_date
-        if not date_to_use and payload.consultation.scheduled_at:
-            date_to_use = payload.consultation.scheduled_at
+    # Заполняем даты/статусы: сначала берем из consultation, если его нет или поле пустое — берем из payload
+    date_to_use = consultation.start_date if consultation else None
+    if not date_to_use and payload.consultation.scheduled_at:
+        date_to_use = payload.consultation.scheduled_at
+    if date_to_use:
+        from datetime import timezone
+        dt = date_to_use
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        attrs["date_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    end_to_use = consultation.end_date if consultation and hasattr(consultation, "end_date") else None
+    if not end_to_use and getattr(payload.consultation, "end_date", None):
+        end_to_use = payload.consultation.end_date
+    if end_to_use:
+        from datetime import timezone
+        dt = end_to_use
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        attrs["con_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    redate_to_use = consultation.redate if consultation and hasattr(consultation, "redate") else None
+    if not redate_to_use and getattr(payload.consultation, "redate", None):
+        redate_to_use = payload.consultation.redate
+    if redate_to_use:
+        from datetime import timezone
+        dt = redate_to_use
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        attrs["redate_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    retime_to_use = consultation.redate_time if consultation and hasattr(consultation, "redate_time") else None
+    if not retime_to_use and getattr(payload.consultation, "redate_time", None):
+        retime_to_use = payload.consultation.redate_time
+    if retime_to_use:
+        attrs["retime_con"] = retime_to_use.strftime("%H:%M")
+    
+    # consultation_type: берем из consultation.consultation_type или из payload.consultation.consultation_type
+    consultation_type_value = None
+    if consultation and hasattr(consultation, "consultation_type") and consultation.consultation_type:
+        consultation_type_value = consultation.consultation_type
+    elif hasattr(payload.consultation, "consultation_type") and payload.consultation.consultation_type:
+        consultation_type_value = payload.consultation.consultation_type
+    if consultation_type_value:
+        attrs["consultation_type"] = str(consultation_type_value)
+    
+    # Закрыто без консультации
+    denied_value = None
+    if consultation and hasattr(consultation, "denied"):
+        denied_value = consultation.denied
+    if denied_value is None and getattr(payload.consultation, "denied", None) is not None:
+        denied_value = payload.consultation.denied
+    if denied_value is not None:
+        attrs["closed_without_con"] = bool(denied_value)
         
-        if date_to_use:
-            # Используем формат без timezone: YYYY-MM-DDTHH:MM:SS
-            # ВАЖНО: Chatwoot может требовать полный формат с секундами
-            from datetime import timezone
-            dt = date_to_use
-            if dt.tzinfo:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            # Форматируем с секундами (даже если они 00)
-            attrs["date_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
-        
-        # Конец консультации
-        if consultation.end_date:
-            from datetime import timezone
-            dt = consultation.end_date
-            if dt.tzinfo:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            attrs["con_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
-        
-        # Дата переноса
-        if consultation.redate:
-            from datetime import timezone
-            dt = consultation.redate
-            if dt.tzinfo:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            attrs["redate_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
-        
-        # Время переноса
-        if consultation.redate_time:
-            attrs["retime_con"] = consultation.redate_time.strftime("%H:%M")
-        
-        # Тип консультации (маппинг статуса)
-        if consultation.status:
-            # Маппинг статуса в тип консультации
-            status_to_type = {
-                "open": "ВОчередьНаКонсультацию",
-                "pending": "ВОчередьНаКонсультацию",
-                "resolved": "КонсультацияИТС",
-                "closed": "КонсультацияИТС",
-            }
-            attrs["type_con"] = status_to_type.get(consultation.status, consultation.status)
-        
-        # Закрыто без консультации - отправляем только если явно установлено
-        # Chatwoot может не принимать None для булевых полей
-        if hasattr(consultation, 'denied') and consultation.denied is not None:
-            attrs["closed_without_con"] = bool(consultation.denied)
-        
-        # Данные о подписке из owner
-        if owner.subs_id:
-            attrs["subs_id"] = str(owner.subs_id)
-        
-        if owner.subs_start:
-            from datetime import timezone
-            dt = owner.subs_start
-            if dt.tzinfo:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            attrs["subs_start"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
-        
-        if owner.subs_end:
-            from datetime import timezone
-            dt = owner.subs_end
-            if dt.tzinfo:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            attrs["subs_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
-        
-        if owner.tariff_id:
-            attrs["tariff_id"] = str(owner.tariff_id)
-        
-        if owner.tariffperiod_id:
-            attrs["tariffperiod_id"] = str(owner.tariffperiod_id)
+    # Данные о подписке из owner
+    if owner.subs_id:
+        attrs["subs_id"] = str(owner.subs_id)
+    
+    if owner.subs_start:
+        from datetime import timezone
+        dt = owner.subs_start
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        attrs["subs_start"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    if owner.subs_end:
+        from datetime import timezone
+        dt = owner.subs_end
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        attrs["subs_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    if owner.tariff_id:
+        attrs["tariff_id"] = str(owner.tariff_id)
+    
+    if owner.tariffperiod_id:
+        attrs["tariffperiod_id"] = str(owner.tariffperiod_id)
 
     # Фильтруем только опциональные поля (None, пустые строки, пустые списки)
-    # Обязательные поля (code_abonent, topic_name) всегда остаются
+    # Обязательное поле (code_abonent) всегда остается
     filtered = {}
     for key, value in attrs.items():
-        # Обязательные поля всегда включаем
-        if key in ("code_abonent", "topic_name"):
+        # Обязательное поле всегда включаем
+        if key == "code_abonent":
             filtered[key] = value
         # Опциональные поля включаем только если не пустые
         elif value not in (None, "", []):
@@ -582,8 +583,8 @@ async def _build_chatwoot_custom_attrs(
     
     if len(filtered) > max_fields:
         logger.warning(f"Too many custom_attributes ({len(filtered)}), truncating to {max_fields}")
-        # Оставляем обязательные поля и первые N опциональных
-        required_keys = {"code_abonent", "topic_name"}
+        # Оставляем обязательное поле и первые N опциональных
+        required_keys = {"code_abonent"}
         optional_items = [(k, v) for k, v in filtered.items() if k not in required_keys]
         filtered = {k: v for k, v in filtered.items() if k in required_keys}
         filtered.update(dict(optional_items[:max_fields - len(required_keys)]))
@@ -592,7 +593,7 @@ async def _build_chatwoot_custom_attrs(
         logger.warning(f"Custom_attributes too large ({total_size} bytes), truncating values")
         # Укорачиваем значения полей
         for key, value in filtered.items():
-            if key not in ("code_abonent", "topic_name") and len(str(value)) > 500:
+            if key != "code_abonent" and len(str(value)) > 500:
                 filtered[key] = str(value)[:500]
     
     return filtered
@@ -955,19 +956,13 @@ async def create_consultation(
         # Формируем custom_attrs с учетом созданной consultation
         custom_attrs = await _build_chatwoot_custom_attrs(db, owner_client, payload, consultation=consultation)
         
-        # Валидация обязательных полей для Chatwoot
-        # Если code_abonent или topic_name пустые, используем дефолтные значения
-        # ВАЖНО: эти поля должны быть непустыми, иначе Chatwoot может вернуть ошибку
+        # Валидация обязательного поля для Chatwoot
+        # Если code_abonent пустой, используем дефолтное значение
+        # ВАЖНО: это поле должно быть непустым, иначе Chatwoot может вернуть ошибку
         code_abonent_value = custom_attrs.get("code_abonent")
         if not code_abonent_value or code_abonent_value == "":
             logger.warning(f"code_abonent is empty for client {owner_client.client_id}, using default 'N/A'")
             custom_attrs["code_abonent"] = "N/A"  # Дефолтное значение вместо пустой строки
-        
-        topic_name_value = custom_attrs.get("topic_name")
-        if not topic_name_value or topic_name_value == "":
-            default_topic = payload.consultation.comment[:50] if payload.consultation.comment else "Консультация"
-            logger.warning(f"topic_name is empty for consultation, using default: '{default_topic}'")
-            custom_attrs["topic_name"] = default_topic
         
         # Логируем финальные custom_attrs перед отправкой
         logger.info(f"Final custom_attrs for Chatwoot: {custom_attrs}")
@@ -1019,7 +1014,9 @@ async def create_consultation(
                 contact_email = None  # Не отправляем невалидный email
             
             # Разделяем custom_attributes на contact и conversation согласно ТЗ
+            from ..routers.clients import _build_chatwoot_contact_additional_attrs
             contact_custom_attrs = _build_chatwoot_contact_custom_attrs(owner_client, client)
+            contact_additional_attrs = _build_chatwoot_contact_additional_attrs(owner_client, client)
             conversation_custom_attrs = custom_attrs
             
             # ВАЖНО: Используем source_id из БД клиента, если он уже есть
@@ -1189,7 +1186,8 @@ async def create_consultation(
                                 identifier=str(client.client_id),  # Глобальный внешний ID (UUID)
                                 email=contact_email,
                                 phone_number=contact_phone,
-                                custom_attributes=contact_custom_attrs
+                                custom_attributes=contact_custom_attrs,
+                                additional_attributes=contact_additional_attrs
                             )
                             
                             # Извлекаем contact_id из ответа Public API
@@ -1430,9 +1428,23 @@ async def create_consultation(
                 logger.warning(f"Failed to verify Chatwoot conversation: {verify_error}")
                 # Не прерываем выполнение, но логируем предупреждение
             
-            # Добавляем labels и assignee через Platform API (если нужно)
+            # Определяем команду (team) в зависимости от consultation_type
+            team_id = None
+            consultation_type = payload.consultation.consultation_type
+            if consultation_type == "Консультация по ведению учета":
+                team_name = "консультация по ведению учета"
+                team_id = await chatwoot_client.find_team_by_name(team_name)
+                if not team_id:
+                    logger.warning(f"Team '{team_name}' not found in Chatwoot, conversation will be created without team")
+            elif consultation_type == "Техническая поддержка":
+                team_name = "техническая поддержка"
+                team_id = await chatwoot_client.find_team_by_name(team_name)
+                if not team_id:
+                    logger.warning(f"Team '{team_name}' not found in Chatwoot, conversation will be created without team")
+            
+            # Добавляем labels, assignee и team через Platform API (если нужно)
             # Public API не поддерживает эти параметры при создании
-            if labels or assignee_id:
+            if labels or assignee_id or team_id:
                 try:
                     update_payload = {}
                     if labels:
@@ -1443,15 +1455,21 @@ async def create_consultation(
                         )
                         logger.info(f"✓ Added labels to conversation {chatwoot_cons_id} via Platform API")
                     
-                    if assignee_id:
-                        # Назначаем менеджера через Platform API
+                    # Обновляем conversation с assignee и team одновременно
+                    if assignee_id or team_id:
+                        update_data = {}
+                        if assignee_id:
+                            update_data["assignee_id"] = assignee_id
+                        if team_id:
+                            update_data["team_id"] = team_id
+                        
                         await chatwoot_client.update_conversation(
                             conversation_id=chatwoot_cons_id,
-                            assignee_id=assignee_id
+                            **update_data
                         )
-                        logger.info(f"✓ Assigned manager {assignee_id} to conversation {chatwoot_cons_id} via Platform API")
+                        logger.info(f"✓ Updated conversation {chatwoot_cons_id} via Platform API: {update_data}")
                 except Exception as update_error:
-                    logger.warning(f"Failed to add labels/assignee via Platform API: {update_error}")
+                    logger.warning(f"Failed to add labels/assignee/team via Platform API: {update_error}")
                     # Не прерываем выполнение - conversation уже создана
             
             # Сохраняем данные из ответа создания conversation
@@ -2345,15 +2363,15 @@ async def cancel_consultation(
         f"cl_ref_key={consultation.cl_ref_key}"
     )
     
-    # Удаляем документ в 1C:ЦЛ (освобождает лимит)
+    # Помечаем документ в 1C:ЦЛ на удаление (DeletionMark=true) вместо удаления
     if consultation.cl_ref_key:
         onec_client = OneCClient()
         try:
-            await onec_client.delete_consultation_odata(consultation.cl_ref_key)
-            logger.info(f"✓ Deleted 1C consultation: Ref_Key={consultation.cl_ref_key} for annulled consultation {cons_id}")
+            await onec_client.mark_consultation_deleted(consultation.cl_ref_key)
+            logger.info(f"✓ Marked 1C consultation as deleted (DeletionMark=true): Ref_Key={consultation.cl_ref_key} for annulled consultation {cons_id}")
         except Exception as e:
-            logger.error(f"✗ Failed to delete 1C consultation {consultation.cl_ref_key}: {e}", exc_info=True)
-            # Продолжаем выполнение даже если удаление в 1C не удалось
+            logger.error(f"✗ Failed to mark 1C consultation {consultation.cl_ref_key} as deleted: {e}", exc_info=True)
+            # Продолжаем выполнение даже если пометка в 1C не удалась
     
     # Закрываем беседу в Chatwoot и отправляем сообщение
     chatwoot_client = ChatwootClient()

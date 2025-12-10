@@ -45,9 +45,10 @@ def _build_chatwoot_contact_custom_attrs(
     
     Custom attributes для Contact:
     - code_abonent, inn_pinfl, client_type (обязательные)
-    - region, country (опционально, если есть в модели)
+    - partner (обслуживающая организация, если есть)
     
-    Для пользователей (is_parent=false) используем данные владельца для region и country.
+    Регион/страна теперь передаются в типовые additional_attributes Chatwoot,
+    не в custom_attributes.
     """
     attrs: Dict[str, Any] = {
         "code_abonent": owner.code_abonent or "",
@@ -55,15 +56,10 @@ def _build_chatwoot_contact_custom_attrs(
         "client_type": "owner" if not client.parent_id else "user",
     }
     
-    # Опциональные поля: для пользователей берем из владельца, для владельцев - из клиента
-    region_to_use = client.region if not client.parent_id else (client.region or owner.region)
-    country_to_use = client.country if not client.parent_id else (client.country or owner.country)
-    
-    if region_to_use:
-        attrs["region"] = str(region_to_use)
-    
-    if country_to_use:
-        attrs["country"] = str(country_to_use)
+    # Обслуживающая организация - берем из владельца или клиента
+    partner_to_use = owner.partner if owner.partner else client.partner
+    if partner_to_use:
+        attrs["partner"] = str(partner_to_use)
     
     # Фильтруем пустые значения для опциональных полей
     filtered = {}
@@ -76,6 +72,97 @@ def _build_chatwoot_contact_custom_attrs(
             filtered[key] = value
     
     return filtered
+
+
+def _get_country_code(country_name: Optional[str]) -> Optional[str]:
+    """
+    Получает код страны из названия страны.
+    
+    Маппинг основных стран на их коды ISO 3166-1 alpha-2.
+    """
+    if not country_name:
+        return None
+    
+    country_name_lower = country_name.strip().lower()
+    
+    # Маппинг названий стран на коды
+    country_mapping = {
+        "uzbekistan": "UZ",
+        "узбекистан": "UZ",
+        "russia": "RU",
+        "россия": "RU",
+        "russian federation": "RU",
+        "российская федерация": "RU",
+        "kazakhstan": "KZ",
+        "казахстан": "KZ",
+        "kyrgyzstan": "KG",
+        "киргизия": "KG",
+        "tajikistan": "TJ",
+        "таджикистан": "TJ",
+        "turkmenistan": "TM",
+        "туркменистан": "TM",
+    }
+    
+    # Проверяем точное совпадение
+    if country_name_lower in country_mapping:
+        return country_mapping[country_name_lower]
+    
+    # Проверяем частичное совпадение
+    for key, code in country_mapping.items():
+        if key in country_name_lower or country_name_lower in key:
+            return code
+    
+    # Если страна уже является кодом из 2 символов
+    if len(country_name.strip()) == 2:
+        return country_name.strip().upper()
+    
+    return None
+
+
+def _build_chatwoot_contact_additional_attrs(owner: Client, client: Client) -> Dict[str, Any]:
+    """
+    Типовые additional_attributes для Chatwoot Contact.
+    Эти поля должны идти в additional_attributes, а не в custom_attributes.
+    
+    Формат:
+    {
+        "city": "г. Ташкент, Мирабадский район",
+        "country": "Uzbekistan",
+        "country_code": "UZ",
+        "company_name": "OOO JASUR",
+        "description": "Биография" (опционально)
+    }
+    """
+    # Определяем источник данных: для пользователей берем данные владельца как fallback
+    city_to_use = client.city if not client.parent_id else (client.city or owner.city)
+    region_to_use = client.region if not client.parent_id else (client.region or owner.region)
+    country_to_use = client.country if not client.parent_id else (client.country or owner.country)
+    company_to_use = owner.company_name or client.company_name
+    
+    # Формируем строку города в формате: "г. <city>, <region>"
+    city_str = None
+    if city_to_use and region_to_use:
+        city_str = f"г. {city_to_use}, {region_to_use}"
+    elif city_to_use:
+        city_str = f"г. {city_to_use}"
+    elif region_to_use:
+        city_str = str(region_to_use)
+    
+    # Получаем код страны из названия
+    country_code = _get_country_code(country_to_use)
+    
+    attrs: Dict[str, Any] = {}
+    if city_str:
+        attrs["city"] = city_str
+    if country_to_use:
+        attrs["country"] = str(country_to_use)
+    if country_code:
+        attrs["country_code"] = country_code
+    if company_to_use:
+        attrs["company_name"] = str(company_to_use)
+    # description не заполняем, так как не знаем что туда добавить
+    
+    return attrs
 
 
 async def _sync_client_to_chatwoot(
@@ -114,8 +201,9 @@ async def _sync_client_to_chatwoot(
             logger.debug(f"Skipping Chatwoot contact creation for client {client.client_id}: no valid email or phone")
             return
         
-        # Custom attributes
+        # Custom attributes и типовые additional_attributes
         contact_custom_attrs = _build_chatwoot_contact_custom_attrs(owner_client, client)
+        contact_additional_attrs = _build_chatwoot_contact_additional_attrs(owner_client, client)
         
         # ВАЖНО: НЕ передаем source_id при создании contact - Chatwoot создает его автоматически
         # source_id будет извлечен из ответа создания contact
@@ -159,7 +247,8 @@ async def _sync_client_to_chatwoot(
                     email=contact_email,
                     phone_number=contact_phone,
                     custom_attributes=contact_custom_attrs,
-                    inbox_id=settings.CHATWOOT_INBOX_ID
+                    inbox_id=settings.CHATWOOT_INBOX_ID,
+                    additional_attributes=contact_additional_attrs
                     # source_id НЕ передаем - Chatwoot создает его автоматически
                 )
                 
@@ -740,6 +829,9 @@ async def find_or_create_client(
                     client.region = client_data.region
                 if client_data.city is not None:
                     client.city = client_data.city
+                # Обновляем обслуживающую организацию
+                if client_data.partner is not None:
+                    client.partner = client_data.partner
                 # Обновляем is_parent и parent_id согласно запросу
                 client.is_parent = final_is_parent
                 client.parent_id = parent_uuid
@@ -800,6 +892,9 @@ async def find_or_create_client(
                 client.name = client_data.name.strip()
             if client_data.contact_name:
                 client.contact_name = client_data.contact_name.strip()
+            # Обновляем обслуживающую организацию
+            if client_data.partner is not None:
+                client.partner = client_data.partner
             # ВАЖНО: Обновляем ИНН только если это владелец
             if normalized_inn and final_is_parent:
                 client.org_inn = normalized_inn
@@ -808,6 +903,9 @@ async def find_or_create_client(
             # ВАЖНО: Обновляем company_name только если это владелец
             if client_data.company_name and final_is_parent:
                 client.company_name = client_data.company_name.strip() if client_data.company_name else None
+            # Обновляем partner (обслуживающая организация)
+            if client_data.partner is not None:
+                client.partner = client_data.partner
             # Обновляем географические поля
             if client_data.country is not None:
                 client.country = client_data.country
@@ -875,6 +973,9 @@ async def find_or_create_client(
             client.name = client_data.name.strip()
         if client_data.contact_name:
             client.contact_name = client_data.contact_name.strip()
+        # Обновляем обслуживающую организацию
+        if client_data.partner is not None:
+            client.partner = client_data.partner
         if client_data.cl_ref_key:
             client.cl_ref_key = client_data.cl_ref_key
         if client_data.subs_id:
@@ -895,6 +996,9 @@ async def find_or_create_client(
         # ВАЖНО: Обновляем company_name только если это владелец
         if client_data.company_name and final_is_parent:
             client.company_name = client_data.company_name.strip() if client_data.company_name else None
+        # Обновляем partner (обслуживающая организация)
+        if client_data.partner is not None:
+            client.partner = client_data.partner
         # Обновляем географические поля
         if client_data.country is not None:
             client.country = client_data.country
@@ -961,6 +1065,8 @@ async def find_or_create_client(
                 client_by_code.contact_name = client_data.contact_name.strip()
             if client_data.cl_ref_key:
                 client_by_code.cl_ref_key = client_data.cl_ref_key
+        if client_data.partner is not None:
+            client_by_code.partner = client_data.partner
             if client_data.subs_id:
                 client_by_code.subs_id = client_data.subs_id
             if client_data.subs_start:
@@ -984,6 +1090,9 @@ async def find_or_create_client(
                 client_by_code.region = client_data.region
             if client_data.city is not None:
                 client_by_code.city = client_data.city
+            # Обновляем обслуживающую организацию
+            if client_data.partner is not None:
+                client_by_code.partner = client_data.partner
             client_by_code.code_abonent = normalized_code_abonent
             client_by_code.is_parent = final_is_parent
             client_by_code.parent_id = parent_uuid
@@ -1027,6 +1136,8 @@ async def find_or_create_client(
                     existing_owner.contact_name = client_data.contact_name.strip()
                 if client_data.cl_ref_key:
                     existing_owner.cl_ref_key = client_data.cl_ref_key
+                if client_data.partner is not None:
+                    existing_owner.partner = client_data.partner
                 if client_data.subs_id:
                     existing_owner.subs_id = client_data.subs_id
                 if client_data.subs_start:
@@ -1086,6 +1197,7 @@ async def find_or_create_client(
         contact_name=client_data.contact_name.strip() if client_data.contact_name else None,
         company_name=client_data.company_name.strip() if client_data.company_name else None,
         code_abonent=code_to_use,
+        partner=client_data.partner,
         is_parent=final_is_parent,
         parent_id=parent_uuid,
     )
