@@ -548,6 +548,8 @@ class ChatwootClient:
         logger.info(f"=== Creating Chatwoot contact via Public API ===")
         logger.info(f"  Endpoint: POST /public/api/v1/inboxes/{settings.CHATWOOT_INBOX_IDENTIFIER}/contacts")
         logger.info(f"  Payload: {json.dumps(payload, ensure_ascii=False, indent=2)}")
+        if additional_attributes:
+            logger.info(f"  Additional attributes: {json.dumps(additional_attributes, ensure_ascii=False, indent=2)}")
         
         endpoint = f"/public/api/v1/inboxes/{settings.CHATWOOT_INBOX_IDENTIFIER}/contacts"
         response = await self._request_public_api("POST", endpoint, data=payload)
@@ -1230,6 +1232,9 @@ class ChatwootClient:
         
         Перед добавлением убеждается, что все labels существуют в Chatwoot.
         
+        ВАЖНО: Chatwoot API требует передачи labels как массива строк в теле запроса.
+        Используем PUT метод для замены всех labels или POST для добавления.
+        
         Args:
             conversation_id: ID беседы
             labels: Список меток для добавления
@@ -1237,19 +1242,45 @@ class ChatwootClient:
         Returns:
             Dict с данными обновленной беседы
         """
+        if not labels:
+            logger.debug(f"No labels to add for conversation {conversation_id}")
+            return {}
+        
         # Убеждаемся, что все labels существуют
         for label in labels:
             if label:
                 await self.ensure_label_exists(label)
         
-        payload = {
-            "labels": labels
-        }
-        return await self._request(
-            "POST",
-            f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/labels",
-            data=payload
-        )
+        # Chatwoot API требует передачи labels как массива строк
+        # Используем PUT для замены всех labels беседы
+        payload = labels  # Передаем массив напрямую, не в объекте
+        
+        import json
+        logger.info(f"Adding labels to conversation {conversation_id}: {json.dumps(labels, ensure_ascii=False)}")
+        
+        try:
+            # Пробуем PUT метод (замена всех labels)
+            response = await self._request(
+                "PUT",
+                f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/labels",
+                data=payload
+            )
+            logger.info(f"✓ Successfully added labels to conversation {conversation_id}")
+            return response
+        except Exception as e:
+            # Если PUT не работает, пробуем POST (добавление labels)
+            logger.warning(f"PUT method failed for labels, trying POST: {e}")
+            try:
+                response = await self._request(
+                    "POST",
+                    f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/labels",
+                    data={"labels": payload}  # Для POST используем объект с полем labels
+                )
+                logger.info(f"✓ Successfully added labels to conversation {conversation_id} via POST")
+                return response
+            except Exception as post_error:
+                logger.error(f"Failed to add labels via both PUT and POST: {post_error}", exc_info=True)
+                raise
     
     async def send_message(
         self,
@@ -1294,6 +1325,33 @@ class ChatwootClient:
             "POST",
             f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/messages",
             data=payload
+        )
+    
+    async def get_messages(
+        self,
+        conversation_id: str,
+        page: int = 1,
+        per_page: int = 50
+    ) -> Dict[str, Any]:
+        """
+        Получение истории сообщений из conversation.
+        
+        Args:
+            conversation_id: ID консультации в Chatwoot
+            page: Номер страницы (начиная с 1)
+            per_page: Количество сообщений на странице
+        
+        Returns:
+            Dict с данными сообщений и метаданными пагинации
+        """
+        params = {
+            "page": page,
+            "per_page": per_page
+        }
+        return await self._request(
+            "GET",
+            f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/messages",
+            params=params
         )
     
     async def create_user(

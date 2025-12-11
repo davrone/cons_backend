@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     # Автор по умолчанию для создания ТелефонныйЗвонок в ЦЛ
     ONEC_DEFAULT_AUTHOR_NAME: str = Field(default="<не определено>", description="Название менеджера (description) из справочника users для использования как Автор_Key при создании консультаций в ЦЛ")
     
+    # Telegram Bot
+    TELEGRAM_BOT_TOKEN: str = Field(default="", description="Токен Telegram бота от BotFather")
+    TELEGRAM_WEBHOOK_URL: Optional[str] = Field(default=None, description="URL для webhook от Telegram (опционально, для production)")
+    TELEGRAM_WEBHOOK_SECRET: Optional[str] = Field(default=None, description="Секрет для проверки webhook от Telegram (опционально)")
+    TELEGRAM_WEBAPP_URL: Optional[str] = Field(default=None, description="URL для Telegram Web App (фронтенд, опционально, если не указан, используется базовый URL из TELEGRAM_WEBHOOK_URL)")
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

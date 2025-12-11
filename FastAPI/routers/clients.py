@@ -139,14 +139,14 @@ def _build_chatwoot_contact_additional_attrs(owner: Client, client: Client) -> D
     country_to_use = client.country if not client.parent_id else (client.country or owner.country)
     company_to_use = owner.company_name or client.company_name
     
-    # Формируем строку города в формате: "г. <city>, <region>"
+    # Формируем строку города в формате: "<region>, <city>"
     city_str = None
-    if city_to_use and region_to_use:
-        city_str = f"г. {city_to_use}, {region_to_use}"
-    elif city_to_use:
-        city_str = f"г. {city_to_use}"
+    if region_to_use and city_to_use:
+        city_str = f"{region_to_use}, {city_to_use}"
     elif region_to_use:
         city_str = str(region_to_use)
+    elif city_to_use:
+        city_str = str(city_to_use)
     
     # Получаем код страны из названия
     country_code = _get_country_code(country_to_use)
@@ -158,8 +158,9 @@ def _build_chatwoot_contact_additional_attrs(owner: Client, client: Client) -> D
         attrs["country"] = str(country_to_use)
     if country_code:
         attrs["country_code"] = country_code
-    if company_to_use:
-        attrs["company_name"] = str(company_to_use)
+    # company_name всегда добавляем, если есть значение (даже пустая строка не должна передаваться)
+    if company_to_use and company_to_use.strip():
+        attrs["company_name"] = str(company_to_use).strip()
     # description не заполняем, так как не знаем что туда добавить
     
     return attrs

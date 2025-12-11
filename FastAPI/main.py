@@ -16,10 +16,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .init_db import init_db, check_db_connection
-from .routers import auth, webhooks, health, consultations, clients, dicts, managers
+from .routers import auth, webhooks, health, consultations, clients, dicts, managers, telegram
 from .routers import websocket as ws_router
 from .scheduler import setup_scheduler, start_scheduler, shutdown_scheduler
 from .services.chatwoot_client import ChatwootClient
+from .services.telegram_bot import TelegramBotService
 from .exceptions import (
     ConsultationError,
     ConsultationNotFoundError,
@@ -72,7 +73,12 @@ async def lifespan(app: FastAPI):
             try:
                 await chatwoot_client.ensure_label_exists(label_title)
             except Exception as label_error:
-                logger.warning(f"Failed to initialize label '{label_title}': {label_error}")
+                # Игнорируем ошибки "already exists" - это нормально при повторном запуске
+                error_str = str(label_error).lower()
+                if "already" in error_str or "422" in error_str or "409" in error_str:
+                    logger.debug(f"Label '{label_title}' already exists (expected)")
+                else:
+                    logger.warning(f"Failed to initialize label '{label_title}': {label_error}")
         print("✓ Labels инициализированы в Chatwoot")
     except Exception as e:
         logger.warning(f"Ошибка инициализации labels: {e}", exc_info=True)
@@ -92,11 +98,74 @@ async def lifespan(app: FastAPI):
     else:
         print("ℹ️  Планировщик задач отключен в этом контейнере (запущен в отдельном контейнере cons_scheduler)")
     
+    # Инициализация Telegram бота
+    telegram_bot_service = None
+    if settings.TELEGRAM_BOT_TOKEN:
+        try:
+            telegram_bot_service = TelegramBotService()
+            
+            # Устанавливаем глобальный экземпляр для роутера
+            # Устанавливаем глобальную переменную в модуле telegram
+            import FastAPI.routers.telegram as telegram_module
+            telegram_module.telegram_bot_service = telegram_bot_service
+            
+            # Инициализируем application бота (нужно для webhook режима)
+            if telegram_bot_service.application:
+                await telegram_bot_service.application.initialize()
+                await telegram_bot_service.application.start()
+                logger.info("Telegram bot application initialized")
+            
+            # Настраиваем webhook или polling
+            if settings.TELEGRAM_WEBHOOK_URL:
+                # Production: пытаемся использовать webhook
+                # Если webhook не установится (домен недоступен и т.д.), переключаемся на polling
+                # Проверяем, есть ли уже путь в URL
+                if '/api/telegram/webhook' in settings.TELEGRAM_WEBHOOK_URL:
+                    webhook_url = settings.TELEGRAM_WEBHOOK_URL
+                else:
+                    base_url = settings.TELEGRAM_WEBHOOK_URL.rstrip('/')
+                    webhook_url = f"{base_url}/api/telegram/webhook"
+                
+                logger.info(f"Attempting to setup webhook at: {webhook_url}")
+                webhook_success = await telegram_bot_service.setup_webhook(
+                    webhook_url=webhook_url,
+                    secret_token=settings.TELEGRAM_WEBHOOK_SECRET
+                )
+                
+                if webhook_success:
+                    print(f"✓ Telegram bot webhook настроен: {webhook_url}")
+                else:
+                    # Webhook не установился, переключаемся на polling
+                    print(f"⚠️  Webhook не установлен, переключаемся на polling")
+                    import asyncio
+                    asyncio.create_task(telegram_bot_service.start_polling())
+                    print("✓ Telegram bot polling запущен")
+            else:
+                # Development: используем polling
+                # Запускаем polling в фоне
+                import asyncio
+                asyncio.create_task(telegram_bot_service.start_polling())
+                print("✓ Telegram bot polling запущен")
+            
+        except Exception as e:
+            logger.error(f"Ошибка инициализации Telegram бота: {e}", exc_info=True)
+            print(f"⚠️  Предупреждение: не удалось инициализировать Telegram бота: {e}")
+    else:
+        print("ℹ️  Telegram bot отключен (TELEGRAM_BOT_TOKEN не указан)")
+    
     yield
     
     # Shutdown
     print("🛑 Остановка приложения...")
     shutdown_scheduler()
+    
+    # Остановка Telegram бота
+    if telegram_bot_service:
+        try:
+            await telegram_bot_service.shutdown()
+            print("✓ Telegram bot остановлен")
+        except Exception as e:
+            logger.error(f"Ошибка остановки Telegram бота: {e}", exc_info=True)
 
 
 # Создаем приложение
@@ -272,6 +341,7 @@ app.include_router(managers.router, prefix="/api/managers", tags=["managers"])
 app.include_router(webhooks.router, prefix="/webhook", tags=["webhooks"])
 app.include_router(dicts.router, prefix="/api/dicts", tags=["dicts"])
 app.include_router(ws_router.router, prefix="/ws/consultations", tags=["websocket"])
+app.include_router(telegram.router, prefix="/api/telegram", tags=["telegram"])
 
 
 @app.get("/")

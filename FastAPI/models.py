@@ -10,7 +10,7 @@ SQLAlchemy модели для системы консультаций.
 from typing import Optional
 
 from sqlalchemy import (
-    Column, String, Boolean, Integer, DateTime, ForeignKey, Text, 
+    Column, String, Boolean, Integer, BigInteger, DateTime, ForeignKey, Text, 
     JSON, SmallInteger, Time, Date, Sequence, PrimaryKeyConstraint,
     UniqueConstraint
 )
@@ -62,6 +62,21 @@ class Client(Base):
     @subscriber_id.setter
     def subscriber_id(self, value: Optional[str]) -> None:
         self.code_abonent = value
+
+
+class TelegramUser(Base):
+    """Пользователи Telegram, связанные с клиентами"""
+    __tablename__ = "telegram_users"
+    __table_args__ = {"schema": "cons"}
+
+    telegram_user_id = Column(BigInteger, primary_key=True)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("cons.clients.client_id"), nullable=True)
+    phone_number = Column(Text, nullable=True)
+    username = Column(Text, nullable=True)
+    first_name = Column(Text, nullable=True)
+    last_name = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class Consultation(Base):

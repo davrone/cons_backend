@@ -131,8 +131,10 @@ Authorization: Bearer <FRONT_BEARER_TOKEN>
     "subs_end": "2025-12-31T23:59:59Z",
     "tariff_id": "tariff-1",
     "company_name": "ООО Компания",
+    "partner": "ООО Обслуживающая организация",
     "region": "Москва",
-    "city": "Москва"
+    "city": "Москва",
+    "country": "Россия"
   },
   "consultation": {
     "scheduled_at": "2025-02-01T10:00:00Z",
@@ -144,9 +146,26 @@ Authorization: Bearer <FRONT_BEARER_TOKEN>
     "importance": 1,
     "topic": "Тема консультации"
   },
-  "source": "web"
+  "source": "SITE",
+  "telegram_user_id": 123456789,
+  "telegram_phone_number": "+79991234567"
 }
 ```
+
+**Поля Request Body:**
+- `client` (опционально): Данные клиента. Если не указан, используется `client_id` из `consultation`.
+- `consultation`: Данные консультации (обязательно).
+- `source` (опционально): Источник создания. Возможные значения:
+  - `"SITE"` - создано через сайт (по умолчанию)
+  - `"TELEGRAM"` - создано через Telegram Web App
+  - `"CALL_CENTER"` - создано через колл-центр
+- `telegram_user_id` (опционально): ID пользователя Telegram. Передается только если создается через Telegram Web App.
+- `telegram_phone_number` (опционально): Номер телефона из контакта Telegram. Передается только если создается через Telegram Web App и пользователь разрешил доступ к контакту.
+
+**ВАЖНО:** Если передан `telegram_user_id`, бэкенд автоматически:
+- Устанавливает `source="TELEGRAM"`
+- Связывает Telegram пользователя с клиентом в таблице `telegram_users`
+- Позволяет использовать чат в Telegram боте для этой консультации
 
 **Response (200):**
 ```json
@@ -743,8 +762,10 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "region": "Москва",
   "city": "Москва",
+  "country": "Россия",
   "subs_id": "sub-123",
   "subs_start": "2025-01-01T00:00:00Z",
   "subs_end": "2025-12-31T23:59:59Z",
@@ -753,6 +774,9 @@ setInterval(() => ws.send('ping'), 30000);
   "is_parent": true
 }
 ```
+
+**Поля Request Body:**
+- `partner` (опционально): Обслуживающая организация. Используется для передачи в Chatwoot как кастомный атрибут контакта. Может быть заполнен как владельцем, так и пользователем.
 
 **Response (200):**
 ```json
@@ -764,8 +788,10 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "region": "Москва",
   "city": "Москва",
+  "country": "Россия",
   "source_id": "chatwoot-source-id",
   "chatwoot_pubsub_token": "pubsub-token",
   "is_parent": true,
@@ -783,7 +809,7 @@ setInterval(() => ws.send('ping'), 30000);
 #### GET `/clients/{client_id}`
 Получение клиента по ID.
 
-Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `country`, `region`, `city` из владельца.
+Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `country`, `region`, `city`, `partner` из владельца.
 
 **ВАЖНО:** В ответе всегда присутствуют поля `is_parent` и `parent_id`, которые определяют права доступа:
 - `is_parent=true` и `parent_id=null` → владелец (может изменять ИНН и название организации)
@@ -799,6 +825,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "country": "Россия",
   "region": "Москва",
   "city": "Москва",
@@ -819,6 +846,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "country": "Россия",
   "region": "Москва",
   "city": "Москва",
@@ -837,7 +865,7 @@ setInterval(() => ws.send('ping'), 30000);
 #### GET `/clients/by-hash/{hash}`
 Получение клиента по хешу.
 
-Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `country`, `region`, `city` из владельца.
+Если клиент является пользователем (`is_parent=false`), возвращает данные с полями `company_name`, `org_inn`, `country`, `region`, `city`, `partner` из владельца.
 
 **Response (200) - для владельца:**
 ```json
@@ -849,6 +877,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "country": "Россия",
   "region": "Москва",
   "city": "Москва",
@@ -867,6 +896,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "country": "Россия",
   "region": "Москва",
   "city": "Москва",
@@ -903,6 +933,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "country": "Россия",
   "region": "Москва",
   "city": "Москва",
@@ -921,6 +952,7 @@ setInterval(() => ws.send('ping'), 30000);
   "code_abonent": "12345",
   "org_inn": "1234567890",
   "company_name": "ООО Компания",
+  "partner": "ООО Обслуживающая организация",
   "country": "Россия",
   "region": "Москва",
   "city": "Москва",
@@ -937,6 +969,7 @@ setInterval(() => ws.send('ping'), 30000);
   "email": "petr@example.com",
   "phone_number": "+79991234568",
   "code_abonent": "12345",
+  "partner": "ООО Обслуживающая организация",
   "is_parent": false,
   "parent_id": null
 }
@@ -1181,6 +1214,135 @@ setInterval(() => ws.send('ping'), 30000);
 
 ---
 
+### Telegram
+
+#### POST `/telegram/webhook`
+Webhook от Telegram для получения обновлений бота.
+
+**ВАЖНО:** Этот endpoint используется только бэкендом для получения обновлений от Telegram. Фронт не должен вызывать его напрямую.
+
+**Headers:**
+- `X-Telegram-Bot-Api-Secret-Token` (опционально): Секрет для проверки webhook (если настроен `TELEGRAM_WEBHOOK_SECRET`)
+
+**Response (200):**
+```json
+{
+  "ok": true
+}
+```
+
+---
+
+#### POST `/telegram/webhook/chatwoot`
+Webhook от Chatwoot для отправки новых сообщений в Telegram.
+
+**ВАЖНО:** Этот endpoint используется только бэкендом для синхронизации сообщений из Chatwoot в Telegram. Фронт не должен вызывать его напрямую.
+
+**Response (200):**
+```json
+{
+  "ok": true
+}
+```
+
+---
+
+#### GET `/telegram/consultations/{cons_id}/messages`
+Получение истории сообщений из Chatwoot для консультации.
+
+Используется для загрузки истории при открытии чата в Telegram боте.
+
+**Query Parameters:**
+- `page` (опционально): Номер страницы (по умолчанию: 1)
+- `per_page` (опционально): Количество сообщений на странице (по умолчанию: 50)
+
+**Response (200):**
+```json
+{
+  "messages": [
+    {
+      "id": "123",
+      "content": "Текст сообщения",
+      "message_type": "incoming",
+      "created_at": "2025-01-27T12:00:00Z",
+      "sender_name": "Иванов Иван",
+      "sender_type": "user"
+    }
+  ],
+  "total": 25,
+  "page": 1,
+  "per_page": 50
+}
+```
+
+**Ошибки:**
+- `404 Not Found` - Консультация не найдена
+- `500 Internal Server Error` - Ошибка получения сообщений
+
+---
+
+#### GET `/telegram/consultations/{cons_id}`
+Получение информации о консультации (статус, можно ли отправлять сообщения).
+
+**Response (200):**
+```json
+{
+  "cons_id": "12345",
+  "status": "open",
+  "is_open": true,
+  "message": null
+}
+```
+
+Если консультация закрыта:
+```json
+{
+  "cons_id": "12345",
+  "status": "closed",
+  "is_open": false,
+  "message": "Консультация закрыта. Новые сообщения не принимаются."
+}
+```
+
+**Ошибки:**
+- `404 Not Found` - Консультация не найдена
+
+---
+
+#### POST `/telegram/link-user`
+Связывание Telegram пользователя с клиентом.
+
+**ВАЖНО:** Обычно вызывается автоматически при создании консультации через Telegram Web App. Может использоваться для ручной привязки.
+
+**Request Body:**
+```json
+{
+  "telegram_user_id": 123456789,
+  "client_id": "uuid-клиента",
+  "phone_number": "+79991234567",
+  "username": "username",
+  "first_name": "Иван",
+  "last_name": "Иванов"
+}
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Telegram user linked successfully",
+  "telegram_user_id": 123456789,
+  "client_id": "uuid-клиента"
+}
+```
+
+**Ошибки:**
+- `404 Not Found` - Клиент не найден (если указан `client_id`)
+- `400 Bad Request` - Невалидный формат `client_id`
+- `500 Internal Server Error` - Ошибка связывания
+
+---
+
 ## Webhooks (для внешних систем)
 
 ### POST `/webhook/chatwoot`
@@ -1279,7 +1441,9 @@ const response = await fetch('/api/consultations/create', {
       consultation_type: 'Техническая поддержка',
       comment: 'Вопрос о работе системы'
     },
-    source: 'web'
+    source: 'SITE',
+    telegram_user_id: 123456789,
+    telegram_phone_number: '+79991234567'
   })
 });
 

@@ -1,6 +1,6 @@
 """Схемы для работы с консультациями"""
 from pydantic import BaseModel, field_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime, date, time
 
 from .clients import ClientCreate
@@ -81,6 +81,10 @@ class ConsultationWithClient(BaseModel):
     
     # Метаданные
     source: Optional[str] = "SITE"  # SITE, TELEGRAM, CALL_CENTER
+    
+    # Telegram данные (если создается через Telegram Web App)
+    telegram_user_id: Optional[int] = None  # ID пользователя Telegram
+    telegram_phone_number: Optional[str] = None  # Телефон из контакта Telegram
 
 
 class ConsultationCreateSimple(BaseModel):
@@ -138,7 +142,7 @@ class ConsultationRead(BaseModel):
     online_question: Optional[str] = None
     con_blocks: Optional[str] = None  # Блоки консультации
     con_rates: Optional[Dict[str, Any]] = None
-    con_calls: Optional[Dict[str, Any]] = None
+    con_calls: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None  # Может быть словарем или списком словарей
     chatwoot_source_id: Optional[str] = None  # source_id из Chatwoot (для подключения виджета)
     source: Optional[str] = None  # Источник создания: BACKEND, 1C_CL, CHATWOOT, ETL
     created_at: Optional[datetime] = None
@@ -200,6 +204,9 @@ class ConsultationResponse(BaseModel):
     consultation: ConsultationRead
     client_id: str
     message: str = "Consultation created successfully"
+    source: Optional[str] = None  # Источник создания консультации (TELEGRAM, SITE, BACKEND)
+    telegram_user_id: Optional[int] = None  # ID пользователя Telegram (если создано через Telegram)
+    bot_username: Optional[str] = None  # Username бота для Telegram (если создано через Telegram)
     # Поля для подключения чат-виджета Chatwoot
     chatwoot_conversation_id: Optional[str] = None  # ID conversation в Chatwoot (cons_id)
     chatwoot_source_id: Optional[str] = None  # source_id из contact (для идентификации пользователя в виджете)

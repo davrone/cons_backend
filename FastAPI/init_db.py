@@ -144,7 +144,14 @@ async def init_db():
     
     Идемпотентна - можно запускать многократно.
     """
+    # Чтобы избежать гонок/взаимных блокировок при параллельном старте нескольких контейнеров,
+    # держим advisory lock на время инициализации.
+    lock_key = 987654321  # произвольный ключ блокировки
+    lock_conn = None
     try:
+        lock_conn = await engine.connect()
+        await lock_conn.execute(text("SELECT pg_advisory_lock(:key)"), {"key": lock_key})
+
         print("Начало инициализации БД...")
         await create_schemas()
         await create_tables()
@@ -154,6 +161,12 @@ async def init_db():
         print(f"✗ Ошибка инициализации БД: {e}")
         raise
     finally:
+        # Освобождаем advisory lock и закрываем соединение
+        if lock_conn:
+            try:
+                await lock_conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+            finally:
+                await lock_conn.close()
         await engine.dispose()
 
 

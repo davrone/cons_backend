@@ -24,6 +24,7 @@ from ..models import (
     Call,
     User,
     UserMapping,
+    TelegramUser,
 )
 from ..schemas.tickets import (
     ConsultationWithClient,
@@ -643,37 +644,54 @@ def _build_chatwoot_contact_custom_attrs(
 
 def _build_chatwoot_labels(
     language: Optional[str],
-    source: Optional[str]
+    source: Optional[str],
+    consultation_type: Optional[str] = None
 ) -> List[str]:
     """
     Формируем labels для Conversation (типовое поле Chatwoot).
-    Используем человеко-читаемые названия вместо кодов.
+    Используем точные названия меток, которые должны быть созданы в Chatwoot.
     
-    ВАЖНО: Используются человеко-читаемые названия (например, "Русский" вместо "lang_ru").
-    Labels должны быть созданы заранее при инициализации приложения.
+    Метки в Chatwoot:
+    - рус, узб - языки
+    - сайт, тг - источники
+    - тех - тип консультации (Техническая поддержка)
+    - бух, рт, ук - продукты 1С (бухгалтерия, розница, управление компанией)
+    
+    ВАЖНО: Метки должны быть созданы заранее в Chatwoot с точными названиями.
     """
     labels = []
+    
+    # Маппинг языков
     if language:
-        # Маппинг кодов языков в человеко-читаемые названия
         lang_map = {
-            "ru": "Русский",
-            "uz": "Узбекский",
+            "ru": "рус",
+            "uz": "узб",
         }
-        label_name = lang_map.get(language.lower(), f"Язык: {language}")
-        labels.append(label_name)
+        label_name = lang_map.get(language.lower())
+        if label_name:
+            labels.append(label_name)
+    
+    # Маппинг источников
     if source:
-        # Маппинг источников в человеко-читаемые названия
         source_map = {
-            "site": "Сайт",
-            "web": "Сайт",
-            "telegram": "Telegram",
-            "tg": "Telegram",
-            "phone": "Телефон",
-            "call": "Телефон",
+            "site": "сайт",
+            "web": "сайт",
+            "telegram": "тг",
+            "tg": "тг",
+            "TELEGRAM": "тг",
         }
         source_lower = source.lower()
-        label_name = source_map.get(source_lower, f"Источник: {source}")
-        labels.append(label_name)
+        label_name = source_map.get(source_lower)
+        if label_name:
+            labels.append(label_name)
+    
+    # Маппинг типа консультации
+    if consultation_type:
+        # Если тип консультации содержит "Техническая поддержка" или похожее
+        consultation_type_lower = consultation_type.lower()
+        if "техническая" in consultation_type_lower or "тех" in consultation_type_lower:
+            labels.append("тех")
+    
     return labels
 
 
@@ -929,7 +947,42 @@ async def create_consultation(
         if not selected_manager_key:
             selected_manager_key = await _get_default_manager_key(db)
 
-        # 2. Создаем консультацию в БД
+        # 2. Обрабатываем Telegram пользователя если передан
+        telegram_user_id = payload.telegram_user_id
+        telegram_phone_number = payload.telegram_phone_number
+        
+        # Определяем источник создания
+        source = "TELEGRAM" if telegram_user_id else payload.source or "BACKEND"
+        
+        # Связываем Telegram пользователя с клиентом если передан telegram_user_id
+        if telegram_user_id:
+            try:
+                result = await db.execute(
+                    select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
+                )
+                telegram_user = result.scalar_one_or_none()
+                
+                if telegram_user:
+                    # Обновляем существующего пользователя
+                    telegram_user.client_id = client.client_id
+                    if telegram_phone_number:
+                        telegram_user.phone_number = telegram_phone_number
+                else:
+                    # Создаем нового пользователя
+                    telegram_user = TelegramUser(
+                        telegram_user_id=telegram_user_id,
+                        client_id=client.client_id,
+                        phone_number=telegram_phone_number
+                    )
+                    db.add(telegram_user)
+                
+                await db.flush()
+                logger.info(f"Linked Telegram user {telegram_user_id} with client {client.client_id}")
+            except Exception as e:
+                logger.warning(f"Failed to link Telegram user: {e}", exc_info=True)
+                # Продолжаем создание консультации даже если не удалось связать пользователя
+        
+        # 3. Создаем консультацию в БД
         # ВАЖНО: Используем транзакцию для атомарности операций
         # При ошибке в Chatwoot/1C - откатываем транзакцию
         temp_cons_id = f"temp_{uuid.uuid4()}"
@@ -948,7 +1001,7 @@ async def create_consultation(
             start_date=payload.consultation.scheduled_at,
             status="open",
             manager=selected_manager_key,  # Устанавливаем выбранного менеджера
-            source="BACKEND",  # Указываем источник создания
+            source=source,  # Указываем источник создания (TELEGRAM, SITE, BACKEND)
         )
         db.add(consultation)
         await db.flush()
@@ -967,7 +1020,7 @@ async def create_consultation(
         # Логируем финальные custom_attrs перед отправкой
         logger.info(f"Final custom_attrs for Chatwoot: {custom_attrs}")
         
-        # 3. Отправляем в Chatwoot и 1C
+        # 4. Отправляем в Chatwoot и 1C
         # Отслеживаем успех создания хотя бы в одной системе
         chatwoot_success = False
         onec_success = False
@@ -997,10 +1050,17 @@ async def create_consultation(
             # Маппинг importance в priority (типовое поле Chatwoot)
             priority = _map_importance_to_priority(payload.consultation.importance)
             
-            # Формируем labels для language и source (типовое поле Chatwoot)
+            # Формируем labels для language, source и consultation_type (типовое поле Chatwoot)
+            consultation_type_for_labels = None
+            if consultation and consultation.consultation_type:
+                consultation_type_for_labels = consultation.consultation_type
+            elif payload.consultation.consultation_type:
+                consultation_type_for_labels = payload.consultation.consultation_type
+            
             labels = _build_chatwoot_labels(
                 language=payload.consultation.lang,
-                source=payload.source
+                source=source,  # Используем определенный выше source (TELEGRAM, SITE, BACKEND)
+                consultation_type=consultation_type_for_labels
             )
             
             # Подготавливаем данные контакта (используются для поиска, создания контакта и conversation)
@@ -1845,11 +1905,27 @@ async def create_consultation(
         # Получаем ФИО менеджера
         manager_name = await _get_manager_name(db, consultation.manager)
         
+        # Получаем bot_username для Telegram (если консультация создана через Telegram)
+        bot_username = None
+        if source == "TELEGRAM" and telegram_user_id:
+            try:
+                from ..services.telegram_bot import TelegramBotService
+                telegram_bot_service = TelegramBotService()
+                bot_info = await telegram_bot_service.bot.get_me()
+                if bot_info:
+                    bot_username = bot_info.username
+                    logger.info(f"Got bot username for Telegram consultation: {bot_username}")
+            except Exception as e:
+                logger.warning(f"Failed to get bot username: {e}")
+        
         # Формируем ответ
         response = ConsultationResponse(
             consultation=ConsultationRead.from_model(consultation, manager_name=manager_name),
             client_id=str(client.client_id),
             message=message,
+            source=source,  # Источник создания (TELEGRAM, SITE, BACKEND)
+            telegram_user_id=telegram_user_id if telegram_user_id else None,  # ID пользователя Telegram
+            bot_username=bot_username,  # Username бота для Telegram
             # Поля для подключения чат-виджета Chatwoot
             # ВАЖНО: chatwoot_conversation_id будет None если conversation не создана
             chatwoot_conversation_id=chatwoot_cons_id if chatwoot_success else None,  # ID conversation (только если создана)
@@ -1858,6 +1934,26 @@ async def create_consultation(
             chatwoot_inbox_id=chatwoot_inbox_id,  # inbox_id для подключения виджета
             chatwoot_pubsub_token=final_pubsub_token,  # pubsub_token для WebSocket подключения (из контакта, не из беседы)
         )
+        
+        # Если консультация создана через Telegram, отправляем авто сообщение ботом
+        if source == "TELEGRAM" and telegram_user_id and chatwoot_cons_id:
+            try:
+                from ..services.telegram_bot import TelegramBotService
+                telegram_bot_service = TelegramBotService()
+                # Отправляем сообщение пользователю о создании консультации
+                consultation_message = (
+                    f"✅ Ваша заявка #{consultation.number or consultation.cons_id} создана!\n\n"
+                    f"Мы получили ваш запрос и скоро с вами свяжемся.\n\n"
+                    f"Вы можете продолжить общение здесь в чате."
+                )
+                await telegram_bot_service.bot.send_message(
+                    chat_id=telegram_user_id,
+                    text=consultation_message
+                )
+                logger.info(f"Sent auto message to Telegram user {telegram_user_id} for consultation {consultation.cons_id}")
+            except Exception as e:
+                logger.error(f"Failed to send auto message to Telegram user {telegram_user_id}: {e}", exc_info=True)
+                # Не блокируем ответ, если не удалось отправить сообщение
         
         # Сохраняем idempotency key если передан (после успешного создания)
         if idempotency_key:
