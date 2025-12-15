@@ -858,7 +858,7 @@ class ChatwootClient:
     
     async def find_team_by_name(self, team_name: str) -> Optional[int]:
         """
-        Найти команду по имени.
+        Найти команду по имени (регистронезависимый поиск).
         
         Args:
             team_name: Название команды
@@ -877,11 +877,18 @@ class ChatwootClient:
                 logger.warning(f"Unexpected teams response format: {type(teams)}")
                 return None
             
-            for team in teams_list:
-                if isinstance(team, dict) and team.get("name") == team_name:
-                    return team.get("id")
+            # Нормализуем имя команды для поиска (регистронезависимо)
+            team_name_normalized = team_name.lower().strip()
             
-            logger.debug(f"Team '{team_name}' not found in Chatwoot")
+            for team in teams_list:
+                if isinstance(team, dict):
+                    team_name_in_chatwoot = team.get("name", "")
+                    if team_name_in_chatwoot.lower().strip() == team_name_normalized:
+                        team_id = team.get("id")
+                        logger.info(f"Found team '{team_name}' in Chatwoot: id={team_id}")
+                        return team_id
+            
+            logger.warning(f"Team '{team_name}' not found in Chatwoot. Available teams: {[t.get('name') for t in teams_list if isinstance(t, dict)]}")
             return None
         except Exception as e:
             logger.warning(f"Failed to find team '{team_name}' in Chatwoot: {e}")
@@ -1298,6 +1305,83 @@ class ChatwootClient:
             f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/messages",
             data=payload
         )
+    
+    async def send_message_with_attachment(
+        self,
+        conversation_id: str,
+        content: str,
+        attachment_url: str,
+        attachment_type: str = "file",
+        message_type: str = "incoming"
+    ) -> Dict[str, Any]:
+        """
+        Отправка сообщения с вложением в консультацию.
+        
+        Args:
+            conversation_id: ID консультации в Chatwoot
+            content: Текст сообщения
+            attachment_url: URL файла для загрузки
+            attachment_type: Тип файла (image, file, audio, video)
+            message_type: Тип сообщения (incoming/outgoing)
+        """
+        import httpx
+        from io import BytesIO
+        
+        # Сначала загружаем файл по URL
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            file_response = await client.get(attachment_url)
+            file_response.raise_for_status()
+            file_content = file_response.content
+            file_name = attachment_url.split("/")[-1] or f"file.{attachment_type}"
+        
+        # Определяем content_type по типу файла
+        content_type_map = {
+            "image": "image/jpeg",
+            "audio": "audio/mpeg",
+            "video": "video/mp4",
+            "file": "application/octet-stream"
+        }
+        content_type = content_type_map.get(attachment_type, "application/octet-stream")
+        
+        # Отправляем сообщение с вложением через multipart/form-data
+        url = f"{self.base_url}/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/messages"
+        headers = {
+            "api_access_token": self.api_token,
+            "User-Agent": "Clobus-Chatwoot-Client/1.0"
+        }
+        
+        # Используем multipart/form-data для отправки файла
+        # Chatwoot ожидает attachments[] как массив файлов
+        files = {
+            "attachments[]": (file_name, BytesIO(file_content), content_type)
+        }
+        data = {
+            "content": content,
+            "message_type": message_type
+        }
+        
+        logger.info(f"Sending message with attachment to conversation {conversation_id}: type={attachment_type}, size={len(file_content)} bytes, filename={file_name}")
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    data=data,
+                    files=files
+                )
+                response.raise_for_status()
+                result = response.json()
+                logger.info(f"Successfully sent message with attachment to conversation {conversation_id}")
+                return result
+            except httpx.HTTPStatusError as e:
+                error_body = e.response.text if e.response else ""
+                logger.error(
+                    f"Failed to send message with attachment: {e} | "
+                    f"Status: {e.response.status_code if e.response else 'N/A'} | "
+                    f"Response: {error_body}"
+                )
+                raise
     
     async def send_note(
         self,

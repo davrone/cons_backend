@@ -408,6 +408,14 @@ async def chatwoot_webhook(
                 if custom_attrs_changed:
                     changes.append("custom_attributes")
                 logger.info(f"Updated consultation {cons_id} in DB from Chatwoot webhook. Changes: {', '.join(changes) if changes else 'none'}")
+                
+                # Уведомляем WebSocket клиентов об обновлении (если были изменения)
+                if status_changed or manager_changed or custom_attrs_changed:
+                    try:
+                        from ..routers.websocket import notify_consultation_update
+                        await notify_consultation_update(cons_id, consultation)
+                    except Exception as ws_error:
+                        logger.debug(f"Failed to notify WebSocket clients: {ws_error}")
         
         elif event_type == "conversation.status_changed" or event_type == "conversation.resolved":
             # Изменение статуса консультации в Chatwoot
@@ -655,6 +663,7 @@ async def onec_webhook(
             consultation = result.scalar_one_or_none()
             
             if consultation:
+                old_status = consultation.status
                 consultation.status = "closed"
                 end_date_value = event_data.get("end_date")
                 if end_date_value:
@@ -674,7 +683,7 @@ async def onec_webhook(
                     db=db,
                     cons_id=cons_id or consultation.cons_id,
                     field_name="status",
-                    old_value=consultation.status,
+                    old_value=old_status,
                     new_value="closed",
                     source="1C_CL"
                 )
@@ -687,8 +696,18 @@ async def onec_webhook(
                             conversation_id=consultation.cons_id,
                             status="resolved",
                         )
-                    except Exception:
-                        pass
+                        logger.info(f"Updated Chatwoot conversation {consultation.cons_id} status to 'resolved'")
+                    except Exception as e:
+                        logger.warning(f"Failed to update Chatwoot conversation status: {e}")
+                
+                await db.flush()
+                
+                # Уведомляем WebSocket клиентов об обновлении
+                try:
+                    from ..routers.websocket import notify_consultation_update
+                    await notify_consultation_update(consultation.cons_id or cons_id, consultation)
+                except Exception as ws_error:
+                    logger.debug(f"Failed to notify WebSocket clients: {ws_error}")
         
         await db.commit()
         webhook_log.processed = True

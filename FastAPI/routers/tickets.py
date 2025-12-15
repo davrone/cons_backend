@@ -88,35 +88,46 @@ async def create_ticket(
         pass
     
     # 4. Отправляем в 1C:ЦЛ через OData
-    onec_client = OneCClient()
-    try:
-        # Формируем КонсультацииИТС если есть данные
-        consultations_its = None
-        if ticket.online_question_cat or ticket.online_question:
-            consultations_its = [{
-                "LineNumber": "1",
-                "ВидПО_Key": None,  # Можно добавить если есть в ticket
-                "РазделПО_Key": None,
-                "Вопрос": ticket.comment or "",
-                "Ответ": ""
-            }]
-        
-        onec_response = await onec_client.create_consultation_odata(
-            client_key=ticket.cl_ref_key,  # Абонент_Key из ЦЛ
-            description=ticket.comment or "",
-            topic=None,  # Можно добавить в схему если нужно
-            scheduled_at=ticket.scheduled_at,
-            question_category_key=ticket.online_question_cat,
-            question_key=ticket.online_question,
-            consultations_its=consultations_its
-        )
-        # OData возвращает Ref_Key и Number
-        consultation.cl_ref_key = onec_response.get("Ref_Key")
-        consultation.number = onec_response.get("Number")
-    except Exception as e:
-        # Если ЦЛ недоступен, продолжаем без его данных
-        logger.error(f"Failed to create consultation in 1C: {e}")
-        pass
+    # ВАЖНО: Отправляем в ЦЛ только консультации с типом "Консультация по ведению учёта"
+    # Техническая поддержка НЕ отправляется в ЦЛ
+    consultation_type = getattr(ticket, 'consultation_type', None) or getattr(consultation, 'consultation_type', None)
+    should_send_to_cl = consultation_type == "Консультация по ведению учёта"
+    
+    if ticket.cl_ref_key and should_send_to_cl:
+        onec_client = OneCClient()
+        try:
+            # Формируем КонсультацииИТС если есть данные
+            consultations_its = None
+            if ticket.online_question_cat or ticket.online_question:
+                consultations_its = [{
+                    "LineNumber": "1",
+                    "ВидПО_Key": None,  # Можно добавить если есть в ticket
+                    "РазделПО_Key": None,
+                    "Вопрос": ticket.comment or "",
+                    "Ответ": ""
+                }]
+            
+            onec_response = await onec_client.create_consultation_odata(
+                client_key=ticket.cl_ref_key,  # Абонент_Key из ЦЛ
+                description=ticket.comment or "",
+                topic=None,  # Можно добавить в схему если нужно
+                scheduled_at=ticket.scheduled_at,
+                question_category_key=ticket.online_question_cat,
+                question_key=ticket.online_question,
+                consultations_its=consultations_its
+            )
+            # OData возвращает Ref_Key и Number
+            consultation.cl_ref_key = onec_response.get("Ref_Key")
+            consultation.number = onec_response.get("Number")
+        except Exception as e:
+            # Если ЦЛ недоступен, продолжаем без его данных
+            logger.error(f"Failed to create consultation in 1C: {e}")
+            pass
+    else:
+        if not should_send_to_cl:
+            logger.info(f"Skipping 1C consultation creation: consultation_type='{consultation_type}' (only 'Консультация по ведению учёта' should be sent to ЦЛ)")
+        elif not ticket.cl_ref_key:
+            logger.warning("Skipping 1C consultation creation: client is not synced with 1C (cl_ref_key missing)")
     
     await db.commit()
     await db.refresh(consultation)

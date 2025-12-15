@@ -6,7 +6,8 @@
 Механика:
 - каждая строка оценки сохраняется в cons.cons_rating_answers (на уровне вопроса)
 - для каждого cons_key пересчитывается средняя оценка и сохраняется в cons.cons.con_rates
-- прогресс фиксируется в sys.sync_state по максимальной дате Period
+- прогресс фиксируется в sys.sync_state по последнему обработанному Обращение_Key
+  (используется ключ вместо ДатаОценки, так как ДатаОценки может быть не заполнена)
 """
 from __future__ import annotations
 
@@ -128,8 +129,27 @@ async def ensure_support_objects():
                 """
                 CREATE TABLE IF NOT EXISTS sys.sync_state (
                     entity_name TEXT PRIMARY KEY,
-                    last_synced_at TIMESTAMPTZ
+                    last_synced_at TIMESTAMPTZ,
+                    last_synced_key TEXT
                 )
+                """
+            )
+        )
+        # Добавляем колонку last_synced_key если её нет
+        await conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_schema = 'sys' 
+                        AND table_name = 'sync_state' 
+                        AND column_name = 'last_synced_key'
+                    ) THEN
+                        ALTER TABLE sys.sync_state ADD COLUMN last_synced_key TEXT;
+                    END IF;
+                END $$;
                 """
             )
         )
@@ -144,7 +164,20 @@ async def ensure_support_objects():
     await engine.dispose()
 
 
+async def get_last_sync_key(db: AsyncSession) -> Optional[str]:
+    """Получает последний обработанный Обращение_Key из sync_state"""
+    result = await db.execute(
+        text("SELECT last_synced_key FROM sys.sync_state WHERE entity_name = :entity"),
+        {"entity": ENTITY},
+    )
+    row = result.first()
+    if row and row[0]:
+        return row[0]
+    return None
+
+
 async def get_last_sync_date(db: AsyncSession) -> Optional[datetime]:
+    """Получает последнюю дату синхронизации (используется как fallback)"""
     result = await db.execute(
         text("SELECT last_synced_at FROM sys.sync_state WHERE entity_name = :entity"),
         {"entity": ENTITY},
@@ -155,16 +188,19 @@ async def get_last_sync_date(db: AsyncSession) -> Optional[datetime]:
     return None
 
 
-async def save_sync_date(db: AsyncSession, value: datetime):
+async def save_sync_state(db: AsyncSession, last_key: Optional[str] = None, last_date: Optional[datetime] = None):
+    """Сохраняет состояние синхронизации (ключ и/или дату)"""
     await db.execute(
         text(
             """
-            INSERT INTO sys.sync_state (entity_name, last_synced_at)
-            VALUES (:entity, :date)
-            ON CONFLICT (entity_name) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at
+            INSERT INTO sys.sync_state (entity_name, last_synced_at, last_synced_key)
+            VALUES (:entity, :date, :key)
+            ON CONFLICT (entity_name) DO UPDATE SET 
+                last_synced_at = COALESCE(EXCLUDED.last_synced_at, sys.sync_state.last_synced_at),
+                last_synced_key = COALESCE(EXCLUDED.last_synced_key, sys.sync_state.last_synced_key)
             """
         ),
-        {"entity": ENTITY, "date": value},
+        {"entity": ENTITY, "date": last_date, "key": last_key},
     )
 
 
@@ -317,19 +353,28 @@ async def notify_chatwoot_rating(
 async def process_batch(
     db: AsyncSession,
     batch: List[Dict[str, Any]],
-    min_period: Optional[datetime],
-) -> Tuple[int, Optional[datetime], Dict[str, int]]:
+    last_synced_key: Optional[str],
+) -> Tuple[int, Optional[str], Optional[datetime], Dict[str, int]]:
+    """
+    Обрабатывает батч записей оценок.
+    Возвращает: (количество обработанных, последний обработанный ключ, последняя дата, статистика)
+    
+    ВАЖНО: Пропуск уже обработанных записей происходит на основе last_synced_key.
+    Если ключ меньше или равен last_synced_key, запись пропускается.
+    Это работает потому что записи сортируются по ключу в OData запросе.
+    """
     cons_keys: Set[str] = set()
     client_keys: Set[str] = set()
     latest_period: Optional[datetime] = None
+    last_processed_key: Optional[str] = None
     stats = {
         "rows_in_batch": len(batch),
         "skipped_missing_cons": 0,
         "skipped_missing_question": 0,
-        "skipped_missing_period": 0,
-        "skipped_before_min": 0,
+        "skipped_before_key": 0,
     }
 
+    # Собираем все ключи из батча
     for item in batch:
         cons_key = clean_uuid(item.get("Обращение_Key"))
         client_key = clean_uuid(item.get("Контрагент_Key"))
@@ -343,6 +388,10 @@ async def process_batch(
 
     rows: List[Dict[str, Any]] = []
     affected_cons_keys: Set[str] = set()
+    
+    # Флаг для отслеживания, прошли ли мы уже точку last_synced_key
+    # Это позволяет пропускать записи до нужной точки, а затем обрабатывать все остальные
+    passed_sync_point = last_synced_key is None
 
     for item in batch:
         cons_key = clean_uuid(item.get("Обращение_Key"))
@@ -350,16 +399,9 @@ async def process_batch(
         manager_key = clean_uuid(item.get("Менеджер_Key"))
         question_number = clean_int(item.get("НомерВопроса"))
         
-        # ВАЖНО: У сущности InformationRegister_ОценкаКонсультацийПоЗаявкам НЕТ поля Period
-        # Используем только ДатаОценки (может быть "0001-01-01T00:00:00" если не заполнена)
+        # Используем ДатаОценки только для сохранения, не для синхронизации
         rating_date_dt = clean_datetime(item.get("ДатаОценки"))
-        
-        # Для синхронизации используем ДатаОценки
-        # Если ДатаОценки не валидна (0001-01-01), используем текущую дату как fallback
-        sync_date = rating_date_dt
-        if not sync_date or sync_date.year == 1:
-            # Если ДатаОценки не заполнена, используем текущую дату для синхронизации
-            sync_date = datetime.now(timezone.utc)
+        if rating_date_dt and rating_date_dt.year == 1:
             rating_date_dt = None  # Не сохраняем невалидную дату
 
         if not cons_key:
@@ -368,16 +410,27 @@ async def process_batch(
         if question_number is None:
             stats["skipped_missing_question"] += 1
             continue
-        if not sync_date:
-            stats["skipped_missing_period"] += 1
-            continue
 
-        if min_period and sync_date < min_period:
-            stats["skipped_before_min"] += 1
-            continue
+        # Пропускаем записи до последнего обработанного ключа
+        # Используем сравнение строк для GUID (OData сортирует по ключу, так что порядок стабильный)
+        if not passed_sync_point and last_synced_key:
+            # Сравниваем ключи как строки (GUID в формате UUID сортируются лексикографически)
+            if cons_key == last_synced_key:
+                # Достигли точки синхронизации, начинаем обрабатывать следующие записи
+                passed_sync_point = True
+            elif cons_key < last_synced_key:
+                # Еще не достигли точки синхронизации, пропускаем
+                stats["skipped_before_key"] += 1
+                continue
+            else:
+                # Ключ больше last_synced_key, начинаем обрабатывать
+                passed_sync_point = True
 
-        if latest_period is None or sync_date > latest_period:
-            latest_period = sync_date
+        # Обновляем последний обработанный ключ (используем максимальный по строковому сравнению)
+        if last_processed_key is None or cons_key > last_processed_key:
+            last_processed_key = cons_key
+        if rating_date_dt and (latest_period is None or rating_date_dt > latest_period):
+            latest_period = rating_date_dt
 
         rating_value = clean_int(item.get("Оценка"))
         cons_info = cons_map.get(cons_key, (None, None))
@@ -404,7 +457,7 @@ async def process_batch(
         affected_cons_keys.add(cons_key)
 
     if not rows:
-        return 0, latest_period, stats
+        return 0, last_processed_key, latest_period, stats
 
     # Вставляем/обновляем записи и получаем ключи новых записей
     new_keys = await upsert_answers(db, rows)
@@ -424,7 +477,7 @@ async def process_batch(
                     db=db
                 )
     
-    return len(rows), latest_period, stats
+    return len(rows), last_processed_key, latest_period, stats
 
 
 async def pull_cons_rates():
@@ -447,26 +500,29 @@ async def pull_cons_rates():
 
     try:
         async with AsyncSessionLocal() as db:
-            last_sync = await get_last_sync_date(db)
-            min_period = None
-            if last_sync:
-                min_period = last_sync - timedelta(days=1)
-                logger.info("Incremental sync from %s (last_sync=%s)", min_period.date(), last_sync)
+            # Получаем последний обработанный ключ для инкрементальной загрузки
+            last_synced_key = await get_last_sync_key(db)
+            last_synced_date = await get_last_sync_date(db)
+            
+            if last_synced_key:
+                logger.info("Incremental sync from key: %s (last_sync_date=%s)", last_synced_key[:8] + "...", last_synced_date)
             else:
-                logger.info("First run — loading from %s", INITIAL_FROM_DATE)
+                logger.info("First run — loading all records")
 
             skip = 0
             total_processed = 0
             error_logs = 0
-            last_period_processed: Optional[datetime] = None
+            last_processed_key: Optional[str] = last_synced_key
+            last_period_processed: Optional[datetime] = last_synced_date
 
             while True:
-                # ВАЖНО: У сущности InformationRegister_ОценкаКонсультацийПоЗаявкам НЕТ поля Period для фильтрации
-                # Загружаем все записи без фильтра по дате (фильтрация происходит в process_batch по min_period)
-                # Используем только сортировку по ДатаОценки
+                # ВАЖНО: Не используем фильтрацию по GUID через $filter, так как GUID нельзя сравнивать через gt/lt
+                # Используем только сортировку по Обращение_Key, а пропуск уже обработанных записей
+                # происходит на стороне приложения в функции process_batch
+                encoded_orderby = quote("Обращение_Key asc", safe=",", encoding='utf-8')
                 url = (
                     f"{ODATA_BASEURL}{ENTITY}?$format=json"
-                    f"&$orderby=ДатаОценки asc"
+                    f"&$orderby={encoded_orderby}"
                     f"&$top={PAGE_SIZE}&$skip={skip}"
                 )
 
@@ -481,7 +537,7 @@ async def pull_cons_rates():
                     break
 
                 try:
-                    processed, latest_period, stats = await process_batch(db, batch, min_period)
+                    processed, batch_last_key, latest_period, stats = await process_batch(db, batch, last_synced_key)
                 except Exception as exc:
                     if error_logs < MAX_ERROR_LOGS:
                         logger.error("Error processing rates batch (skip=%s): %s", skip, exc)
@@ -493,43 +549,41 @@ async def pull_cons_rates():
 
                 await db.commit()
                 total_processed += processed
-                if processed or stats["rows_in_batch"] == 0:
-                    logger.info("Processed %s rate rows (total=%s, skip=%s)", processed, total_processed, skip)
-                else:
-                    logger.warning(
-                        "Batch skip=%s dropped entirely (rows=%s, missing_cons=%s, missing_q=%s, missing_period=%s, before_min=%s)",
-                        skip,
-                        stats["rows_in_batch"],
-                        stats["skipped_missing_cons"],
-                        stats["skipped_missing_question"],
-                        stats["skipped_missing_period"],
-                        stats["skipped_before_min"],
-                    )
-                    if (
-                        stats["rows_in_batch"] > 0
-                        and stats["skipped_missing_period"] == stats["rows_in_batch"]
-                        and batch
-                    ):
-                        sample = batch[0]
-                        preview = {k: sample.get(k) for k in sample.keys()}
-                        logger.warning(
-                            "Sample row for missing Period (skip=%s): %s | keys=%s",
-                            skip,
-                            json.dumps(preview, ensure_ascii=False),
-                            list(sample.keys()),
-                        )
-
+                
+                # Обновляем последний обработанный ключ
+                if batch_last_key and (last_processed_key is None or batch_last_key > last_processed_key):
+                    last_processed_key = batch_last_key
+                
+                # Обновляем последнюю дату
                 if latest_period and (
                     last_period_processed is None or latest_period > last_period_processed
                 ):
                     last_period_processed = latest_period
 
+                if processed or stats["rows_in_batch"] == 0:
+                    logger.info(
+                        "Processed %s rate rows (total=%s, skip=%s, last_key=%s)",
+                        processed,
+                        total_processed,
+                        skip,
+                        batch_last_key[:8] + "..." if batch_last_key else "None",
+                    )
+                else:
+                    logger.warning(
+                        "Batch skip=%s dropped entirely (rows=%s, missing_cons=%s, missing_q=%s, before_key=%s)",
+                        skip,
+                        stats["rows_in_batch"],
+                        stats["skipped_missing_cons"],
+                        stats["skipped_missing_question"],
+                        stats["skipped_before_key"],
+                    )
+
                 # ВАЖНО: Сохраняем sync_state после каждого батча для устойчивости при прерывании
-                if last_period_processed:
+                if last_processed_key:
                     try:
-                        await save_sync_date(db, last_period_processed)
+                        await save_sync_state(db, last_key=last_processed_key, last_date=last_period_processed)
                         await db.commit()
-                        logger.debug(f"✓ Sync state saved after batch: {last_period_processed}")
+                        logger.debug(f"✓ Sync state saved after batch: key={last_processed_key[:8]}..., date={last_period_processed}")
                     except Exception as sync_error:
                         logger.warning(f"Failed to save sync state after batch: {sync_error}")
                         # Не прерываем выполнение, продолжаем обработку
@@ -538,13 +592,14 @@ async def pull_cons_rates():
                     break
                 skip += PAGE_SIZE
 
-            # Финальное сохранение даты синхронизации (на случай если последний батч не сохранил)
-            if last_period_processed:
-                await save_sync_date(db, last_period_processed)
+            # Финальное сохранение состояния синхронизации
+            if last_processed_key:
+                await save_sync_state(db, last_key=last_processed_key, last_date=last_period_processed)
                 await db.commit()
                 logger.info(
-                    "✓ Rate sync completed. Total processed: %s (last_period=%s)",
+                    "✓ Rate sync completed. Total processed: %s (last_key=%s, last_date=%s)",
                     total_processed,
+                    last_processed_key[:8] + "..." if last_processed_key else "None",
                     last_period_processed,
                 )
             else:

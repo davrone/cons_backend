@@ -48,7 +48,13 @@ class TelegramBotService:
         # Обработчик контакта
         self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
         
-        # Обработчик текстовых сообщений
+        # Обработчик медиафайлов (фото, документы, аудио, видео)
+        self.application.add_handler(MessageHandler(
+            filters.PHOTO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO,
+            self.handle_media
+        ))
+        
+        # Обработчик текстовых сообщений (должен быть последним, чтобы не перехватывать медиа)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
         logger.info("Telegram bot handlers setup completed")
@@ -114,6 +120,39 @@ class TelegramBotService:
                     )
                     return
                 
+                # Сохраняем активную консультацию в контексте пользователя
+                # Это позволяет обрабатывать сообщения без проверки client_id
+                if context.user_data is not None:
+                    context.user_data["active_cons_id"] = cons_id
+                    context.user_data["active_client_id"] = consultation.client_id
+                
+                # ВАЖНО: Связываем Telegram пользователя с клиентом из консультации
+                # Это нужно для того, чтобы сообщения от операторов доходили до пользователя
+                if consultation.client_id:
+                    try:
+                        result = await db.execute(
+                            select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
+                        )
+                        telegram_user = result.scalar_one_or_none()
+                        
+                        if telegram_user:
+                            # Обновляем существующего пользователя
+                            telegram_user.client_id = consultation.client_id
+                            logger.info(f"Linked Telegram user {telegram_user_id} with client {consultation.client_id} via /start command")
+                        else:
+                            # Создаем нового пользователя
+                            telegram_user = TelegramUser(
+                                telegram_user_id=telegram_user_id,
+                                client_id=consultation.client_id
+                            )
+                            db.add(telegram_user)
+                            logger.info(f"Created and linked Telegram user {telegram_user_id} with client {consultation.client_id} via /start command")
+                        
+                        await db.commit()
+                    except Exception as e:
+                        logger.error(f"Failed to link Telegram user via /start command: {e}", exc_info=True)
+                        await db.rollback()
+                
                 # Проверяем статус консультации
                 is_open = consultation.status in (None, "open", "pending")
                 
@@ -156,21 +195,61 @@ class TelegramBotService:
                 )
                 return
             
+            # Фильтруем только пользовательские сообщения (не системные)
+            user_messages = []
+            for msg in messages:
+                # Пропускаем системные сообщения (private notes, activity messages)
+                private = msg.get("private", False)
+                message_type = msg.get("message_type", "")
+                # content может быть None, поэтому обрабатываем это
+                content = msg.get("content") or ""
+                if content:
+                    content = str(content).strip()
+                else:
+                    content = ""
+                
+                # Пропускаем приватные заметки и пустые сообщения
+                if private or not content:
+                    continue
+                
+                # Пропускаем activity сообщения (системные события)
+                if message_type == "activity":
+                    continue
+                
+                user_messages.append(msg)
+            
+            if not user_messages:
+                await update.message.reply_text(
+                    "💬 Чат открыт. Начните общение, отправив сообщение."
+                )
+                return
+            
             # Отправляем информацию о загрузке истории
             await update.message.reply_text(
-                f"📜 Загружаю историю сообщений ({len(messages)} сообщений)..."
+                f"📜 Загружаю историю сообщений ({len(user_messages)} сообщений)..."
             )
             
             # Отправляем сообщения в хронологическом порядке (старые первыми)
-            for msg in reversed(messages):
-                content = msg.get("content", "")
+            for msg in reversed(user_messages):
+                # content может быть None, поэтому обрабатываем это
+                content = msg.get("content") or ""
+                if content:
+                    content = str(content).strip()
+                else:
+                    content = ""
+                
                 message_type = msg.get("message_type", "incoming")
                 sender = msg.get("sender", {})
-                sender_name = sender.get("name", "Система") if sender else "Система"
-                created_at = msg.get("created_at", "")
+                sender_name = sender.get("name", "Менеджер") if sender else "Менеджер"
+                sender_type = sender.get("type", "") if sender else ""
                 
-                # Форматируем сообщение для Telegram
-                if message_type == "incoming":
+                # В Chatwoot:
+                # - message_type == "incoming" означает сообщение от клиента (входящее)
+                # - message_type == "outgoing" означает сообщение от менеджера/бота (исходящее)
+                # - sender.type == "user" означает менеджер
+                # - sender.type == "contact" означает клиент
+                
+                if message_type == "outgoing" or sender_type == "user":
                     # Сообщение от менеджера
                     formatted_msg = f"👤 {sender_name}:\n{content}"
                 else:
@@ -179,8 +258,30 @@ class TelegramBotService:
                 
                 await update.message.reply_text(formatted_msg)
             
+            # Определяем URL для Web App
+            if settings.TELEGRAM_WEBAPP_URL:
+                web_app_url = settings.TELEGRAM_WEBAPP_URL.rstrip("/")
+                if "/subscriptions" not in web_app_url:
+                    web_app_url = f"{web_app_url}/subscriptions"
+            elif settings.TELEGRAM_WEBHOOK_URL:
+                base_url = settings.TELEGRAM_WEBHOOK_URL.replace("/api/telegram/webhook", "").rstrip("/")
+                if "backdev" in base_url:
+                    base_url = base_url.replace("backdev", "dev")
+                web_app_url = f"{base_url}/subscriptions"
+            else:
+                web_app_url = "https://your-domain.com/subscriptions"
+            
+            # Отправляем сообщение с кнопкой web app
+            from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+            keyboard = [[InlineKeyboardButton(
+                "📱 Открыть портал поддержки",
+                web_app=WebAppInfo(url=web_app_url)
+            )]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             await update.message.reply_text(
-                "✅ История загружена. Теперь вы можете продолжить общение."
+                "✅ История загружена. Теперь вы можете продолжить общение.",
+                reply_markup=reply_markup
             )
             
         except Exception as e:
@@ -212,12 +313,22 @@ class TelegramBotService:
                 )
                 telegram_user = result.scalar_one_or_none()
                 
+                # Проверяем, есть ли активная консультация для связывания
+                active_client_id = None
+                if context.user_data and context.user_data.get("active_client_id"):
+                    active_client_id = context.user_data.get("active_client_id")
+                
                 if telegram_user:
                     # Обновляем существующего пользователя Telegram
                     telegram_user.phone_number = phone_number
                     telegram_user.first_name = from_user.first_name
                     telegram_user.last_name = from_user.last_name
                     telegram_user.username = from_user.username
+                    
+                    # ВАЖНО: Если есть активная консультация, связываем с клиентом
+                    if active_client_id:
+                        telegram_user.client_id = active_client_id
+                        logger.info(f"Linked Telegram user {telegram_user_id} with client {active_client_id} via contact")
                 else:
                     # Создаем нового пользователя Telegram
                     telegram_user = TelegramUser(
@@ -225,14 +336,18 @@ class TelegramBotService:
                         phone_number=phone_number,
                         first_name=from_user.first_name,
                         last_name=from_user.last_name,
-                        username=from_user.username
+                        username=from_user.username,
+                        client_id=active_client_id
                     )
                     db.add(telegram_user)
+                    if active_client_id:
+                        logger.info(f"Created and linked Telegram user {telegram_user_id} with client {active_client_id} via contact")
                 
                 await db.commit()
             
             # Отправляем сообщение с кнопкой для открытия Web App
-            from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+            # Убираем кнопку отправки контакта и оставляем только web app
+            from telegram import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
             
             # Определяем URL для Web App
             # ВАЖНО: Web App должен открываться на фронтенде, а не на бэкенде
@@ -263,9 +378,17 @@ class TelegramBotService:
             )]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
+            # Убираем клавиатуру с кнопкой отправки контакта
             await update.message.reply_text(
                 "✅ Контакт сохранен!\n\n"
                 "Теперь вы можете создать заявку на консультацию через портал поддержки.",
+                reply_markup=ReplyKeyboardRemove(),
+                reply_to_message_id=update.message.message_id
+            )
+            
+            # Отправляем отдельное сообщение с кнопкой web app
+            await update.message.reply_text(
+                "Нажмите кнопку ниже, чтобы открыть портал поддержки:",
                 reply_markup=reply_markup
             )
             
@@ -284,29 +407,102 @@ class TelegramBotService:
         message_text = update.message.text
         
         try:
-            # Находим активную консультацию для пользователя
+            # Проверяем, есть ли активная консультация в контексте пользователя
+            # (установлена при переходе через deep link /start cons_123)
+            active_cons_id = None
+            if context.user_data:
+                active_cons_id = context.user_data.get("active_cons_id")
+            
             async with AsyncSessionLocal() as db:
-                # Получаем client_id пользователя
-                result = await db.execute(
-                    select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
-                )
-                telegram_user = result.scalar_one_or_none()
+                consultation = None
                 
-                if not telegram_user or not telegram_user.client_id:
-                    await update.message.reply_text(
-                        "❌ Вы не связаны с клиентом. Пожалуйста, создайте заявку через портал поддержки."
+                # Если есть активная консультация в контексте, используем её
+                if active_cons_id:
+                    result = await db.execute(
+                        select(Consultation).where(Consultation.cons_id == active_cons_id)
                     )
-                    return
+                    consultation = result.scalar_one_or_none()
                 
-                # Находим открытую консультацию для этого клиента
-                result = await db.execute(
-                    select(Consultation)
-                    .where(Consultation.client_id == telegram_user.client_id)
-                    .where(Consultation.status.in_([None, "open", "pending"]))
-                    .order_by(Consultation.create_date.desc())
-                    .limit(1)
-                )
-                consultation = result.scalar_one_or_none()
+                # Если нет активной консультации в контексте, ищем по client_id или связываем по cons_id
+                if not consultation:
+                    result = await db.execute(
+                        select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
+                    )
+                    telegram_user = result.scalar_one_or_none()
+                    
+                    # Если Telegram пользователь не связан с клиентом, пытаемся найти консультацию по cons_id из deep link
+                    # или по последней открытой консультации для этого пользователя
+                    if not telegram_user or not telegram_user.client_id:
+                        # Пытаемся найти консультацию по cons_id из deep link (если пользователь перешел по /start cons_id=XXX)
+                        # Или находим последнюю открытую консультацию, созданную недавно
+                        from datetime import datetime, timezone, timedelta
+                        recent_time = datetime.now(timezone.utc) - timedelta(hours=24)  # За последние 24 часа
+                        
+                        # Ищем последние открытые консультации
+                        result = await db.execute(
+                            select(Consultation)
+                            .where(Consultation.status.in_([None, "open", "pending"]))
+                            .where(Consultation.created_at >= recent_time)
+                            .order_by(Consultation.created_at.desc())
+                            .limit(10)
+                        )
+                        recent_consultations = result.scalars().all()
+                        
+                        # Пытаемся найти консультацию по номеру телефона из Telegram пользователя
+                        consultation = None
+                        if telegram_user and telegram_user.phone_number:
+                            for cons in recent_consultations:
+                                if cons.client_id:
+                                    result = await db.execute(
+                                        select(Client).where(Client.client_id == cons.client_id)
+                                    )
+                                    client = result.scalar_one_or_none()
+                                    if client and client.phone_number == telegram_user.phone_number:
+                                        consultation = cons
+                                        # Связываем Telegram пользователя с клиентом
+                                        telegram_user.client_id = cons.client_id
+                                        await db.commit()
+                                        logger.info(f"Auto-linked Telegram user {telegram_user_id} with client {cons.client_id} via phone_number in handle_message")
+                                        break
+                        
+                        # Если не нашли по телефону, но есть консультации - берем самую последнюю
+                        # Это работает только если пользователь создал одну консультацию
+                        if not consultation and recent_consultations:
+                            # Берем самую последнюю консультацию
+                            consultation = recent_consultations[0]
+                            if consultation.client_id:
+                                # Создаем или обновляем Telegram пользователя
+                                if not telegram_user:
+                                    telegram_user = TelegramUser(
+                                        telegram_user_id=telegram_user_id,
+                                        client_id=consultation.client_id
+                                    )
+                                    db.add(telegram_user)
+                                else:
+                                    telegram_user.client_id = consultation.client_id
+                                await db.commit()
+                                logger.info(f"Auto-linked Telegram user {telegram_user_id} with client {consultation.client_id} via recent consultation in handle_message")
+                        
+                        if not consultation:
+                            await update.message.reply_text(
+                                "❌ Вы не связаны с клиентом. Пожалуйста, создайте заявку через портал поддержки или перейдите по ссылке из заявки."
+                            )
+                            return
+                    else:
+                        # Находим открытую консультацию для этого клиента
+                        result = await db.execute(
+                            select(Consultation)
+                            .where(Consultation.client_id == telegram_user.client_id)
+                            .where(Consultation.status.in_([None, "open", "pending"]))
+                            .order_by(Consultation.created_at.desc())
+                            .limit(1)
+                        )
+                        consultation = result.scalar_one_or_none()
+                    
+                    # Сохраняем найденную консультацию в контексте
+                    if consultation and context.user_data is not None:
+                        context.user_data["active_cons_id"] = consultation.cons_id
+                        context.user_data["active_client_id"] = consultation.client_id
                 
                 if not consultation:
                     await update.message.reply_text(
@@ -330,7 +526,7 @@ class TelegramBotService:
                     message_type="incoming"
                 )
                 
-                await update.message.reply_text("✅ Сообщение отправлено менеджеру.")
+                # Убрано подтверждение отправки сообщения
                 
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
@@ -340,17 +536,225 @@ class TelegramBotService:
     
     async def send_message_to_telegram(self, telegram_user_id: int, message_text: str):
         """Отправка сообщения пользователю в Telegram"""
+        print(f"[TELEGRAM BOT] send_message_to_telegram called: user_id={telegram_user_id}, message_length={len(message_text)}")
+        
         if not self.bot:
+            print("[TELEGRAM BOT] ERROR: Bot not initialized")
             logger.warning("Bot not initialized, cannot send message")
             return
         
         try:
-            await self.bot.send_message(
+            print(f"[TELEGRAM BOT] Attempting to send message to chat_id={telegram_user_id}")
+            result = await self.bot.send_message(
                 chat_id=telegram_user_id,
                 text=message_text
             )
+            print(f"[TELEGRAM BOT] Message sent successfully: message_id={result.message_id if result else 'N/A'}")
+            logger.info(f"Message sent to Telegram user {telegram_user_id}, message_id={result.message_id if result else 'N/A'}")
         except Exception as e:
+            print(f"[TELEGRAM BOT] ERROR sending message: {e}")
             logger.error(f"Error sending message to Telegram: {e}", exc_info=True)
+            raise  # Пробрасываем ошибку, чтобы увидеть её в webhook
+    
+    async def send_media_to_telegram(
+        self, 
+        telegram_user_id: int, 
+        file_url: str, 
+        file_type: str = "file",
+        caption: str = None
+    ):
+        """Отправка медиафайла (фото, документ, аудио, видео) пользователю в Telegram"""
+        print(f"[TELEGRAM BOT] send_media_to_telegram called: user_id={telegram_user_id}, file_url={file_url}, file_type={file_type}")
+        
+        if not self.bot:
+            print("[TELEGRAM BOT] ERROR: Bot not initialized")
+            logger.warning("Bot not initialized, cannot send media")
+            return
+        
+        try:
+            import httpx
+            from io import BytesIO
+            from urllib.parse import urlparse, urljoin
+            
+            # Формируем полный URL файла (если это относительный путь)
+            if not file_url.startswith("http"):
+                # Если это относительный путь, добавляем базовый URL Chatwoot
+                from ..config import settings
+                base_url = settings.CHATWOOT_API_URL.rstrip("/")
+                file_url = urljoin(base_url, file_url.lstrip("/"))
+            
+            print(f"[TELEGRAM BOT] Downloading file from: {file_url}")
+            
+            # Скачиваем файл из Chatwoot
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                file_response = await client.get(file_url)
+                file_response.raise_for_status()
+                file_content = file_response.content
+                file_name = file_url.split("/")[-1].split("?")[0] or f"file.{file_type}"  # Убираем query параметры
+            
+            print(f"[TELEGRAM BOT] Downloaded file: {file_name}, size={len(file_content)} bytes")
+            
+            # Отправляем файл в зависимости от типа
+            file_obj = BytesIO(file_content)
+            file_obj.name = file_name
+            
+            if file_type == "image" or file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                # Отправляем как фото
+                result = await self.bot.send_photo(
+                    chat_id=telegram_user_id,
+                    photo=file_obj,
+                    caption=caption
+                )
+                print(f"[TELEGRAM BOT] Photo sent successfully: message_id={result.message_id if result else 'N/A'}")
+            elif file_type == "audio" or file_name.lower().endswith(('.mp3', '.ogg', '.wav', '.m4a')):
+                # Отправляем как аудио
+                result = await self.bot.send_audio(
+                    chat_id=telegram_user_id,
+                    audio=file_obj,
+                    caption=caption
+                )
+                print(f"[TELEGRAM BOT] Audio sent successfully: message_id={result.message_id if result else 'N/A'}")
+            elif file_type == "video" or file_name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                # Отправляем как видео
+                result = await self.bot.send_video(
+                    chat_id=telegram_user_id,
+                    video=file_obj,
+                    caption=caption
+                )
+                print(f"[TELEGRAM BOT] Video sent successfully: message_id={result.message_id if result else 'N/A'}")
+            else:
+                # Отправляем как документ
+                result = await self.bot.send_document(
+                    chat_id=telegram_user_id,
+                    document=file_obj,
+                    caption=caption
+                )
+                print(f"[TELEGRAM BOT] Document sent successfully: message_id={result.message_id if result else 'N/A'}")
+            
+            logger.info(f"Media sent to Telegram user {telegram_user_id}, message_id={result.message_id if result else 'N/A'}")
+        except Exception as e:
+            print(f"[TELEGRAM BOT] ERROR sending media: {e}")
+            logger.error(f"Error sending media to Telegram: {e}", exc_info=True)
+            raise
+    
+    async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка медиафайлов (фото, документы, аудио, видео)"""
+        if not update.message:
+            return
+        
+        telegram_user_id = update.message.from_user.id
+        
+        try:
+            # Проверяем, есть ли активная консультация в контексте пользователя
+            active_cons_id = None
+            if context.user_data:
+                active_cons_id = context.user_data.get("active_cons_id")
+            
+            async with AsyncSessionLocal() as db:
+                consultation = None
+                
+                # Если есть активная консультация в контексте, используем её
+                if active_cons_id:
+                    result = await db.execute(
+                        select(Consultation).where(Consultation.cons_id == active_cons_id)
+                    )
+                    consultation = result.scalar_one_or_none()
+                
+                # Если нет активной консультации в контексте, ищем по client_id
+                if not consultation:
+                    result = await db.execute(
+                        select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
+                    )
+                    telegram_user = result.scalar_one_or_none()
+                    
+                    if not telegram_user or not telegram_user.client_id:
+                        await update.message.reply_text(
+                            "❌ Вы не связаны с клиентом. Пожалуйста, создайте заявку через портал поддержки."
+                        )
+                        return
+                    
+                    # Находим открытую консультацию для этого клиента
+                    result = await db.execute(
+                        select(Consultation)
+                        .where(Consultation.client_id == telegram_user.client_id)
+                        .where(Consultation.status.in_([None, "open", "pending"]))
+                        .order_by(Consultation.create_date.desc())
+                        .limit(1)
+                    )
+                    consultation = result.scalar_one_or_none()
+                    
+                    # Сохраняем найденную консультацию в контексте
+                    if consultation and context.user_data is not None:
+                        context.user_data["active_cons_id"] = consultation.cons_id
+                        context.user_data["active_client_id"] = consultation.client_id
+                
+                if not consultation:
+                    await update.message.reply_text(
+                        "❌ У вас нет активных консультаций. Создайте новую заявку через портал поддержки."
+                    )
+                    return
+                
+                # Проверяем статус консультации
+                if consultation.status in ("closed", "resolved", "cancelled"):
+                    await update.message.reply_text(
+                        "ℹ️ Эта консультация закрыта. Новые сообщения не принимаются.\n\n"
+                        "Вы можете создать новую заявку через портал поддержки."
+                    )
+                    return
+                
+                # Получаем файл из сообщения
+                file = None
+                file_type = None
+                caption = update.message.caption or ""
+                
+                if update.message.photo:
+                    # Фото - берем самое большое
+                    file = update.message.photo[-1].file_id
+                    file_type = "image"
+                elif update.message.document:
+                    file = update.message.document.file_id
+                    file_type = "file"
+                elif update.message.audio:
+                    file = update.message.audio.file_id
+                    file_type = "audio"
+                elif update.message.voice:
+                    file = update.message.voice.file_id
+                    file_type = "audio"
+                elif update.message.video:
+                    file = update.message.video.file_id
+                    file_type = "video"
+                
+                if not file:
+                    await update.message.reply_text(
+                        "❌ Не удалось обработать файл. Пожалуйста, попробуйте отправить его снова."
+                    )
+                    return
+                
+                # Получаем файл от Telegram
+                file_obj = await self.bot.get_file(file)
+                # Получаем полный URL файла от Telegram
+                # file_path уже содержит правильный путь, не нужно добавлять базовый URL дважды
+                if file_obj.file_path.startswith("http"):
+                    file_url = file_obj.file_path
+                else:
+                    file_url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_obj.file_path}"
+                
+                # Отправляем медиафайл в Chatwoot
+                chatwoot_client = ChatwootClient()
+                await chatwoot_client.send_message_with_attachment(
+                    conversation_id=consultation.cons_id,
+                    content=caption or f"📎 Отправлен файл ({file_type})",
+                    attachment_url=file_url,
+                    attachment_type=file_type
+                )
+                
+                # Убрано подтверждение отправки файла
+                
+        except Exception as e:
+            logger.error(f"Error handling media: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Произошла ошибка при отправке файла. Пожалуйста, попробуйте позже."
+            )
     
     async def start_polling(self):
         """Запуск polling (для разработки)"""

@@ -1,10 +1,14 @@
-# Убеждаемся, что crontab всегда в формате LF
-crontab text eol=lf
-
-# Остальные текстовые файлы
+# Устанавливаем LF для всех скриптов и текстовых файлов
 *.sh text eol=lf
 *.py text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.env text eol=lf
 
+# Автоматическая нормализация всех остальных текстовых файлов
+* text=auto

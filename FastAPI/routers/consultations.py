@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta, date, time
 from typing import Optional, List, Dict, Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Header, Body
+from fastapi import APIRouter, Depends, HTTPException, Header, Body, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, cast, Date, case
 from sqlalchemy.dialects.postgresql import insert
@@ -123,11 +123,12 @@ async def _check_consultation_limit(
     consultation_date: datetime,
 ) -> None:
     """
-    Проверяет лимит консультаций типа "Консультация по ведению учета" в бэкенде перед отправкой в ЦЛ.
+    Проверяет лимит консультаций типа "Консультация по ведению учёта" в бэкенде перед отправкой в ЦЛ.
     
-    Лимит: максимум 3 консультации на один день (по дате консультации).
+    Лимит: максимум 3 открытых/завершенных консультации на один день (по дате консультации).
     Проверка выполняется по code_abonent для всех user_id этого абонента.
-    Проверяет только консультации типа "Консультация по ведению учета", которые были успешно созданы в ЦЛ (имеют cl_ref_key).
+    Проверяет только консультации типа "Консультация по ведению учёта", которые были успешно созданы в ЦЛ (имеют cl_ref_key).
+    Отмененные консультации (status="cancelled") НЕ учитываются в лимите.
     
     Логика проверки:
     1. Приоритетно проверяет по коду абонента (code_abonent), если он есть
@@ -136,8 +137,10 @@ async def _check_consultation_limit(
        когда клиент может быть создан без кода абонента, но уже существует в ЦЛ по ИНН
     
     ВАЖНО: 
-    - Проверяет ТОЛЬКО консультации типа "Консультация по ведению учета".
+    - Проверяет ТОЛЬКО консультации типа "Консультация по ведению учёта".
     - Консультации типа "Техническая поддержка" НЕ учитываются в лимите.
+    - Отмененные консультации (status="cancelled") НЕ учитываются в лимите.
+    - Учитываются только открытые/завершенные заявки (status != "cancelled").
     - Проверка выполняется по коду абонента (приоритетно), так как код абонента выдается системой
       и не может быть изменен пользователем, в то время как ИНН может быть изменен во фронтенде.
     - Если код абонента отсутствует, используется проверка по ИНН для случаев создания через
@@ -167,13 +170,16 @@ async def _check_consultation_limit(
         consultation_date_only = consultation_date.date()
     
     # Базовые условия для всех запросов
-    # Проверяем ТОЛЬКО консультации типа "Консультация по ведению учета"
+    # Проверяем ТОЛЬКО консультации типа "Консультация по ведению учёта"
+    # Исключаем отмененные консультации (status != "cancelled")
+    # Учитываем только открытые/завершенные заявки (не отмененные)
     base_conditions = [
         Consultation.start_date.isnot(None),
         cast(Consultation.start_date, Date) == consultation_date_only,
         Consultation.cl_ref_key.isnot(None),
         Consultation.cl_ref_key != "",
-        Consultation.consultation_type == "Консультация по ведению учета"
+        Consultation.consultation_type == "Консультация по ведению учёта",
+        (Consultation.status.is_(None)) | (Consultation.status != "cancelled")
     ]
     
     count = 0
@@ -785,6 +791,7 @@ async def _process_onec_response(
 @router.post("/create", response_model=ConsultationResponse)
 async def create_consultation(
     payload: ConsultationWithClient,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     authorization: Optional[str] = Header(None, description="Bearer токен (опционально)"),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key", description="Уникальный ключ для предотвращения дублирования")
@@ -889,7 +896,7 @@ async def create_consultation(
         if consultation_type == "Техническая поддержка":
             # Проверка: максимум 1 открытая консультация одновременно для одного user_id (client_id)
             await _check_technical_support_limit(db, client.client_id)
-        elif consultation_type == "Консультация по ведению учета":
+        elif consultation_type == "Консультация по ведению учёта":
             # Проверка: максимум 3 консультации в день по code_abonent для всех user_id этого абонента
             if payload.consultation.scheduled_at:
                 await _check_consultation_limit(
@@ -951,10 +958,46 @@ async def create_consultation(
         telegram_user_id = payload.telegram_user_id
         telegram_phone_number = payload.telegram_phone_number
         
-        # Определяем источник создания
-        source = "TELEGRAM" if telegram_user_id else payload.source or "BACKEND"
+        # Автоматически определяем Telegram Web App по User-Agent или другим признакам
+        user_agent = request.headers.get("user-agent", "").lower()
+        referer = request.headers.get("referer", "").lower()
+        origin = request.headers.get("origin", "").lower()
         
-        # Связываем Telegram пользователя с клиентом если передан telegram_user_id
+        # Проверяем все возможные признаки Telegram Web App
+        is_telegram_webapp = (
+            "telegram" in user_agent or 
+            "telegram" in referer or
+            "telegram" in origin or
+            telegram_user_id is not None or
+            payload.source == "TELEGRAM"  # Если фронтенд явно указал source
+        )
+        
+        logger.info(f"Telegram Web App detection: user_agent={user_agent[:50]}, referer={referer[:50]}, origin={origin[:50]}, is_telegram_webapp={is_telegram_webapp}, payload.source={payload.source}")
+        
+        # Если это Telegram Web App, но telegram_user_id не передан, пытаемся найти по номеру телефона
+        if is_telegram_webapp and not telegram_user_id and client.phone_number:
+            try:
+                result = await db.execute(
+                    select(TelegramUser).where(TelegramUser.phone_number == client.phone_number)
+                )
+                telegram_user_by_phone = result.scalar_one_or_none()
+                if telegram_user_by_phone:
+                    telegram_user_id = telegram_user_by_phone.telegram_user_id
+                    telegram_phone_number = telegram_user_by_phone.phone_number or client.phone_number
+                    logger.info(f"Found Telegram user by phone_number: {telegram_user_id} for client {client.client_id}")
+            except Exception as e:
+                logger.warning(f"Failed to find Telegram user by phone_number: {e}", exc_info=True)
+        
+        # Определяем источник создания
+        # Если это Telegram Web App или передан telegram_user_id, устанавливаем source = "TELEGRAM"
+        if is_telegram_webapp or telegram_user_id or payload.source == "TELEGRAM":
+            source = "TELEGRAM"
+        else:
+            source = payload.source or "BACKEND"
+        
+        logger.info(f"Consultation source: {source}, telegram_user_id: {telegram_user_id}, is_telegram_webapp: {is_telegram_webapp}, payload.source: {payload.source}")
+        
+        # Связываем Telegram пользователя с клиентом если передан telegram_user_id или найден по телефону
         if telegram_user_id:
             try:
                 result = await db.execute(
@@ -1491,7 +1534,7 @@ async def create_consultation(
             # Определяем команду (team) в зависимости от consultation_type
             team_id = None
             consultation_type = payload.consultation.consultation_type
-            if consultation_type == "Консультация по ведению учета":
+            if consultation_type == "Консультация по ведению учёта":
                 team_name = "консультация по ведению учета"
                 team_id = await chatwoot_client.find_team_by_name(team_name)
                 if not team_id:
@@ -1680,18 +1723,18 @@ async def create_consultation(
                 
                 # Обновляем custom_attrs с номером из 1C
                 if consultation.number:
-                    custom_attrs["number_con"] = consultation.number
+                    custom_attrs["number_con"] = str(consultation.number)
                     # Обновляем в Chatwoot если conversation уже создан
                     if chatwoot_success and chatwoot_cons_id:
                         try:
-                            # Обновляем custom_attributes в Chatwoot
+                            # Обновляем custom_attributes в Chatwoot с номером консультации
                             await chatwoot_client.update_conversation(
                                 conversation_id=chatwoot_cons_id,
-                                # Можно добавить метод для обновления custom_attributes если нужно
+                                custom_attributes={"number_con": str(consultation.number)}
                             )
-                            logger.debug(f"Updated Chatwoot conversation {chatwoot_cons_id} with 1C number: {consultation.number}")
+                            logger.info(f"Updated Chatwoot conversation {chatwoot_cons_id} with 1C number: {consultation.number}")
                         except Exception as e:
-                            logger.warning(f"Failed to update Chatwoot conversation with 1C data: {e}")
+                            logger.warning(f"Failed to update Chatwoot conversation with 1C number: {e}")
                 
                 onec_success = True
                 logger.info(f"✓ Created 1C consultation: cl_ref_key={consultation.cl_ref_key}, number={consultation.number}, client_key={client_key}")

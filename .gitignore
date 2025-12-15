@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+.env/
+.superset_env/
+.superset/
+
+# Logs
+*.log
+superset_home/.bash_history
+superset_home/.python_history
+
+# VS Code
+.vscode/
+
+# Docker
+*.dockerignore
+Dockerfile*
+docker-compose*.yml
+
+# Local python packages
+superset/.local/
+
+# Temporary files
+*.tmp
+*.swp
+
+# System files
+.DS_Store
+Thumbs.db
