@@ -520,6 +520,98 @@ async def chatwoot_webhook(
             # Можно обновить last_message_at или сохранить в q_and_a
             # В зависимости от бизнес-логики
         
+        elif event_type == "conversation.status_changed" or event_type == "conversation.resolved":
+            # Обработка toggle_status - закрытие/открытие консультации
+            conversation = event_data.get("conversation", {})
+            cons_id = str(conversation.get("id"))
+            new_status = conversation.get("status", "resolved" if event_type == "conversation.resolved" else None)
+            
+            result = await db.execute(
+                select(Consultation).where(Consultation.cons_id == cons_id)
+            )
+            consultation = result.scalar_one_or_none()
+            
+            if consultation:
+                old_status = consultation.status
+                if old_status != new_status:
+                    # Обновляем статус в БД
+                    consultation.status = new_status
+                    
+                    # Если статус изменился на "resolved" или "closed", обновляем end_date
+                    if new_status in ("resolved", "closed") and not consultation.end_date:
+                        consultation.end_date = datetime.now(timezone.utc)
+                    
+                    # Синхронизируем с ЦЛ в фоновой задаче
+                    if consultation.cl_ref_key:
+                        status_mapping = {
+                            "open": "new",
+                            "resolved": "closed",
+                            "pending": "in_progress",
+                        }
+                        onec_status = status_mapping.get(new_status, new_status)
+                        asyncio.create_task(_sync_status_to_1c_background(
+                            cons_id=cons_id,
+                            cl_ref_key=consultation.cl_ref_key,
+                            onec_status=onec_status
+                        ))
+                    
+                    await db.flush()
+                    logger.info(f"Updated consultation {cons_id} status to '{new_status}' from Chatwoot toggle_status")
+        
+        elif event_type == "message.updated" or event_type == "message.rating" or event_type == "conversation.rating":
+            # Обработка оценки консультации из Chatwoot
+            conversation = event_data.get("conversation", {})
+            message = event_data.get("message", {})
+            conversation_id = str(conversation.get("id") or message.get("conversation_id"))
+            rating = conversation.get("rating") or message.get("rating")
+            
+            if rating and conversation_id:
+                result = await db.execute(
+                    select(Consultation).where(Consultation.cons_id == conversation_id)
+                )
+                consultation = result.scalar_one_or_none()
+                
+                if consultation and consultation.cl_ref_key and consultation.manager:
+                    try:
+                        from ..services.onec_client import OneCClient
+                        from ..models import Client
+                        onec_client = OneCClient()
+                        
+                        # Получаем данные оценки из Chatwoot
+                        rating_value = rating.get("value") if isinstance(rating, dict) else rating
+                        rating_feedback = rating.get("feedback") if isinstance(rating, dict) else None
+                        
+                        # Получаем client_key из консультации
+                        client_key = consultation.client_key
+                        if not client_key and consultation.client_id:
+                            # Пытаемся получить client_key из клиента
+                            client_result = await db.execute(
+                                select(Client.cl_ref_key).where(Client.client_id == consultation.client_id).limit(1)
+                            )
+                            client_row = client_result.first()
+                            if client_row:
+                                client_key = client_row[0]
+                        
+                        if client_key and consultation.manager:
+                            # Отправляем оценку в ЦЛ через OData
+                            # ВАЖНО: Chatwoot может отправлять оценку как одно значение или как несколько вопросов
+                            # По умолчанию используем вопрос №1 с оценкой rating_value
+                            await onec_client.create_rating_odata(
+                                cons_key=consultation.cl_ref_key,
+                                client_key=client_key,
+                                manager_key=consultation.manager,
+                                question_number=1,  # По умолчанию первый вопрос
+                                rating=int(rating_value) if rating_value else 5,
+                                question_text="Оценка консультации",
+                                comment=rating_feedback,
+                                period=datetime.now(timezone.utc)
+                            )
+                            logger.info(f"Sent rating to ЦЛ for consultation {conversation_id}: value={rating_value}, feedback={rating_feedback}")
+                        else:
+                            logger.warning(f"Cannot send rating to ЦЛ: missing client_key or manager for consultation {conversation_id}")
+                    except Exception as rating_error:
+                        logger.warning(f"Failed to send rating to ЦЛ for consultation {conversation_id}: {rating_error}", exc_info=True)
+        
         await db.commit()
         webhook_log.processed = True
         await db.commit()

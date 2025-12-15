@@ -42,7 +42,7 @@ class ChatwootClient:
     
     def __init__(self):
         self.base_url = settings.CHATWOOT_API_URL.rstrip("/")
-        # ВАЖНО: Используем только CHATWOOT_API_TOKEN (Platform API token)
+        # ВАЖНО: Используем только CHATWOOT_API_TOKEN (Application API token)
         # НЕ используем bot_token - он не имеет доступа к некоторым endpoint'ам
         self.api_token = settings.CHATWOOT_API_TOKEN
         self.account_id = str(settings.CHATWOOT_ACCOUNT_ID).strip()
@@ -58,7 +58,7 @@ class ChatwootClient:
         # Проверяем, что токен не пустой
         if not self.api_token or len(self.api_token.strip()) == 0:
             raise RuntimeError(
-                "CHATWOOT_API_TOKEN is empty. Please set Platform API token in .env file. "
+                "CHATWOOT_API_TOKEN is empty. Please set Application API token in .env file. "
                 "Bot tokens are not supported - they don't have access to all endpoints."
             )
     
@@ -150,20 +150,20 @@ class ChatwootClient:
         params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Базовый метод для запросов к Chatwoot Platform API.
+        Базовый метод для запросов к Chatwoot Application API.
         
         ВАЖНО: Токен CHATWOOT_API_TOKEN передается в заголовке 'api_access_token'.
-        Это обязательное требование Chatwoot Platform API - токен должен быть именно
+        Это обязательное требование Chatwoot Application API - токен должен быть именно
         в этом заголовке, иначе запросы не будут работать (401 Unauthorized).
         
         НЕ используем:
-        - Authorization header (Bearer token) - это не работает для Platform API
+        - Authorization header (Bearer token) - это не работает для Application API
         - Другие варианты заголовков для токена
         - Bot tokens - они не имеют доступа к некоторым endpoint'ам (например, /contacts)
         """
         url = f"{self.base_url}{endpoint}"
         # ВАЖНО: Токен CHATWOOT_API_TOKEN ОБЯЗАТЕЛЬНО должен быть в заголовке 'api_access_token'
-        # Это требование Chatwoot Platform API - иначе будет 401 Unauthorized
+        # Это требование Chatwoot Application API - иначе будет 401 Unauthorized
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -716,7 +716,7 @@ class ChatwootClient:
         team_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        Создание новой консультации в Chatwoot согласно Platform API.
+        Создание новой консультации в Chatwoot через Application API.
         
         ВАЖНО: 
         - Обязательно передавать объект `contact` с `email` или `phone_number` для правильной идентификации
@@ -841,9 +841,10 @@ class ChatwootClient:
                 logger.warning(f"Invalid priority '{priority}', ignoring. Valid values: {valid_priorities}")
         
         # Assignee и Team - назначаем оператора и команду
-        if assignee_id:
+        # ВАЖНО: assignee_id должен быть передан при создании через Application API
+        if assignee_id is not None:
             payload["assignee_id"] = int(assignee_id)
-        if team_id:
+        if team_id is not None:
             payload["team_id"] = int(team_id)
     
     async def get_teams(self) -> List[Dict[str, Any]]:
@@ -1075,7 +1076,7 @@ class ChatwootClient:
         custom_attributes: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Обновление консультации в Chatwoot.
+        Обновление консультации в Chatwoot через Application API.
         
         Args:
             conversation_id: ID консультации
@@ -1087,46 +1088,45 @@ class ChatwootClient:
         payload = {}
         if status:
             payload["status"] = status
-        if assignee_id:
+        if assignee_id is not None:  # Разрешаем 0 для снятия назначения
             payload["assignee_id"] = assignee_id
-        if team_id:
+        if team_id is not None:
             payload["team_id"] = team_id
         if custom_attributes:
             # Применяем ту же очистку, что и при создании
-            cleaned_custom_attrs = {}
-            for key, value in custom_attributes.items():
-                key_str = str(key)
-                if value is None:
-                    continue
-                if isinstance(value, bool):
-                    cleaned_custom_attrs[key_str] = value
-                elif isinstance(value, (str, int, float)):
-                    if isinstance(value, str):
-                        import re
-                        value = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', value)
-                        value = re.sub(r'\s+', ' ', value).strip()
-                        if len(value) > 500:
-                            value = value[:500]
-                    cleaned_custom_attrs[key_str] = value
-                elif isinstance(value, (list, dict)):
-                    import json
-                    json_str = json.dumps(value, ensure_ascii=False)
-                    if len(json_str) > 500:
-                        json_str = json_str[:500]
-                    cleaned_custom_attrs[key_str] = json_str
-                else:
-                    str_value = str(value)
-                    if len(str_value) > 500:
-                        str_value = str_value[:500]
-                    cleaned_custom_attrs[key_str] = str_value
-            
+            cleaned_custom_attrs = self._clean_custom_attributes(custom_attributes)
             if cleaned_custom_attrs:
                 payload["custom_attributes"] = cleaned_custom_attrs
         
+        if not payload:
+            logger.warning(f"No fields to update for conversation {conversation_id}")
+            return {}
+        
         return await self._request(
-            "PUT",
+            "PATCH",
             f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}",
             data=payload
+        )
+    
+    async def toggle_conversation_status(
+        self,
+        conversation_id: str
+    ) -> Dict[str, Any]:
+        """
+        Переключение статуса консультации (открыть/закрыть) через Application API.
+        
+        Использует POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_status
+        
+        Args:
+            conversation_id: ID консультации
+            
+        Returns:
+            Dict с данными обновленной консультации
+        """
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/toggle_status",
+            data={}
         )
     
     async def get_conversation(self, conversation_id: str) -> Dict[str, Any]:
@@ -1293,12 +1293,25 @@ class ChatwootClient:
         self,
         conversation_id: str,
         content: str,
-        message_type: str = "outgoing"
+        message_type: str = "outgoing",
+        private: bool = False
     ) -> Dict[str, Any]:
-        """Отправка сообщения в консультацию"""
+        """
+        Отправка сообщения в консультацию через Application API.
+        
+        ВАЖНО: Использует Application API с CHATWOOT_API_TOKEN, чтобы сообщения
+        отправлялись от имени системы, а не клиента.
+        
+        Args:
+            conversation_id: ID консультации
+            content: Текст сообщения
+            message_type: Тип сообщения ("incoming" или "outgoing")
+            private: Если True, сообщение видно только агенту (служебное)
+        """
         payload = {
             "content": content,
-            "message_type": message_type
+            "message_type": message_type,
+            "private": private
         }
         return await self._request(
             "POST",
@@ -1387,22 +1400,25 @@ class ChatwootClient:
         self,
         conversation_id: str,
         content: str,
-        private: bool = True
+        private: bool = False
     ) -> Dict[str, Any]:
         """
-        Отправка служебного сообщения (note) в консультацию.
+        Отправка служебного сообщения (note) в консультацию через Application API.
+        
+        ВАЖНО: Использует Application API с CHATWOOT_API_TOKEN, чтобы сообщения
+        отправлялись от имени системы, а не клиента.
         
         Args:
             conversation_id: ID консультации в Chatwoot
             content: Текст сообщения
-            private: Если True, сообщение видно только агенту
+            private: Если True, сообщение видно только агенту (по умолчанию False - видно клиенту)
         
         Returns:
             Dict с данными созданного сообщения
         """
         payload = {
             "content": content,
-            "message_type": "incoming",
+            "message_type": "outgoing",  # Исходящее от системы
             "private": private
         }
         return await self._request(

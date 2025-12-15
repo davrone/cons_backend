@@ -116,6 +116,9 @@ async def send_queue_update_notification(
     """
     Отправить уведомление об изменении очереди клиенту.
     
+    ВАЖНО: Для "Техническая поддержка" уведомления об очереди не отправляются,
+    так как там нет очередей - консультанты сами забирают заявки.
+    
     Args:
         db: Сессия БД
         consultation: Консультация
@@ -123,6 +126,11 @@ async def send_queue_update_notification(
     """
     if not consultation.cons_id or consultation.cons_id.startswith("cl_"):
         logger.debug(f"Skipping queue notification for consultation {consultation.cons_id} (no Chatwoot ID)")
+        return
+    
+    # ВАЖНО: Для "Техническая поддержка" не отправляем уведомления об очереди
+    if consultation.consultation_type == "Техническая поддержка":
+        logger.debug(f"Skipping queue notification for consultation {consultation.cons_id} (Техническая поддержка - no queue)")
         return
     
     manager_key = manager_key or consultation.manager

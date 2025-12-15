@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     CHATWOOT_API_URL: str = ""
     CHATWOOT_API_TOKEN: str = ""
     CHATWOOT_ACCOUNT_ID: str = ""
-    CHATWOOT_INBOX_ID: Optional[int] = None  # ID inbox для создания conversations (Platform API)
+    CHATWOOT_INBOX_ID: Optional[int] = None  # ID inbox для создания conversations (Application API)
     CHATWOOT_INBOX_IDENTIFIER: Optional[str] = None  # Identifier inbox для Public API (используется для создания contacts и conversations)
     
     # 1C:ЦЛ API

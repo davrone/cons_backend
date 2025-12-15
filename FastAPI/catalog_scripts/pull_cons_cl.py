@@ -389,6 +389,45 @@ async def process_consultation_item(
                 except Exception as sync_error:
                     logger.warning(f"Failed to sync consultation status {consultation.cons_id} in Chatwoot: {sync_error}")
         
+        # Синхронизируем номер консультации и другие поля в Chatwoot custom_attributes
+        if consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+            try:
+                chatwoot_client = ChatwootClient()
+                custom_attrs_to_update = {}
+                
+                # Номер консультации
+                if consultation.number:
+                    custom_attrs_to_update["consultation_number"] = consultation.number
+                
+                # Дата консультации
+                if consultation.start_date:
+                    custom_attrs_to_update["date_con"] = consultation.start_date.isoformat()
+                
+                # Дата окончания
+                if consultation.end_date:
+                    custom_attrs_to_update["con_end"] = consultation.end_date.isoformat()
+                
+                # Перенос (дата)
+                if consultation.redate:
+                    custom_attrs_to_update["redate_con"] = consultation.redate.isoformat()
+                
+                # Перенос (время)
+                if consultation.redate_time:
+                    custom_attrs_to_update["retime_con"] = consultation.redate_time.strftime("%H:%M")
+                
+                # Закрыто без консультации
+                custom_attrs_to_update["closed_without_con"] = consultation.denied
+                
+                # Обновляем только если есть изменения
+                if custom_attrs_to_update:
+                    await chatwoot_client.update_conversation(
+                        conversation_id=consultation.cons_id,
+                        custom_attributes=custom_attrs_to_update
+                    )
+                    logger.info(f"Synced consultation fields to Chatwoot for {consultation.cons_id}: {list(custom_attrs_to_update.keys())}")
+            except Exception as sync_error:
+                logger.warning(f"Failed to sync consultation fields to Chatwoot {consultation.cons_id}: {sync_error}")
+        
         if client_key and consultation.client_key != client_key:
             consultation.client_key = client_key
             has_changes = True

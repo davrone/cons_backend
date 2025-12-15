@@ -1314,7 +1314,7 @@ async def create_consultation(
                                         logger.info(f"source_id not found in create response, fetching contact {contact_id} to get source_id")
                                         fetched_contact = await chatwoot_client.get_contact(contact_id)
                                         
-                                        # Извлекаем source_id из ответа GET запроса Platform API
+                                        # Извлекаем source_id из ответа GET запроса Application API
                                         new_contact_source_id = chatwoot_client._extract_source_id(
                                             fetched_contact,
                                             inbox_id=settings.CHATWOOT_INBOX_ID
@@ -1392,7 +1392,7 @@ async def create_consultation(
                                             logger.info(f"source_id not found in find response, fetching contact {contact_id} to get source_id")
                                             fetched_contact = await chatwoot_client.get_contact(contact_id)
                                             
-                                            # Извлекаем source_id из ответа GET запроса Platform API
+                                            # Извлекаем source_id из ответа GET запроса Application API
                                             contact_source_id = chatwoot_client._extract_source_id(
                                                 fetched_contact,
                                                 inbox_id=settings.CHATWOOT_INBOX_ID
@@ -1408,7 +1408,7 @@ async def create_consultation(
                                         client.source_id = contact_source_id
                                         
                                         # ВАЖНО: Для существующего contact нужно получить pubsub_token через GET запрос к Public API
-                                        # pubsub_token не возвращается в Platform API ответе, только в Public API
+                                        # pubsub_token не возвращается в Application API ответе, только в Public API
                                         if not client.chatwoot_pubsub_token:
                                             try:
                                                 logger.info(f"Getting pubsub_token for existing contact via Public API: source_id={contact_source_id}")
@@ -1472,65 +1472,6 @@ async def create_consultation(
                         assignee_id = user.chatwoot_user_id
                         logger.info(f"Found Chatwoot user {assignee_id} for manager {selected_manager_key}")
             
-            # ВАЖНО: Для Public API используем source_id из contact (contact_source_id)
-            # Public API требует source_id контакта для создания conversation
-            if not contact_source_id:
-                raise ValueError("contact_source_id is required for creating conversation via Public API")
-            
-            logger.info(f"=== Creating conversation via Public API ===")
-            logger.info(f"  Contact source_id: {contact_source_id}")
-            logger.info(f"  Inbox identifier: {settings.CHATWOOT_INBOX_IDENTIFIER}")
-            logger.info(f"  Message preview: {(payload.consultation.comment or '')[:100]}")
-            
-            # Создаем conversation через Public API
-            # ВАЖНО: Public API использует source_id контакта, а не UUID conversation
-            chatwoot_response = await chatwoot_client.create_conversation_via_public_api(
-                source_id=contact_source_id,  # source_id из contact (не UUID conversation)
-                message=payload.consultation.comment or "",
-                custom_attributes=conversation_custom_attrs,  # Атрибуты беседы (тикета)
-            )
-            # Извлекаем conversation_id из ответа Public API
-            chatwoot_cons_id = str(chatwoot_response.get("id"))
-            if not chatwoot_cons_id or chatwoot_cons_id == "None":
-                # Пробуем извлечь из payload
-                chatwoot_cons_id = str(chatwoot_response.get("payload", {}).get("id", "")) if isinstance(chatwoot_response.get("payload"), dict) else None
-                if not chatwoot_cons_id or chatwoot_cons_id == "None":
-                    raise ValueError(f"Chatwoot returned invalid conversation ID: {chatwoot_response}")
-            
-            # ВАЖНО: pubsub_token НЕ возвращается в ответе создания conversation
-            # pubsub_token возвращается ТОЛЬКО в ответе POST создания contact через Public API
-            # pubsub_token уже сохранен в БД клиента при создании contact выше
-            # Используем pubsub_token из БД клиента
-            if client.chatwoot_pubsub_token:
-                logger.info(f"✓ Using pubsub_token from client DB (saved during contact creation): {client.chatwoot_pubsub_token[:20]}...")
-            else:
-                logger.warning(f"⚠ pubsub_token not found in client DB - contact may not have been created via Public API or pubsub_token was not in response")
-            
-            # Извлекаем source_id из ответа создания conversation
-            # Обычно это тот же source_id контакта, но проверяем ответ на всякий случай
-            conversation_source_id_from_response = chatwoot_client._extract_source_id(
-                chatwoot_response,
-                inbox_id=settings.CHATWOOT_INBOX_ID
-            )
-            
-            # Используем source_id из ответа, если он есть, иначе используем source_id контакта
-            chatwoot_source_id = conversation_source_id_from_response if conversation_source_id_from_response else contact_source_id
-            
-            if conversation_source_id_from_response and conversation_source_id_from_response != contact_source_id:
-                logger.info(f"✓ Found different source_id in conversation response: {conversation_source_id_from_response} (contact source_id: {contact_source_id})")
-            else:
-                logger.info(f"✓ Using contact source_id for conversation: {chatwoot_source_id}")
-            
-            # Дополнительная проверка: убеждаемся, что conversation действительно создана
-            try:
-                verify_conversation = await chatwoot_client.get_conversation(chatwoot_cons_id)
-                if not verify_conversation:
-                    raise ValueError(f"Chatwoot conversation {chatwoot_cons_id} was not found after creation")
-                logger.debug(f"Verified Chatwoot conversation exists: {chatwoot_cons_id}")
-            except Exception as verify_error:
-                logger.warning(f"Failed to verify Chatwoot conversation: {verify_error}")
-                # Не прерываем выполнение, но логируем предупреждение
-            
             # Определяем команду (team) в зависимости от consultation_type
             team_id = None
             consultation_type = payload.consultation.consultation_type
@@ -1545,35 +1486,132 @@ async def create_consultation(
                 if not team_id:
                     logger.warning(f"Team '{team_name}' not found in Chatwoot, conversation will be created without team")
             
-            # Добавляем labels, assignee и team через Platform API (если нужно)
-            # Public API не поддерживает эти параметры при создании
-            if labels or assignee_id or team_id:
+            # ВАЖНО: Создаем conversation через Application API с assignee_id сразу
+            # Это позволяет назначить менеджера при создании, а не обновлять потом
+            if contact_id and (assignee_id or team_id or labels):
+                # Используем Application API если есть contact_id и нужно назначить assignee/team/labels
+                logger.info(f"=== Creating conversation via Application API with assignee_id ===")
+                logger.info(f"  Contact ID: {contact_id}")
+                logger.info(f"  Assignee ID: {assignee_id}")
+                logger.info(f"  Team ID: {team_id}")
+                logger.info(f"  Message preview: {(payload.consultation.comment or '')[:100]}")
+                
                 try:
-                    update_payload = {}
-                    if labels:
-                        # Добавляем labels через Platform API
-                        await chatwoot_client.add_conversation_labels(
-                            conversation_id=chatwoot_cons_id,
-                            labels=labels
-                        )
-                        logger.info(f"✓ Added labels to conversation {chatwoot_cons_id} via Platform API")
+                    chatwoot_response = await chatwoot_client.create_conversation(
+                        source_id=contact_source_id or str(contact_id),
+                        inbox_id=settings.CHATWOOT_INBOX_ID,
+                        contact_id=contact_id,
+                        message=payload.consultation.comment or "",
+                        assignee_id=assignee_id,
+                        team_id=team_id,
+                        custom_attributes=conversation_custom_attrs,
+                        status="open"
+                    )
                     
-                    # Обновляем conversation с assignee и team одновременно
+                    # Извлекаем conversation_id из ответа Application API
+                    chatwoot_cons_id = str(chatwoot_response.get("id"))
+                    if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                        # Пробуем извлечь из payload
+                        chatwoot_cons_id = str(chatwoot_response.get("payload", {}).get("id", "")) if isinstance(chatwoot_response.get("payload"), dict) else None
+                        if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                            raise ValueError(f"Chatwoot returned invalid conversation ID: {chatwoot_response}")
+                    
+                    # Добавляем labels отдельно (если нужно)
+                    if labels:
+                        try:
+                            await chatwoot_client.add_conversation_labels(
+                                conversation_id=chatwoot_cons_id,
+                                labels=labels
+                            )
+                            logger.info(f"✓ Added labels to conversation {chatwoot_cons_id} via Application API")
+                        except Exception as labels_error:
+                            logger.warning(f"Failed to add labels: {labels_error}")
+                    
+                    # Извлекаем source_id из ответа
+                    conversation_source_id_from_response = chatwoot_client._extract_source_id(
+                        chatwoot_response,
+                        inbox_id=settings.CHATWOOT_INBOX_ID
+                    )
+                    chatwoot_source_id = conversation_source_id_from_response if conversation_source_id_from_response else contact_source_id
+                    
+                    logger.info(f"✓ Created Chatwoot conversation via Application API: {chatwoot_cons_id}, source_id: {chatwoot_source_id}, assignee_id: {assignee_id}")
+                except Exception as app_api_error:
+                    logger.warning(f"Failed to create conversation via Application API: {app_api_error}, falling back to Public API")
+                    # Fallback на Public API
+                    if not contact_source_id:
+                        raise ValueError("contact_source_id is required for creating conversation via Public API")
+                    
+                    chatwoot_response = await chatwoot_client.create_conversation_via_public_api(
+                        source_id=contact_source_id,
+                        message=payload.consultation.comment or "",
+                        custom_attributes=conversation_custom_attrs,
+                    )
+                    chatwoot_cons_id = str(chatwoot_response.get("id"))
+                    if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                        chatwoot_cons_id = str(chatwoot_response.get("payload", {}).get("id", "")) if isinstance(chatwoot_response.get("payload"), dict) else None
+                        if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                            raise ValueError(f"Chatwoot returned invalid conversation ID: {chatwoot_response}")
+                    
+                    chatwoot_source_id = contact_source_id
+                    
+                    # Обновляем assignee и team через Application API после создания
                     if assignee_id or team_id:
-                        update_data = {}
-                        if assignee_id:
-                            update_data["assignee_id"] = assignee_id
-                        if team_id:
-                            update_data["team_id"] = team_id
-                        
-                        await chatwoot_client.update_conversation(
-                            conversation_id=chatwoot_cons_id,
-                            **update_data
-                        )
-                        logger.info(f"✓ Updated conversation {chatwoot_cons_id} via Platform API: {update_data}")
-                except Exception as update_error:
-                    logger.warning(f"Failed to add labels/assignee/team via Platform API: {update_error}")
-                    # Не прерываем выполнение - conversation уже создана
+                        try:
+                            update_data = {}
+                            if assignee_id:
+                                update_data["assignee_id"] = assignee_id
+                            if team_id:
+                                update_data["team_id"] = team_id
+                            await chatwoot_client.update_conversation(
+                                conversation_id=chatwoot_cons_id,
+                                **update_data
+                            )
+                            logger.info(f"✓ Updated conversation {chatwoot_cons_id} with assignee/team via Application API")
+                        except Exception as update_error:
+                            logger.warning(f"Failed to update assignee/team: {update_error}")
+                    
+                    if labels:
+                        try:
+                            await chatwoot_client.add_conversation_labels(
+                                conversation_id=chatwoot_cons_id,
+                                labels=labels
+                            )
+                        except Exception as labels_error:
+                            logger.warning(f"Failed to add labels: {labels_error}")
+            else:
+                # Используем Public API если нет assignee_id/team_id/labels или нет contact_id
+                if not contact_source_id:
+                    raise ValueError("contact_source_id is required for creating conversation via Public API")
+                
+                logger.info(f"=== Creating conversation via Public API ===")
+                logger.info(f"  Contact source_id: {contact_source_id}")
+                logger.info(f"  Inbox identifier: {settings.CHATWOOT_INBOX_IDENTIFIER}")
+                logger.info(f"  Message preview: {(payload.consultation.comment or '')[:100]}")
+                
+                chatwoot_response = await chatwoot_client.create_conversation_via_public_api(
+                    source_id=contact_source_id,
+                    message=payload.consultation.comment or "",
+                    custom_attributes=conversation_custom_attrs,
+                )
+                chatwoot_cons_id = str(chatwoot_response.get("id"))
+                if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                    chatwoot_cons_id = str(chatwoot_response.get("payload", {}).get("id", "")) if isinstance(chatwoot_response.get("payload"), dict) else None
+                    if not chatwoot_cons_id or chatwoot_cons_id == "None":
+                        raise ValueError(f"Chatwoot returned invalid conversation ID: {chatwoot_response}")
+                
+                conversation_source_id_from_response = chatwoot_client._extract_source_id(
+                    chatwoot_response,
+                    inbox_id=settings.CHATWOOT_INBOX_ID
+                )
+                chatwoot_source_id = conversation_source_id_from_response if conversation_source_id_from_response else contact_source_id
+            
+            # ВАЖНО: pubsub_token НЕ возвращается в ответе создания conversation
+            # pubsub_token возвращается ТОЛЬКО в ответе POST создания contact через Public API
+            # pubsub_token уже сохранен в БД клиента при создании contact выше
+            if client.chatwoot_pubsub_token:
+                logger.info(f"✓ Using pubsub_token from client DB (saved during contact creation): {client.chatwoot_pubsub_token[:20]}...")
+            else:
+                logger.warning(f"⚠ pubsub_token not found in client DB - contact may not have been created via Public API or pubsub_token was not in response")
             
             # Сохраняем данные из ответа создания conversation
             consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
@@ -1880,7 +1918,11 @@ async def create_consultation(
                     info_message_parts.append(f"Запланированная дата консультации: {date_str}.")
                 
                 # Добавляем информацию об очереди и времени ожидания
-                if selected_manager_key:
+                # ВАЖНО: Для "Техническая поддержка" не показываем очередь, только сообщение о времени связи
+                consultation_type = consultation.consultation_type or payload.consultation.consultation_type
+                if consultation_type == "Техническая поддержка":
+                    info_message_parts.append("Мы свяжемся с вами в течение 15-20 минут.")
+                elif selected_manager_key:
                     try:
                         wait_info = await manager_selector.calculate_wait_time(selected_manager_key)
                         queue_position = wait_info["queue_position"]
@@ -1896,10 +1938,11 @@ async def create_consultation(
                 
                 info_message = " ".join(info_message_parts)
                 
-                # Отправляем как note (служебное сообщение, видно клиенту)
-                await chatwoot_client.send_note(
+                # Отправляем через Application API как исходящее сообщение от системы
+                await chatwoot_client.send_message(
                     conversation_id=chatwoot_cons_id,
                     content=info_message,
+                    message_type="outgoing",  # Исходящее от системы
                     private=False  # Видно клиенту
                 )
                 logger.info(f"Sent info message to Chatwoot conversation {chatwoot_cons_id}")
@@ -2182,9 +2225,10 @@ async def create_redate(
         if payload.comment:
             note_content += f"\nКомментарий: {payload.comment}"
         
-        await chatwoot_client.send_note(
+        await chatwoot_client.send_message(
             conversation_id=cons_id,
             content=note_content,
+            message_type="outgoing",
             private=False
         )
         logger.info(f"Sent redate note to Chatwoot for consultation {cons_id}")
