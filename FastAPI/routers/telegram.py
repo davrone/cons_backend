@@ -419,9 +419,24 @@ async def chatwoot_webhook_for_telegram(
                 if attachments and len(attachments) > 0:
                     # Если есть вложения, отправляем их отдельно
                     print(f"[TELEGRAM WEBHOOK] Found {len(attachments)} attachments")
+                    logger.info(f"Found {len(attachments)} attachments to send")
+                    
+                    # Отправляем текст сообщения отдельно, если он есть
+                    if content:
+                        formatted_message = f"👤 {sender_name}:\n{content}"
+                        try:
+                            await bot_service.send_message_to_telegram(
+                                telegram_user_id=telegram_user.telegram_user_id,
+                                message_text=formatted_message
+                            )
+                            print(f"[TELEGRAM WEBHOOK] Sent text message before attachments")
+                        except Exception as text_error:
+                            logger.warning(f"Failed to send text message before attachments: {text_error}")
+                    
+                    # Отправляем каждое вложение
                     for idx, attachment in enumerate(attachments):
                         print(f"[TELEGRAM WEBHOOK] Processing attachment {idx+1}/{len(attachments)}: {attachment}")
-                        logger.info(f"Processing attachment {idx+1}: {attachment}")
+                        logger.info(f"Processing attachment {idx+1}/{len(attachments)}: {attachment}")
                         
                         # Пробуем разные варианты ключей для URL
                         attachment_url = (
@@ -434,18 +449,23 @@ async def chatwoot_webhook_for_telegram(
                         attachment_type = attachment.get("file_type") or attachment.get("type", "file")
                         attachment_name = attachment.get("name") or attachment.get("filename") or attachment.get("file_name", "file")
                         
+                        # Если имя файла не указано, пытаемся извлечь из URL
+                        if not attachment_name or attachment_name == "file":
+                            if attachment_url:
+                                import urllib.parse
+                                parsed_url = urllib.parse.urlparse(attachment_url)
+                                path_parts = parsed_url.path.split("/")
+                                if path_parts:
+                                    attachment_name = path_parts[-1] or "file"
+                        
                         print(f"[TELEGRAM WEBHOOK] Processing attachment: name={attachment_name}, type={attachment_type}, url={attachment_url}")
+                        logger.info(f"Attachment details: name={attachment_name}, type={attachment_type}, url={attachment_url[:100] if attachment_url else None}")
                         
                         if attachment_url:
                             logger.info(f"Sending attachment to Telegram: {attachment_name}, type={attachment_type}")
                             
-                            # Формируем caption с именем отправителя и текстом сообщения (если есть)
-                            caption_parts = []
-                            if sender_name:
-                                caption_parts.append(f"👤 {sender_name}")
-                            if content:
-                                caption_parts.append(content)
-                            caption = "\n".join(caption_parts) if caption_parts else None
+                            # Формируем caption только с именем отправителя (текст уже отправлен отдельно)
+                            caption = f"👤 {sender_name}" if sender_name else None
                             
                             try:
                                 # Отправляем медиафайл через Telegram Bot API
@@ -456,18 +476,34 @@ async def chatwoot_webhook_for_telegram(
                                     caption=caption
                                 )
                                 print(f"[TELEGRAM WEBHOOK] Successfully sent attachment {attachment_name} to Telegram user {telegram_user.telegram_user_id}")
+                                logger.info(f"Successfully sent attachment {attachment_name} to Telegram user {telegram_user.telegram_user_id}")
                             except Exception as attach_error:
                                 print(f"[TELEGRAM WEBHOOK] ERROR sending attachment: {attach_error}")
                                 logger.error(f"Error sending attachment to Telegram: {attach_error}", exc_info=True)
+                                import traceback
+                                logger.error(f"Traceback: {traceback.format_exc()}")
                                 # Если не удалось отправить файл, отправляем ссылку на файл
                                 file_message = f"👤 {sender_name} отправил файл: {attachment_name}\n{attachment_url}"
-                                await bot_service.send_message_to_telegram(
-                                    telegram_user_id=telegram_user.telegram_user_id,
-                                    message_text=file_message
-                                )
+                                try:
+                                    await bot_service.send_message_to_telegram(
+                                        telegram_user_id=telegram_user.telegram_user_id,
+                                        message_text=file_message
+                                    )
+                                except Exception as fallback_error:
+                                    logger.error(f"Failed to send fallback file message: {fallback_error}")
                         else:
                             logger.warning(f"Attachment has no URL: {attachment}")
                             print(f"[TELEGRAM WEBHOOK] Attachment has no URL: {attachment}")
+                            # Отправляем уведомление о файле без URL
+                            if attachment_name and attachment_name != "file":
+                                file_message = f"👤 {sender_name} отправил файл: {attachment_name}"
+                                try:
+                                    await bot_service.send_message_to_telegram(
+                                        telegram_user_id=telegram_user.telegram_user_id,
+                                        message_text=file_message
+                                    )
+                                except Exception as fallback_error:
+                                    logger.error(f"Failed to send file notification: {fallback_error}")
                 else:
                     # Обычное текстовое сообщение
                     formatted_message = f"👤 {sender_name}:\n{content}"

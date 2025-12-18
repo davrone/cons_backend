@@ -575,6 +575,7 @@ class TelegramBotService:
             import httpx
             from io import BytesIO
             from urllib.parse import urlparse, urljoin
+            import mimetypes
             
             # Формируем полный URL файла (если это относительный путь)
             if not file_url.startswith("http"):
@@ -585,20 +586,72 @@ class TelegramBotService:
             
             print(f"[TELEGRAM BOT] Downloading file from: {file_url}")
             
-            # Скачиваем файл из Chatwoot
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            # Скачиваем файл из Chatwoot с поддержкой redirect
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                 file_response = await client.get(file_url)
                 file_response.raise_for_status()
                 file_content = file_response.content
-                file_name = file_url.split("/")[-1].split("?")[0] or f"file.{file_type}"  # Убираем query параметры
+                
+                # Определяем имя файла из URL или Content-Disposition заголовка
+                file_name = None
+                content_disposition = file_response.headers.get("Content-Disposition", "")
+                if content_disposition:
+                    # Пытаемся извлечь имя файла из Content-Disposition
+                    import re
+                    filename_match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^\s;]+)', content_disposition)
+                    if filename_match:
+                        file_name = filename_match.group(1).strip('\'"')
+                
+                # Если не нашли в заголовке, берем из URL
+                if not file_name:
+                    file_name = file_url.split("/")[-1].split("?")[0] or "file"
+                    # Убираем query параметры
+                    if "?" in file_name:
+                        file_name = file_name.split("?")[0]
+                
+                # Если имя файла все еще пустое, используем дефолтное
+                if not file_name or file_name == "file":
+                    # Определяем расширение по Content-Type
+                    content_type = file_response.headers.get("Content-Type", "")
+                    if content_type:
+                        ext = mimetypes.guess_extension(content_type.split(";")[0])
+                        if ext:
+                            file_name = f"file{ext}"
+                        else:
+                            file_name = "file"
+                    else:
+                        file_name = "file"
             
             print(f"[TELEGRAM BOT] Downloaded file: {file_name}, size={len(file_content)} bytes")
             
-            # Отправляем файл в зависимости от типа
+            # Определяем тип файла по расширению
+            file_name_lower = file_name.lower()
+            file_ext = None
+            if "." in file_name_lower:
+                file_ext = file_name_lower.split(".")[-1]
+            
+            # Определяем, какой метод использовать для отправки
+            is_image = (
+                file_type == "image" or 
+                file_ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'ico', 'svg')
+            )
+            is_audio = (
+                file_type == "audio" or 
+                file_ext in ('mp3', 'ogg', 'wav', 'm4a', 'aac', 'flac', 'opus', 'wma')
+            )
+            is_video = (
+                file_type == "video" or 
+                file_ext in ('mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'wmv', '3gp', 'mpeg', 'mpg')
+            )
+            
+            # Создаем BytesIO объект с правильным именем файла
             file_obj = BytesIO(file_content)
+            # ВАЖНО: Устанавливаем имя файла через атрибут name для правильной работы с Telegram API
             file_obj.name = file_name
             
-            if file_type == "image" or file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+            print(f"[TELEGRAM BOT] Sending file as: is_image={is_image}, is_audio={is_audio}, is_video={is_video}, file_ext={file_ext}")
+            
+            if is_image:
                 # Отправляем как фото
                 result = await self.bot.send_photo(
                     chat_id=telegram_user_id,
@@ -606,15 +659,16 @@ class TelegramBotService:
                     caption=caption
                 )
                 print(f"[TELEGRAM BOT] Photo sent successfully: message_id={result.message_id if result else 'N/A'}")
-            elif file_type == "audio" or file_name.lower().endswith(('.mp3', '.ogg', '.wav', '.m4a')):
+            elif is_audio:
                 # Отправляем как аудио
                 result = await self.bot.send_audio(
                     chat_id=telegram_user_id,
                     audio=file_obj,
-                    caption=caption
+                    caption=caption,
+                    title=file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
                 )
                 print(f"[TELEGRAM BOT] Audio sent successfully: message_id={result.message_id if result else 'N/A'}")
-            elif file_type == "video" or file_name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            elif is_video:
                 # Отправляем как видео
                 result = await self.bot.send_video(
                     chat_id=telegram_user_id,
@@ -635,6 +689,8 @@ class TelegramBotService:
         except Exception as e:
             print(f"[TELEGRAM BOT] ERROR sending media: {e}")
             logger.error(f"Error sending media to Telegram: {e}", exc_info=True)
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
     
     async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
