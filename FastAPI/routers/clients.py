@@ -213,8 +213,32 @@ async def _sync_client_to_chatwoot(
         existing_contact = await chatwoot_client.find_contact_by_identifier(str(client.client_id))
         
         if existing_contact:
-            # Контакт существует - извлекаем source_id из существующего contact
-            logger.info(f"Contact already exists in Chatwoot for client {client.client_id}")
+            # Контакт существует - обновляем его через PATCH и извлекаем source_id
+            logger.info(f"Contact already exists in Chatwoot for client {client.client_id}, updating via PATCH")
+            
+            # Извлекаем contact_id из существующего contact
+            contact_id = existing_contact.get("id")
+            if not contact_id:
+                # Пробуем извлечь из payload
+                payload_contact = existing_contact.get("payload", {})
+                if isinstance(payload_contact, dict):
+                    contact_id = payload_contact.get("contact", {}).get("id") if isinstance(payload_contact.get("contact"), dict) else None
+            
+            if contact_id:
+                # ВАЖНО: Обновляем контакт через PATCH с актуальными данными
+                try:
+                    logger.info(f"Updating existing Chatwoot contact {contact_id} via PATCH for client {client.client_id}")
+                    updated_contact = await chatwoot_client.update_contact(
+                        contact_id=contact_id,
+                        name=contact_name,
+                        email=contact_email,
+                        phone_number=contact_phone,
+                        custom_attributes=contact_custom_attrs,
+                        additional_attributes=contact_additional_attrs
+                    )
+                    logger.info(f"✓ Updated Chatwoot contact {contact_id} via PATCH for client {client.client_id}")
+                except Exception as update_error:
+                    logger.warning(f"Failed to update contact {contact_id} via PATCH: {update_error}, continuing with source_id extraction")
             
             # Извлекаем source_id из существующего contact
             # source_id может быть в contact_inbox.source_id или в корне ответа
@@ -232,9 +256,26 @@ async def _sync_client_to_chatwoot(
                 if not contact_source_id and len(contact_inboxes) > 0:
                     contact_source_id = contact_inboxes[0].get("source_id")
             
+            # Если source_id не найден в найденном контакте, пробуем получить через GET
+            if not contact_source_id and contact_id:
+                try:
+                    fetched_contact = await chatwoot_client.get_contact(contact_id)
+                    payload_fetched = fetched_contact.get("payload", {})
+                    contact_inboxes = payload_fetched.get("contact_inboxes", [])
+                    if isinstance(contact_inboxes, list) and len(contact_inboxes) > 0:
+                        for ci in contact_inboxes:
+                            inbox_info = ci.get("inbox", {})
+                            if inbox_info.get("id") == settings.CHATWOOT_INBOX_ID:
+                                contact_source_id = ci.get("source_id")
+                                break
+                        if not contact_source_id and len(contact_inboxes) > 0:
+                            contact_source_id = contact_inboxes[0].get("source_id")
+                except Exception as get_error:
+                    logger.warning(f"Failed to get contact {contact_id} to extract source_id: {get_error}")
+            
             if contact_source_id:
                 client.source_id = contact_source_id
-                logger.info(f"✓ Found existing Chatwoot contact source_id: {contact_source_id} for client {client.client_id}")
+                logger.info(f"✓ Found and updated existing Chatwoot contact source_id: {contact_source_id} for client {client.client_id}")
             else:
                 logger.warning(f"Existing contact found but source_id not found in response for client {client.client_id}")
         else:
@@ -330,13 +371,15 @@ async def _sync_client_to_chatwoot(
             except httpx.HTTPStatusError as http_error:
                 # Обработка ошибки 422 - контакт уже существует
                 if http_error.response.status_code == 422:
-                    logger.warning(f"Contact creation returned 422 (already exists), trying to find existing contact for client {client.client_id}")
+                    logger.warning(f"Contact creation returned 422 (already exists), trying to find and update existing contact for client {client.client_id}")
                     
                     # Инициализируем contact_source_id для случая ошибки
                     contact_source_id = None
                     
                     # Пытаемся найти существующий contact
                     found_contact = None
+                    contact_id = None
+                    
                     if str(client.client_id):
                         found_contact = await chatwoot_client.find_contact_by_identifier(str(client.client_id))
                     
@@ -347,6 +390,30 @@ async def _sync_client_to_chatwoot(
                         found_contact = await chatwoot_client.find_contact_by_phone(contact_phone)
                     
                     if found_contact:
+                        # Извлекаем contact_id из найденного contact
+                        contact_id = found_contact.get("id")
+                        if not contact_id:
+                            # Пробуем извлечь из payload
+                            payload_contact = found_contact.get("payload", {})
+                            if isinstance(payload_contact, dict):
+                                contact_id = payload_contact.get("contact", {}).get("id") if isinstance(payload_contact.get("contact"), dict) else None
+                        
+                        if contact_id:
+                            # ВАЖНО: Обновляем контакт через PATCH вместо повторного создания
+                            try:
+                                logger.info(f"Updating existing Chatwoot contact {contact_id} via PATCH for client {client.client_id}")
+                                updated_contact = await chatwoot_client.update_contact(
+                                    contact_id=contact_id,
+                                    name=contact_name,
+                                    email=contact_email,
+                                    phone_number=contact_phone,
+                                    custom_attributes=contact_custom_attrs,
+                                    additional_attributes=contact_additional_attrs
+                                )
+                                logger.info(f"✓ Updated Chatwoot contact {contact_id} via PATCH for client {client.client_id}")
+                            except Exception as update_error:
+                                logger.warning(f"Failed to update contact {contact_id} via PATCH: {update_error}, continuing with source_id extraction")
+                        
                         # Извлекаем source_id из найденного contact
                         contact_inboxes = found_contact.get("contact_inboxes", [])
                         if isinstance(contact_inboxes, list) and len(contact_inboxes) > 0:
@@ -357,9 +424,26 @@ async def _sync_client_to_chatwoot(
                             if not contact_source_id and len(contact_inboxes) > 0:
                                 contact_source_id = contact_inboxes[0].get("source_id")
                         
+                        # Если source_id не найден в найденном контакте, пробуем получить через GET
+                        if not contact_source_id and contact_id:
+                            try:
+                                fetched_contact = await chatwoot_client.get_contact(contact_id)
+                                payload_fetched = fetched_contact.get("payload", {})
+                                contact_inboxes = payload_fetched.get("contact_inboxes", [])
+                                if isinstance(contact_inboxes, list) and len(contact_inboxes) > 0:
+                                    for ci in contact_inboxes:
+                                        inbox_info = ci.get("inbox", {})
+                                        if inbox_info.get("id") == settings.CHATWOOT_INBOX_ID:
+                                            contact_source_id = ci.get("source_id")
+                                            break
+                                    if not contact_source_id and len(contact_inboxes) > 0:
+                                        contact_source_id = contact_inboxes[0].get("source_id")
+                            except Exception as get_error:
+                                logger.warning(f"Failed to get contact {contact_id} to extract source_id: {get_error}")
+                        
                         if contact_source_id:
                             client.source_id = contact_source_id
-                            logger.info(f"✓ Found existing contact source_id: {contact_source_id} for client {client.client_id}")
+                            logger.info(f"✓ Found and updated existing contact source_id: {contact_source_id} for client {client.client_id}")
                         else:
                             logger.warning(f"Found existing contact but source_id not found for client {client.client_id}")
                     else:

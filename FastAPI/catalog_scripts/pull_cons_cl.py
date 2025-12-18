@@ -363,7 +363,19 @@ async def process_consultation_item(
             has_changes = True
         
         old_status = consultation.status
-        if consultation.status != status:
+        # ═══════════════════════════════════════════════════════════════════════
+        # GUARD CLAUSE: Терминальные статусы НЕ МЕНЯЕМ из ЦЛ
+        # ═══════════════════════════════════════════════════════════════════════
+        terminal_statuses = {"closed", "resolved", "cancelled"}
+        
+        # Если консультация уже в терминальном статусе, не меняем его
+        if old_status in terminal_statuses:
+            logger.debug(
+                f"Status update skipped for consultation {ref_key}: "
+                f"current status '{old_status}' is terminal, not updating to '{status}' from ЦЛ"
+            )
+            # Пропускаем обновление статуса, но продолжаем обновлять другие поля
+        elif consultation.status != status:
             consultation.status = status
             has_changes = True
             

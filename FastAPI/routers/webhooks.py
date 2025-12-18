@@ -177,7 +177,21 @@ async def chatwoot_webhook(
                 if "status" in conversation:
                     old_status = consultation.status
                     new_status = conversation["status"]
-                    if old_status != new_status:
+                    
+                    # ═══════════════════════════════════════════════════════════════════════
+                    # GUARD CLAUSE: Терминальные статусы НЕ МЕНЯЕМ из Chatwoot
+                    # ═══════════════════════════════════════════════════════════════════════
+                    terminal_statuses = {"closed", "resolved", "cancelled"}
+                    
+                    # Если консультация уже в терминальном статусе, не меняем его
+                    # Исключение: если в Chatwoot статус "resolved" или "closed" - это может быть корректное закрытие
+                    if old_status in terminal_statuses and new_status not in ("resolved", "closed"):
+                        logger.info(
+                            f"Status update skipped in webhook: consultation {cons_id} has terminal status '{old_status}', "
+                            f"not updating to '{new_status}' from Chatwoot"
+                        )
+                        # Пропускаем обновление статуса
+                    elif old_status != new_status:
                         # ВАЖНО: Запрещаем закрытие беседы клиентом для консультаций по ведению учета
                         # Закрытие должно происходить только через ЦЛ или Chatwoot (менеджером)
                         # Если клиент пытается закрыть беседу, откатываем статус обратно
@@ -435,6 +449,26 @@ async def chatwoot_webhook(
             
             if consultation:
                 old_status = consultation.status
+                
+                # ═══════════════════════════════════════════════════════════════════════
+                # GUARD CLAUSE: Терминальные статусы НЕ МЕНЯЕМ из Chatwoot
+                # ═══════════════════════════════════════════════════════════════════════
+                terminal_statuses = {"closed", "resolved", "cancelled"}
+                
+                # Если консультация уже в терминальном статусе, не меняем его
+                # Исключение: если в Chatwoot статус "resolved" или "closed" - это может быть корректное закрытие
+                if old_status in terminal_statuses and new_status not in ("resolved", "closed"):
+                    logger.info(
+                        f"Status update skipped in webhook (conversation.status_changed): "
+                        f"consultation {cons_id} has terminal status '{old_status}', "
+                        f"not updating to '{new_status}' from Chatwoot"
+                    )
+                    await db.commit()
+                    return WebhookResponse(
+                        status="ok",
+                        message=f"Status update skipped: consultation is in terminal state '{old_status}'"
+                    )
+                
                 if old_status != new_status:
                     # ВАЖНО: Запрещаем закрытие беседы клиентом для консультаций по ведению учета
                     # Закрытие должно происходить только через ЦЛ или Chatwoot (менеджером)

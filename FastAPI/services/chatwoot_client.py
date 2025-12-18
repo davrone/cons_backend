@@ -1842,6 +1842,67 @@ class ChatwootClient:
             logger.debug(f"Failed to search contact by phone {phone_number}: {e}")
         return None
     
+    async def update_contact(
+        self,
+        contact_id: int,
+        name: Optional[str] = None,
+        email: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        custom_attributes: Optional[Dict[str, Any]] = None,
+        additional_attributes: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Обновление контакта в Chatwoot через PATCH.
+        
+        ВАЖНО: Использует PATCH метод для обновления существующего контакта.
+        Это правильный способ обновления контакта при ошибке 422 (email already taken).
+        
+        Args:
+            contact_id: ID контакта в Chatwoot
+            name: Имя контакта
+            email: Email контакта
+            phone_number: Номер телефона
+            custom_attributes: Кастомные атрибуты контакта
+            additional_attributes: Типовые дополнительные атрибуты (city, country, etc.)
+        
+        Returns:
+            Dict с данными обновленного контакта
+        """
+        payload: Dict[str, Any] = {}
+        
+        if name is not None:
+            payload["name"] = name
+        
+        # ВАЖНО: Валидируем email перед отправкой
+        if email is not None:
+            if is_valid_email(email):
+                payload["email"] = email
+            else:
+                logger.warning(f"Invalid email format '{email}', skipping email field for contact update")
+                # Не добавляем email, если он невалидный
+        
+        if phone_number is not None:
+            payload["phone_number"] = phone_number
+        
+        if custom_attributes is not None:
+            # Очистка custom_attributes
+            cleaned_custom_attrs = self._clean_custom_attributes(
+                custom_attributes,
+                required_fields=("code_abonent", "inn_pinfl", "client_type")
+            )
+            if cleaned_custom_attrs:
+                payload["custom_attributes"] = cleaned_custom_attrs
+        
+        if additional_attributes is not None:
+            payload["additional_attributes"] = additional_attributes
+        
+        logger.info(f"Updating Chatwoot contact {contact_id} with PATCH: {list(payload.keys())}")
+        return await self._request(
+            "PATCH",
+            f"/api/v1/accounts/{self.account_id}/contacts/{contact_id}",
+            data=payload
+        )
+    
     async def find_or_create_contact(
         self,
         name: str,

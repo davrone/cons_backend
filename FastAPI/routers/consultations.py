@@ -1471,6 +1471,14 @@ async def create_consultation(
                     if user and user.chatwoot_user_id:
                         assignee_id = user.chatwoot_user_id
                         logger.info(f"Found Chatwoot user {assignee_id} for manager {selected_manager_key}")
+                    else:
+                        # Менеджер не найден в Chatwoot - возможно, не синхронизирован
+                        logger.warning(
+                            f"Manager {selected_manager_key} not found in Chatwoot. "
+                            f"User exists: {user is not None}, has chatwoot_user_id: {user.chatwoot_user_id if user else None}. "
+                            f"Conversation will be created without assignee. "
+                            f"Please run sync_users_to_chatwoot.py to sync this user."
+                        )
             
             # Определяем команду (team) в зависимости от consultation_type
             team_id = None
@@ -2684,6 +2692,19 @@ async def sync_consultation(
             detail=f"Consultation {cons_id} not found"
         )
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # GUARD CLAUSE: Терминальные статусы НЕ МЕНЯЕМ
+    # ═══════════════════════════════════════════════════════════════════════
+    terminal_statuses = {"closed", "resolved", "cancelled"}
+    if consultation.status in terminal_statuses:
+        logger.info(
+            f"Sync skipped: consultation {cons_id} is in terminal state: {consultation.status}. "
+            f"Terminal statuses cannot be changed by sync."
+        )
+        # Возвращаем консультацию как есть, не синхронизируем
+        manager_name = await _get_manager_name(db, consultation.manager)
+        return ConsultationRead.from_model(consultation, manager_name=manager_name)
+    
     chatwoot_client = ChatwootClient()
     onec_client = OneCClient()
     
@@ -2704,10 +2725,32 @@ async def sync_consultation(
                     old_status = consultation.status
                     new_status = conversation.get("status")
                     
-                    # Обновляем статус
+                    # Обновляем статус только если он не терминальный
+                    # ВАЖНО: Не меняем терминальные статусы (closed, resolved, cancelled)
                     if new_status and old_status != new_status:
-                        consultation.status = new_status
-                        sync_changes.append(f"status: {old_status} -> {new_status}")
+                        # Проверяем, что новый статус не является "откатом" терминального статуса
+                        # Например, если в Chatwoot статус "open", а у нас "cancelled" - не меняем
+                        if old_status not in terminal_statuses:
+                            # Маппинг статусов Chatwoot → Clobus
+                            # resolved → resolved (НЕ pending!)
+                            mapped_status = new_status
+                            if new_status == "resolved":
+                                mapped_status = "resolved"
+                            elif new_status == "open":
+                                mapped_status = "open"
+                            elif new_status == "pending":
+                                mapped_status = "pending"
+                            else:
+                                # Для неизвестных статусов оставляем текущий
+                                mapped_status = old_status
+                            
+                            consultation.status = mapped_status
+                            sync_changes.append(f"status: {old_status} -> {mapped_status}")
+                        else:
+                            logger.info(
+                                f"Status update skipped: consultation {cons_id} has terminal status '{old_status}', "
+                                f"not updating to '{new_status}' from Chatwoot"
+                            )
                         
                         # Логируем изменение
                         from ..utils.change_log import log_consultation_change
@@ -2755,7 +2798,15 @@ async def sync_consultation(
                 
                 logger.info(f"Synced consultation {cons_id} from Chatwoot. Changes: {', '.join(sync_changes) if sync_changes else 'none'}")
             except Exception as e:
-                logger.warning(f"Failed to sync from Chatwoot: {e}")
+                # ════════════════════════════════════════════════════════════════════
+                # КРИТИЧЕСКИ ВАЖНО: При ошибке НЕ МЕНЯЕМ статус!
+                # ════════════════════════════════════════════════════════════════════
+                logger.warning(
+                    f"Failed to sync from Chatwoot for consultation {cons_id}: {e}. "
+                    f"Current status '{consultation.status}' preserved (not changed to fallback)."
+                )
+                # НЕ устанавливаем fallback "pending"!
+                # Оставляем текущий статус без изменений
         
         # Синхронизация с 1C:ЦЛ
         if consultation.cl_ref_key:
