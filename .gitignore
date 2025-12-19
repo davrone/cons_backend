@@ -1,33 +1,125 @@
-# Python cache
+# ==================================
+# Environment and Secrets
+# ==================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+
+# ==================================
+# Python
+# ==================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PIPFILE.lock
 
-# Virtual environments
+# ==================================
+# Virtual Environments
+# ==================================
 .venv/
-.env/
-.superset_env/
-.superset/
+venv/
+ENV/
+env/
 
+# ==================================
+# FastAPI and Application Runtime
+# ==================================
+FastAPI/logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# ==================================
 # Logs
+# ==================================
 *.log
-superset_home/.bash_history
-superset_home/.python_history
+logs/
+*.log.*
 
+# ==================================
+# IDE and Editors
+# ==================================
 # VS Code
 .vscode/
+*.code-workspace
 
-# Docker
-*.dockerignore
-Dockerfile*
-docker-compose*.yml
+# PyCharm
+.idea/
+*.iml
 
-# Local python packages
-superset/.local/
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
 
-# Temporary files
-*.tmp
-*.swp
+# Other editors
+.swp
+.swo
+*~
+.project
+.classpath
+.c9/
+*.launch
+.settings/
 
-# System files
+# ==================================
+# OS Files
+# ==================================
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini
 Thumbs.db
+
+# ==================================
+# Database
+# ==================================
+*.sql
+!schema.sql
+
+# ==================================
+# Backups and Temporary Files
+# ==================================
+*.backup
+*.bak
+*.tar.gz
+*.zip
+backups/
+tmp/
+temp/
+*.tmp
+
+# ==================================
+# Cursor IDE
+# ==================================
+.cursor/
+
+# ==================================
+# Poetry and dependency locks
+# ==================================
+poetry.lock
+Pipfile.lock

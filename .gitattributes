@@ -1,14 +1,50 @@
-# Устанавливаем LF для всех скриптов и текстовых файлов
+# ==================================
+# Git Attributes for cons_backend Project
+# ==================================
+
+# Auto detect text files and normalize line endings to LF
+* text=auto eol=lf
+
+# ==================================
+# Scripts (always LF)
+# ==================================
 *.sh text eol=lf
-*.py text eol=lf
-*.md text eol=lf
+*.bash text eol=lf
+
+# ==================================
+# Python files
+# ==================================
+*.py text eol=lf diff=python
+*.pyx text eol=lf diff=python
+*.pyi text eol=lf diff=python
+*.pyw text eol=lf diff=python
+
+# ==================================
+# Configuration files
+# ==================================
 *.yml text eol=lf
 *.yaml text eol=lf
-*.txt text eol=lf
 *.json text eol=lf
+*.toml text eol=lf
 *.cfg text eol=lf
+*.conf text eol=lf
+*.config text eol=lf
 *.ini text eol=lf
 *.env text eol=lf
+.env* text eol=lf
+.editorconfig text eol=lf
 
-# Автоматическая нормализация всех остальных текстовых файлов
-* text=auto
+# ==================================
+# Docker files
+# ==================================
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+.dockerignore text eol=lf
+docker-compose*.yml text eol=lf
+
+# ==================================
+# Documentation
+# ==================================
+*.md text eol=lf diff=markdown
+*.mdx text eol=lf
+*.txt text eol=lf

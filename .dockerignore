@@ -1,0 +1,118 @@
+# cons_backend .dockerignore
+# Exclude unnecessary files from Docker build context
+
+# ==================================
+# Git files
+# ==================================
+.git
+.gitignore
+.gitattributes
+
+# ==================================
+# Environment files (don't include in image)
+# ==================================
+.env
+.env.*
+!.env.example
+
+# ==================================
+# Logs
+# ==================================
+logs/**
+*.log
+
+# ==================================
+# Python cache
+# ==================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ==================================
+# IDE
+# ==================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.sublime-project
+.sublime-workspace
+
+# ==================================
+# OS files
+# ==================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini
+Thumbs.db
+
+# ==================================
+# Virtual Environments
+# ==================================
+.venv/
+venv/
+env/
+ENV/
+
+# ==================================
+# Docker files (not needed in build)
+# ==================================
+docker-compose*.yml
+.dockerignore
+
+# ==================================
+# Documentation
+# ==================================
+README.md
+*.md
+docs/
+
+# ==================================
+# Security - SSH keys
+# ==================================
+ssh-key-*
+*.pem
+*.key
+*.crt
+!*.pub.key
+
+# ==================================
+# Database files
+# ==================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ==================================
+# Backup files
+# ==================================
+*.backup
+*.bak
+*.tar.gz
+*.zip
+backups/
+
+# ==================================
+# Cursor IDE
+# ==================================
+.cursor/
+
+# ==================================
+# Temporary files
+# ==================================
+tmp/
+temp/
+*.tmp
