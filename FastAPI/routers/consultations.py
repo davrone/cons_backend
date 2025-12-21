@@ -1916,7 +1916,7 @@ async def create_consultation(
                             # Загружаем связанные данные
                             manager_name = await _get_manager_name(new_db, existing_loaded.manager)
                             # Получаем pubsub_token из клиента
-                            from ..models.client import Client
+                            from ..models import Client
                             client_loaded = await new_db.get(Client, existing_loaded.client_id)
                             final_pubsub_token = None
                             if client_loaded and client_loaded.chatwoot_pubsub_token:
@@ -1925,8 +1925,7 @@ async def create_consultation(
                                 else:
                                     final_pubsub_token = str(client_loaded.chatwoot_pubsub_token)
                             # Формируем ответ с существующей консультацией
-                            # ConsultationRead уже импортирован в начале файла
-                            from ..schemas.consultations import ConsultationResponse
+                            # ConsultationResponse и ConsultationRead уже импортированы в начале файла
                             from ..config import settings
                             response = ConsultationResponse(
                                 consultation=ConsultationRead.from_model(existing_loaded, manager_name=manager_name),
