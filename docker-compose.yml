@@ -5,6 +5,9 @@ services:
       dockerfile: dockerfile
     container_name: cons_api
     env_file: .env
+    extra_hosts:
+      - "${BACKEND_DOMAIN:-localhost}:host-gateway"
+      - "${SUPPORT_DOMAIN:-localhost}:host-gateway"
     ports:
       - "7070:7070"
     restart: unless-stopped
@@ -20,6 +23,9 @@ services:
       dockerfile: dockerfile
     container_name: cons_scheduler
     env_file: .env
+    extra_hosts:
+      - "${BACKEND_DOMAIN:-localhost}:host-gateway"
+      - "${SUPPORT_DOMAIN:-localhost}:host-gateway"
     restart: unless-stopped
     entrypoint: ["bash", "/app/scheduler_entrypoint.sh"]
     environment:
