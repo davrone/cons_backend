@@ -11,6 +11,7 @@ from sqlalchemy import select, func, cast, Date, case, or_, and_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
+from sqlalchemy.exc import IntegrityError
 
 from ..database import get_db
 from ..dependencies.security import verify_front_secret
@@ -1866,7 +1867,30 @@ async def create_consultation(
                 logger.warning(f"⚠ pubsub_token not found in client DB - contact may not have been created via Public API or pubsub_token was not in response")
             
             # Сохраняем данные из ответа создания conversation
-            consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
+            # ВАЖНО: Проверяем, не существует ли уже консультация с таким cons_id
+            # Это может произойти при повторных запросах или если консультация уже была создана
+            existing_consultation = await db.execute(
+                select(Consultation).where(Consultation.cons_id == chatwoot_cons_id).limit(1)
+            )
+            existing = existing_consultation.scalar_one_or_none()
+            
+            if existing:
+                # Консультация с таким cons_id уже существует
+                logger.warning(
+                    f"Consultation with cons_id={chatwoot_cons_id} already exists. "
+                    f"This might be a duplicate request. Existing consultation: {existing.cons_id}, "
+                    f"client_id: {existing.client_id}, created_at: {existing.created_at}"
+                )
+                # Не обновляем cons_id, чтобы избежать конфликта уникальности
+                # Оставляем временный cons_id и логируем предупреждение
+                logger.warning(
+                    f"Keeping temporary cons_id={consultation.cons_id} to avoid unique constraint violation. "
+                    f"Chatwoot conversation {chatwoot_cons_id} is already linked to another consultation."
+                )
+            else:
+                # Консультации с таким cons_id нет - безопасно обновляем
+                consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
+            
             consultation.chatwoot_source_id = chatwoot_source_id  # source_id из contact (для виджета)
             
             # ВАЖНО: pubsub_token принадлежит контакту и уже сохранен в БД клиента при создании contact
@@ -1877,7 +1901,32 @@ async def create_consultation(
             else:
                 logger.warning(f"⚠ pubsub_token not found in client DB - contact may not have been created via Public API or pubsub_token was not in response")
             
-            await db.flush()  # Сохраняем обновленный cons_id и source_id
+            try:
+                await db.flush()  # Сохраняем обновленный cons_id и source_id
+            except IntegrityError as e:
+                # Если все же возникла ошибка уникальности, откатываем транзакцию
+                await db.rollback()
+                logger.error(
+                    f"IntegrityError when updating cons_id to {chatwoot_cons_id}: {e}. "
+                    f"This might be a race condition or duplicate request. "
+                    f"Consultation will be created with temporary cons_id."
+                )
+                # После rollback consultation.cons_id вернется к исходному значению (temp_...)
+                # Но нужно убедиться, что у нас есть временный ID
+                # Если consultation был создан с temp ID, он останется после rollback
+                # Если нет - генерируем новый
+                if not consultation.cons_id or not consultation.cons_id.startswith("temp_"):
+                    consultation.cons_id = f"temp_{uuid.uuid4()}"
+                    logger.warning(f"Generated new temporary cons_id={consultation.cons_id} after rollback")
+                else:
+                    logger.info(f"Keeping original temporary cons_id={consultation.cons_id} after rollback")
+                
+                logger.warning(
+                    f"Chatwoot conversation {chatwoot_cons_id} might be already linked to another consultation. "
+                    f"Consultation will be saved with temporary cons_id={consultation.cons_id}"
+                )
+                # После rollback сессия автоматически начнет новую транзакцию при следующем flush/commit
+                # consultation остается в сессии, но его изменения откатываются
             chatwoot_success = True
             logger.info(f"✓ Created Chatwoot conversation via Public API: {chatwoot_cons_id}, source_id: {chatwoot_source_id}, contact_id: {contact_id}")
         except Exception as e:
