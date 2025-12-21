@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Header, Body, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, cast, Date, case
+from sqlalchemy import select, func, cast, Date, case, or_, and_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
