@@ -1317,6 +1317,7 @@ async def create_consultation(
         # Отслеживаем успех создания хотя бы в одной системе
         chatwoot_success = False
         onec_success = False
+        is_duplicate_consultation = False  # Флаг для отслеживания дубликата консультации
         
         chatwoot_client = ChatwootClient()
         chatwoot_cons_id = None
@@ -1929,9 +1930,8 @@ async def create_consultation(
                     )
                     # В этом случае chatwoot_cons_id не должен использоваться в ответе
                     # так как он связан с другой консультацией
-        chatwoot_cons_id = None
-        chatwoot_success = False
-        is_duplicate_consultation = False  # Флаг для отслеживания дубликата консультации
+                    chatwoot_cons_id = None
+                    chatwoot_success = False
             else:
                 # Консультации с таким cons_id нет - безопасно обновляем
                 consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
