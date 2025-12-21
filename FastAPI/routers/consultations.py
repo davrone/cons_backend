@@ -1895,8 +1895,12 @@ async def create_consultation(
             
             if existing:
                 # Консультация с таким cons_id уже существует
+                # ВАЖНО: Сохраняем cons_id ДО rollback, так как после rollback existing будет недоступен
+                existing_cons_id = existing.cons_id
+                existing_client_id = str(existing.client_id)
+                
                 # Проверяем, для того же ли клиента
-                if str(existing.client_id) == str(owner_client_id):
+                if existing_client_id == str(owner_client_id):
                     # Это повторный запрос для того же клиента - возвращаем существующую консультацию
                     logger.info(
                         f"Consultation with cons_id={chatwoot_cons_id} already exists for client {owner_client_id}. "
@@ -1907,7 +1911,7 @@ async def create_consultation(
                     # Загружаем существующую консультацию в новой сессии для ответа
                     from ..database import AsyncSessionLocal
                     async with AsyncSessionLocal() as new_db:
-                        existing_loaded = await new_db.get(Consultation, existing.cons_id)
+                        existing_loaded = await new_db.get(Consultation, existing_cons_id)
                         if existing_loaded:
                             # Загружаем связанные данные
                             manager_name = await _get_manager_name(new_db, existing_loaded.manager)
@@ -1921,7 +1925,8 @@ async def create_consultation(
                                 else:
                                     final_pubsub_token = str(client_loaded.chatwoot_pubsub_token)
                             # Формируем ответ с существующей консультацией
-                            from ..schemas.consultations import ConsultationResponse, ConsultationRead
+                            # ConsultationRead уже импортирован в начале файла
+                            from ..schemas.consultations import ConsultationResponse
                             from ..config import settings
                             response = ConsultationResponse(
                                 consultation=ConsultationRead.from_model(existing_loaded, manager_name=manager_name),
@@ -1941,7 +1946,7 @@ async def create_consultation(
                     # Консультация существует, но для другого клиента - это ошибка
                     logger.error(
                         f"Consultation with cons_id={chatwoot_cons_id} already exists for different client. "
-                        f"Existing client_id: {existing.client_id}, requested client_id: {owner_client_id}. "
+                        f"Existing client_id: {existing_client_id}, requested client_id: {owner_client_id}. "
                         f"This indicates a data inconsistency."
                     )
                     await db.rollback()
@@ -2161,9 +2166,9 @@ async def create_consultation(
                 logger.error(f"✗ Failed to create 1C consultation: {e}", exc_info=True)
         else:
             logger.warning("⚠ Skipping 1C consultation creation because client is not synced with 1C yet.")
-            logger.warning(f"  Owner client {owner_client.client_id} has no cl_ref_key (client_key is None or empty)")
+            logger.warning(f"  Owner client {owner_client_id} has no cl_ref_key (client_key is None or empty)")
             logger.warning(f"  This means the client was not created in 1C or cl_ref_key was not saved to DB")
-            logger.warning(f"  Owner client details: org_inn={owner_client.org_inn}, code_abonent={owner_client.code_abonent}, name={owner_client.name}")
+            logger.warning(f"  Owner client details: org_inn={owner_client_org_inn}, code_abonent={owner_client_code_abonent}, name={owner_client_name}")
         
         # ВАЖНО: Консультация всегда сохраняется в БД, даже если внешние сервисы недоступны
         # Это позволяет системе продолжать работать при проблемах с внешними сервисами
