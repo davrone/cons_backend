@@ -17,6 +17,7 @@ import os
 import sys
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
@@ -195,7 +196,37 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
     # Извлекаем данные
     email, phone = extract_contact_info(item.get("КонтактнаяИнформация", []))
     org_inn = item.get("ИНН") or item.get("ИННФизЛица")  # Может быть в разных полях
-    name = item.get("Description") or item.get("Наименование")
+    name_raw = item.get("Description") or item.get("Наименование")
+    
+    # ВАЖНО: Парсим name из 1C - там может быть полное название типа "Clobus OOO TOP AGRO TRADE 10240 (303045154)"
+    # Нужно извлечь название компании и положить его в company_name
+    # Формат: "Clobus <название> <код> (<ИНН>)"
+    company_name = None
+    name = None  # name должно содержать ФИО, а не название компании
+    
+    if name_raw:
+        # Убираем префикс "Clobus" если есть
+        name_clean = re.sub(r'^Clobus\s+', '', name_raw, flags=re.IGNORECASE).strip()
+        
+        # Пытаемся извлечь ИНН в скобках в конце
+        inn_match = re.search(r'\((\d+)\)\s*$', name_clean)
+        if inn_match:
+            inn_from_name = inn_match.group(1)
+            # Убираем ИНН из конца
+            name_clean = re.sub(r'\s*\(\d+\)\s*$', '', name_clean).strip()
+        
+        # Пытаемся извлечь код абонента (число в конце перед ИНН)
+        code_match = re.search(r'\s+(\d+)\s*$', name_clean)
+        if code_match:
+            code_from_name = code_match.group(1)
+            # Убираем код абонента из конца
+            name_clean = re.sub(r'\s+\d+\s*$', '', name_clean).strip()
+        
+        # Оставшаяся часть - это название компании
+        if name_clean:
+            company_name = name_clean
+        # name оставляем пустым, так как ФИО должно приходить отдельно или из contact_name
+    
     # ВАЖНО: Заполняем code_abonent из поля КодАбонентаClobus
     code_abonent = item.get("КодАбонентаClobus")
     # Если КодАбонентаClobus пустой или "0", не заполняем code_abonent
@@ -235,9 +266,13 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
         if org_inn and existing_client.org_inn != org_inn:
             existing_client.org_inn = org_inn
             updated = True
-        if name and existing_client.name != name:
-            existing_client.name = name
+        # ВАЖНО: Обновляем company_name из распарсенного name
+        # Не обновляем name, так как оно должно содержать ФИО, а не название компании
+        if company_name and existing_client.company_name != company_name:
+            existing_client.company_name = company_name
             updated = True
+        # ВАЖНО: Не перезаписываем name если оно было установлено вручную через фронт
+        # name должно содержать ФИО клиента, а не название компании
         if code_abonent and existing_client.code_abonent != code_abonent:
             existing_client.code_abonent = code_abonent
             updated = True
@@ -283,7 +318,9 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
             email=email,
             phone_number=phone,
             org_inn=org_inn,
-            name=name,
+            name=None,  # Не заполняем name из 1C, так как там название компании, а не ФИО
+            contact_name=None,  # ФИО должно приходить отдельно
+            company_name=company_name,  # Название компании из распарсенного name
             code_abonent=code_abonent,
             country=country,
             region=region,

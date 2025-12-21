@@ -25,6 +25,7 @@ from ..models import (
     User,
     UserMapping,
     TelegramUser,
+    QueueClosing,
 )
 from ..schemas.tickets import (
     ConsultationWithClient,
@@ -114,6 +115,228 @@ async def _get_default_manager_key(db: AsyncSession) -> Optional[str]:
     )
     manager = result.scalar_one_or_none()
     return manager
+
+
+async def _adjust_scheduled_at_to_working_hours(
+    db: AsyncSession,
+    scheduled_at: datetime,
+    manager_key: Optional[str] = None,
+    consultation_type: Optional[str] = None,
+) -> datetime:
+    """
+    Корректирует scheduled_at на ближайшее рабочее время.
+    
+    Учитывает:
+    - Рабочие часы менеджеров (start_hour, end_hour)
+    - Закрытые очереди (queue_closing)
+    - Если время вне рабочего времени - переносит на следующее рабочее время
+    
+    Args:
+        db: Сессия БД
+        scheduled_at: Выбранное время
+        manager_key: Ключ менеджера (если уже выбран)
+        consultation_type: Тип консультации (для технической поддержки нужны все менеджеры)
+    
+    Returns:
+        Скорректированное время
+    """
+    from datetime import time as dt_time
+    
+    # Нормализуем время к UTC
+    if scheduled_at.tzinfo is None:
+        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+    else:
+        scheduled_at = scheduled_at.astimezone(timezone.utc)
+    
+    current_time = datetime.now(timezone.utc)
+    
+    # Если выбранное время в прошлом, начинаем с текущего времени
+    if scheduled_at < current_time:
+        scheduled_at = current_time
+    
+    # Получаем список доступных менеджеров для проверки рабочего времени
+    if manager_key:
+        # Если менеджер уже выбран, проверяем только его
+        result = await db.execute(
+            select(User).where(User.cl_ref_key == manager_key)
+        )
+        managers = [result.scalar_one_or_none()] if result.scalar_one_or_none() else []
+    else:
+        # Если менеджер не выбран, получаем доступных менеджеров
+        # ВАЖНО: Для технической поддержки нужны все активные менеджеры (без фильтрации по consultation_enabled и con_limit)
+        # Для консультаций по ведению учета - только менеджеры с лимитами
+        if consultation_type == "Техническая поддержка":
+            # Для технической поддержки получаем всех активных менеджеров
+            current_time_only = scheduled_at.time()
+            query = select(User).where(
+                User.deletion_mark == False,
+                User.invalid == False,
+            ).where(
+                or_(
+                    # Менеджер работает всегда (start_hour и end_hour не установлены)
+                    and_(
+                        User.start_hour.is_(None),
+                        User.end_hour.is_(None)
+                    ),
+                    # Или текущее время в пределах рабочего времени
+                    and_(
+                        User.start_hour.isnot(None),
+                        User.end_hour.isnot(None),
+                        User.start_hour <= current_time_only,
+                        User.end_hour >= current_time_only,
+                    ),
+                    # Или рабочее время переходит через полночь (start_hour > end_hour)
+                    and_(
+                        User.start_hour.isnot(None),
+                        User.end_hour.isnot(None),
+                        User.start_hour > User.end_hour,
+                        or_(
+                            current_time_only >= User.start_hour,
+                            current_time_only <= User.end_hour,
+                        )
+                    )
+                )
+            )
+            result = await db.execute(query)
+            managers = result.scalars().all()
+            
+            # Фильтруем менеджеров с закрытой очередью
+            current_date = scheduled_at.date()
+            available_managers = []
+            for manager in managers:
+                if not manager.cl_ref_key:
+                    continue
+                
+                # Проверяем закрытие очереди
+                queue_closing_result = await db.execute(
+                    select(QueueClosing).where(
+                        QueueClosing.manager_key == manager.cl_ref_key,
+                        func.date_trunc('day', QueueClosing.period) == func.date_trunc('day', scheduled_at)
+                    ).limit(1)
+                )
+                if queue_closing_result.scalar_one_or_none():
+                    continue  # Очередь закрыта
+                
+                available_managers.append(manager)
+            
+            managers = available_managers
+        else:
+            # Для консультаций по ведению учета используем ManagerSelector (только менеджеры с лимитами)
+            manager_selector = ManagerSelector(db)
+            managers = await manager_selector.get_available_managers(
+                current_time=scheduled_at
+            )
+    
+    if not managers:
+        # Если нет доступных менеджеров, переносим на следующее утро 9:00
+        next_day = scheduled_at.date() + timedelta(days=1)
+        if scheduled_at.date() == current_time.date():
+            # Если сегодня, проверяем текущее время
+            if current_time.time() >= dt_time(9, 0):
+                # Уже после 9:00 - переносим на завтра
+                next_day = current_time.date() + timedelta(days=1)
+            else:
+                # Еще до 9:00 - можно сегодня в 9:00
+                next_day = current_time.date()
+        
+        adjusted_time = datetime.combine(next_day, dt_time(9, 0)).replace(tzinfo=timezone.utc)
+        logger.info(f"No available managers, adjusting scheduled_at to {adjusted_time}")
+        return adjusted_time
+    
+    # Проверяем рабочее время менеджеров
+    scheduled_date = scheduled_at.date()
+    scheduled_time_only = scheduled_at.time()
+    
+    # Ищем менеджера, который работает в выбранное время
+    working_manager = None
+    for manager in managers:
+        if not manager.cl_ref_key:
+            continue
+        
+        # Проверяем закрытие очереди
+        queue_closing_result = await db.execute(
+            select(QueueClosing).where(
+                QueueClosing.manager_key == manager.cl_ref_key,
+                func.date_trunc('day', QueueClosing.period) == func.date_trunc('day', scheduled_at)
+            ).limit(1)
+        )
+        if queue_closing_result.scalar_one_or_none():
+            continue  # Очередь закрыта
+        
+        # Проверяем рабочее время
+        if manager.start_hour is None or manager.end_hour is None:
+            # Менеджер работает всегда
+            working_manager = manager
+            break
+        
+        start_hour = manager.start_hour
+        end_hour = manager.end_hour
+        
+        # Проверяем, попадает ли время в рабочие часы
+        if start_hour <= end_hour:
+            # Обычное рабочее время (например, 9:00-18:00)
+            if start_hour <= scheduled_time_only <= end_hour:
+                working_manager = manager
+                break
+        else:
+            # Рабочее время переходит через полночь (например, 22:00-06:00)
+            if scheduled_time_only >= start_hour or scheduled_time_only <= end_hour:
+                working_manager = manager
+                break
+    
+    if working_manager:
+        # Найден работающий менеджер - время корректно
+        return scheduled_at
+    
+    # Не найден работающий менеджер - ищем ближайшее рабочее время
+    # Начинаем с выбранной даты и ищем первое доступное время
+    search_date = scheduled_date
+    max_days_ahead = 7  # Максимум на неделю вперед
+    
+    for day_offset in range(max_days_ahead):
+        check_date = search_date + timedelta(days=day_offset)
+        check_datetime = datetime.combine(check_date, dt_time(9, 0)).replace(tzinfo=timezone.utc)
+        
+        # Проверяем всех менеджеров на эту дату
+        for manager in managers:
+            if not manager.cl_ref_key:
+                continue
+            
+            # Проверяем закрытие очереди
+            queue_closing_result = await db.execute(
+                select(QueueClosing).where(
+                    QueueClosing.manager_key == manager.cl_ref_key,
+                    func.date_trunc('day', QueueClosing.period) == func.date_trunc('day', check_datetime)
+                ).limit(1)
+            )
+            if queue_closing_result.scalar_one_or_none():
+                continue  # Очередь закрыта
+            
+            # Проверяем рабочее время
+            if manager.start_hour is None or manager.end_hour is None:
+                # Менеджер работает всегда - используем 9:00
+                adjusted_time = check_datetime
+                logger.info(f"Adjusted scheduled_at to {adjusted_time} (manager {manager.cl_ref_key} works always)")
+                return adjusted_time
+            
+            start_hour = manager.start_hour
+            end_hour = manager.end_hour
+            
+            # Используем start_hour как время начала работы
+            adjusted_time = datetime.combine(check_date, start_hour).replace(tzinfo=timezone.utc)
+            
+            # Проверяем, что это время не в прошлом (для первого дня)
+            if day_offset == 0 and adjusted_time < current_time:
+                # Если сегодня уже прошло start_hour, переносим на завтра
+                continue
+            
+            logger.info(f"Adjusted scheduled_at to {adjusted_time} (manager {manager.cl_ref_key} working hours: {start_hour}-{end_hour})")
+            return adjusted_time
+    
+    # Если не нашли за неделю, возвращаем время через неделю в 9:00
+    fallback_time = datetime.combine(search_date + timedelta(days=7), dt_time(9, 0)).replace(tzinfo=timezone.utc)
+    logger.warning(f"Could not find working time within {max_days_ahead} days, using fallback: {fallback_time}")
+    return fallback_time
 
 
 async def _check_consultation_limit(
@@ -896,37 +1119,6 @@ async def create_consultation(
         if consultation_type == "Техническая поддержка":
             # Проверка: максимум 1 открытая консультация одновременно для одного user_id (client_id)
             await _check_technical_support_limit(db, client.client_id)
-        elif consultation_type == "Консультация по ведению учёта":
-            # Проверка: максимум 3 консультации в день по code_abonent для всех user_id этого абонента
-            if payload.consultation.scheduled_at:
-                await _check_consultation_limit(
-                    db,
-                    code_abonent=owner_client.code_abonent,
-                    org_inn=owner_client.org_inn,
-                    consultation_date=payload.consultation.scheduled_at
-                )
-
-        # Проверка ограничения на создание заявок на будущее
-        if payload.consultation.scheduled_at:
-            settings = get_settings()
-            max_future_date = datetime.now(timezone.utc) + timedelta(days=settings.MAX_FUTURE_CONSULTATION_DAYS)
-            
-            # Нормализуем scheduled_at к UTC (если нет timezone, считаем что это UTC)
-            scheduled_at_utc = payload.consultation.scheduled_at
-            if scheduled_at_utc.tzinfo is None:
-                # Если нет timezone, добавляем UTC
-                scheduled_at_utc = scheduled_at_utc.replace(tzinfo=timezone.utc)
-            else:
-                # Если есть timezone, конвертируем в UTC
-                scheduled_at_utc = scheduled_at_utc.astimezone(timezone.utc)
-            
-            if scheduled_at_utc > max_future_date:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Нельзя создавать консультации более чем на {settings.MAX_FUTURE_CONSULTATION_DAYS} дней вперед. "
-                           f"Максимальная дата: {max_future_date.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-
         # 2. Автоматически выбираем менеджера для консультации
         # ВАЖНО: Для "Техническая поддержка" не подбираем менеджера автоматически
         selected_manager_key = None
@@ -965,6 +1157,52 @@ async def create_consultation(
         # ВАЖНО: Для "Техническая поддержка" менеджер не назначается автоматически
         if not selected_manager_key and consultation_type == "Консультация по ведению учёта":
             selected_manager_key = await _get_default_manager_key(db)
+        
+        # ВАЖНО: Корректируем scheduled_at на ближайшее рабочее время после выбора менеджера
+        if payload.consultation.scheduled_at:
+            original_scheduled_at = payload.consultation.scheduled_at
+            payload.consultation.scheduled_at = await _adjust_scheduled_at_to_working_hours(
+                db=db,
+                scheduled_at=payload.consultation.scheduled_at,
+                manager_key=selected_manager_key,  # Используем выбранного менеджера если есть
+                consultation_type=consultation_type  # Передаем тип консультации для правильной фильтрации менеджеров
+            )
+            
+            if payload.consultation.scheduled_at != original_scheduled_at:
+                logger.info(
+                    f"Adjusted scheduled_at from {original_scheduled_at} to {payload.consultation.scheduled_at} "
+                    f"to match working hours"
+                )
+        
+        # Проверка ограничения на создание заявок на будущее
+        if payload.consultation.scheduled_at:
+            settings = get_settings()
+            max_future_date = datetime.now(timezone.utc) + timedelta(days=settings.MAX_FUTURE_CONSULTATION_DAYS)
+            
+            # Нормализуем scheduled_at к UTC (если нет timezone, считаем что это UTC)
+            scheduled_at_utc = payload.consultation.scheduled_at
+            if scheduled_at_utc.tzinfo is None:
+                # Если нет timezone, добавляем UTC
+                scheduled_at_utc = scheduled_at_utc.replace(tzinfo=timezone.utc)
+            else:
+                # Если есть timezone, конвертируем в UTC
+                scheduled_at_utc = scheduled_at_utc.astimezone(timezone.utc)
+            
+            if scheduled_at_utc > max_future_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Нельзя создавать консультации более чем на {settings.MAX_FUTURE_CONSULTATION_DAYS} дней вперед. "
+                           f"Максимальная дата: {max_future_date.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+        
+        # Проверка: максимум 3 консультации в день по code_abonent для всех user_id этого абонента
+        if consultation_type == "Консультация по ведению учёта" and payload.consultation.scheduled_at:
+            await _check_consultation_limit(
+                db,
+                code_abonent=owner_client.code_abonent,
+                org_inn=owner_client.org_inn,
+                consultation_date=payload.consultation.scheduled_at
+            )
 
         # 2. Обрабатываем Telegram пользователя если передан
         telegram_user_id = payload.telegram_user_id
@@ -1055,7 +1293,8 @@ async def create_consultation(
             importance=payload.consultation.importance,
             start_date=payload.consultation.scheduled_at,
             status="open",
-            manager=selected_manager_key,  # Устанавливаем выбранного менеджера
+            # ВАЖНО: Для технической поддержки менеджер не устанавливается - он будет назначен через Chatwoot webhook
+            manager=None if consultation_type == "Техническая поддержка" else selected_manager_key,
             source=source,  # Указываем источник создания (TELEGRAM, SITE, BACKEND)
         )
         db.add(consultation)
@@ -1723,10 +1962,15 @@ async def create_consultation(
                             f"Proceeding with 1C creation (1C will check limit anyway)."
                         )
                 
-                # Используем выбранного менеджера (или дефолтного если не выбран)
-                manager_key = selected_manager_key or await _get_default_manager_key(db)
-                if not manager_key:
-                    logger.warning("No manager found, consultation will be created without manager_key")
+                # ВАЖНО: Для технической поддержки менеджер не назначается - он сам назначит себя в Chatwoot
+                # Для консультаций по ведению учета используем выбранного менеджера (или дефолтного если не выбран)
+                if consultation_type == "Техническая поддержка":
+                    manager_key = None  # Не назначаем менеджера для технической поддержки
+                    logger.info("Техническая поддержка: менеджер не назначается, будет назначен через Chatwoot")
+                else:
+                    manager_key = selected_manager_key or await _get_default_manager_key(db)
+                    if not manager_key:
+                        logger.warning("No manager found, consultation will be created without manager_key")
                 
                 # СпособСвязи - пока используем маппинг из source (TODO: добавить preferred_contact_method в Client)
                 from ..services.onec_client import map_source_to_contact_method

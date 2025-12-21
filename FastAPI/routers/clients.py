@@ -1294,6 +1294,7 @@ async def find_or_create_client(
     return client
 
 
+@router.post("", response_model=ClientRead)
 @router.post("/", response_model=ClientRead)
 async def create_or_update_client(
     payload: ClientCreate,
