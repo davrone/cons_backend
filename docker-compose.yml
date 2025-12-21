@@ -6,8 +6,9 @@ services:
     container_name: cons_api
     env_file: .env
     extra_hosts:
-      - "${BACKEND_DOMAIN}:host-gateway"
-      - "${SUPPORT_DOMAIN}:host-gateway"
+      - "${BACKEND_DOMAIN}:10.130.10.17"
+      - "${SUPPORT_DOMAIN}:10.130.10.17"
+      - "${SITE_DOMAIN}:10.130.10.11"
     ports:
       - "7070:7070"
     restart: unless-stopped
@@ -24,8 +25,9 @@ services:
     container_name: cons_scheduler
     env_file: .env
     extra_hosts:
-      - "${BACKEND_DOMAIN}:host-gateway"
-      - "${SUPPORT_DOMAIN}:host-gateway"
+      - "${BACKEND_DOMAIN}:10.130.10.17"
+      - "${SUPPORT_DOMAIN}:10.130.10.17"
+      - "${SITE_DOMAIN}:10.130.10.11"
     restart: unless-stopped
     entrypoint: ["bash", "/app/scheduler_entrypoint.sh"]
     environment:
