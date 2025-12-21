@@ -1895,52 +1895,63 @@ async def create_consultation(
             
             if existing:
                 # Консультация с таким cons_id уже существует
-                # ВАЖНО: Сохраняем cons_id ДО rollback, так как после rollback existing будет недоступен
+                # ВАЖНО: Сохраняем данные ДО rollback, так как после rollback existing будет недоступен
                 existing_cons_id = existing.cons_id
                 existing_client_id = str(existing.client_id)
+                existing_status = existing.status
                 
-                # Проверяем, для того же ли клиента
+                # Проверяем, для того же ли клиента И не закрыта ли консультация
                 if existing_client_id == str(owner_client_id):
-                    # Это повторный запрос для того же клиента - возвращаем существующую консультацию
-                    logger.info(
-                        f"Consultation with cons_id={chatwoot_cons_id} already exists for client {owner_client_id}. "
-                        f"This is a duplicate request (idempotency). Returning existing consultation."
-                    )
-                    # Откатываем текущую транзакцию (мы не создавали новую консультацию)
-                    await db.rollback()
-                    # Загружаем существующую консультацию в новой сессии для ответа
-                    from ..database import AsyncSessionLocal
-                    async with AsyncSessionLocal() as new_db:
-                        existing_loaded = await new_db.get(Consultation, existing_cons_id)
-                        if existing_loaded:
-                            # Загружаем связанные данные
-                            manager_name = await _get_manager_name(new_db, existing_loaded.manager)
-                            # Получаем pubsub_token из клиента
-                            from ..models import Client
-                            client_loaded = await new_db.get(Client, existing_loaded.client_id)
-                            final_pubsub_token = None
-                            if client_loaded and client_loaded.chatwoot_pubsub_token:
-                                if isinstance(client_loaded.chatwoot_pubsub_token, bytes):
-                                    final_pubsub_token = client_loaded.chatwoot_pubsub_token.decode('utf-8')
-                                else:
-                                    final_pubsub_token = str(client_loaded.chatwoot_pubsub_token)
-                            # Формируем ответ с существующей консультацией
-                            # ConsultationResponse и ConsultationRead уже импортированы в начале файла
-                            from ..config import settings
-                            response = ConsultationResponse(
-                                consultation=ConsultationRead.from_model(existing_loaded, manager_name=manager_name),
-                                client_id=str(existing_loaded.client_id),
-                                message="Consultation already exists (idempotency)",
-                                source=existing_loaded.source or "SITE",
-                                chatwoot_conversation_id=existing_loaded.cons_id,
-                                chatwoot_source_id=existing_loaded.chatwoot_source_id,
-                                chatwoot_account_id=str(settings.CHATWOOT_ACCOUNT_ID) if settings.CHATWOOT_ACCOUNT_ID else None,
-                                chatwoot_inbox_id=settings.CHATWOOT_INBOX_ID,
-                                chatwoot_pubsub_token=final_pubsub_token,
-                            )
-                            return response
-                    # Если не удалось загрузить - продолжаем создание новой (fallback)
-                    logger.warning(f"Failed to load existing consultation {chatwoot_cons_id}, continuing with new creation")
+                    # Проверяем статус - если консультация закрыта, создаем новую
+                    closed_statuses = ["closed", "cancelled", "resolved"]
+                    if existing_status in closed_statuses:
+                        # Старая консультация закрыта - создаем новую
+                        logger.info(
+                            f"Consultation with cons_id={chatwoot_cons_id} exists but is {existing_status}. "
+                            f"Creating new consultation for client {owner_client_id}."
+                        )
+                        # Продолжаем создание новой консультации (не возвращаем старую)
+                    else:
+                        # Консультация активна - это повторный запрос, возвращаем существующую
+                        logger.info(
+                            f"Consultation with cons_id={chatwoot_cons_id} already exists and is active for client {owner_client_id}. "
+                            f"This is a duplicate request (idempotency). Returning existing consultation."
+                        )
+                        # Откатываем текущую транзакцию (мы не создавали новую консультацию)
+                        await db.rollback()
+                        # Загружаем существующую консультацию в новой сессии для ответа
+                        from ..database import AsyncSessionLocal
+                        async with AsyncSessionLocal() as new_db:
+                            existing_loaded = await new_db.get(Consultation, existing_cons_id)
+                            if existing_loaded:
+                                # Загружаем связанные данные
+                                manager_name = await _get_manager_name(new_db, existing_loaded.manager)
+                                # Получаем pubsub_token из клиента
+                                from ..models import Client
+                                client_loaded = await new_db.get(Client, existing_loaded.client_id)
+                                final_pubsub_token = None
+                                if client_loaded and client_loaded.chatwoot_pubsub_token:
+                                    if isinstance(client_loaded.chatwoot_pubsub_token, bytes):
+                                        final_pubsub_token = client_loaded.chatwoot_pubsub_token.decode('utf-8')
+                                    else:
+                                        final_pubsub_token = str(client_loaded.chatwoot_pubsub_token)
+                                # Формируем ответ с существующей консультацией
+                                # ConsultationResponse и ConsultationRead уже импортированы в начале файла
+                                from ..config import settings
+                                response = ConsultationResponse(
+                                    consultation=ConsultationRead.from_model(existing_loaded, manager_name=manager_name),
+                                    client_id=str(existing_loaded.client_id),
+                                    message="Consultation already exists (idempotency)",
+                                    source=existing_loaded.source or "SITE",
+                                    chatwoot_conversation_id=existing_loaded.cons_id,
+                                    chatwoot_source_id=existing_loaded.chatwoot_source_id,
+                                    chatwoot_account_id=str(settings.CHATWOOT_ACCOUNT_ID) if settings.CHATWOOT_ACCOUNT_ID else None,
+                                    chatwoot_inbox_id=settings.CHATWOOT_INBOX_ID,
+                                    chatwoot_pubsub_token=final_pubsub_token,
+                                )
+                                return response
+                        # Если не удалось загрузить - продолжаем создание новой (fallback)
+                        logger.warning(f"Failed to load existing consultation {chatwoot_cons_id}, continuing with new creation")
                 else:
                     # Консультация существует, но для другого клиента - это ошибка
                     logger.error(
