@@ -8,7 +8,7 @@ services:
     extra_hosts:
       - "${BACKEND_DOMAIN}:10.130.10.17"
       - "${SUPPORT_DOMAIN}:10.130.10.17"
-      - "${SITE_DOMAIN}:10.130.10.11"
+      - "${SITE_DOMAIN}:10.130.10.17"
     ports:
       - "7070:7070"
     restart: unless-stopped
@@ -27,7 +27,7 @@ services:
     extra_hosts:
       - "${BACKEND_DOMAIN}:10.130.10.17"
       - "${SUPPORT_DOMAIN}:10.130.10.17"
-      - "${SITE_DOMAIN}:10.130.10.11"
+      - "${SITE_DOMAIN}:10.130.10.17"
     restart: unless-stopped
     entrypoint: ["bash", "/app/scheduler_entrypoint.sh"]
     environment:
