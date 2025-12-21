@@ -1100,15 +1100,22 @@ async def create_consultation(
                 detail=f"Failed to process owner client: {str(e)}"
             )
         
+        # ВАЖНО: Сохраняем значения атрибутов owner_client в переменные ДО возможного rollback
+        # После rollback нельзя обращаться к атрибутам объектов БД, так как сессия будет в невалидном состоянии
         client_key = owner_client.cl_ref_key
+        owner_client_id = str(owner_client.client_id)
+        owner_client_org_inn = owner_client.org_inn
+        owner_client_code_abonent = owner_client.code_abonent
+        owner_client_name = owner_client.name
+        
         if not client_key:
             logger.error(
                 "✗ Owner client %s is not linked with 1C (cl_ref_key missing). "
                 "This means the client was not created in 1C or sync failed. "
                 "Consultation will be created in DB and Chatwoot, but NOT in 1C.",
-                owner_client.client_id,
+                owner_client_id,
             )
-            logger.error(f"Owner client details: org_inn={owner_client.org_inn}, code_abonent={owner_client.code_abonent}, name={owner_client.name}")
+            logger.error(f"Owner client details: org_inn={owner_client_org_inn}, code_abonent={owner_client_code_abonent}, name={owner_client_name}")
             logger.error(f"Please check logs above for errors during client creation in 1C")
 
         contact_hint = _build_contact_hint(client, owner_client, payload.source)
@@ -1198,8 +1205,8 @@ async def create_consultation(
         if consultation_type == "Консультация по ведению учёта" and payload.consultation.scheduled_at:
             await _check_consultation_limit(
                 db,
-                code_abonent=owner_client.code_abonent,
-                org_inn=owner_client.org_inn,
+                code_abonent=owner_client_code_abonent,
+                org_inn=owner_client_org_inn,
                 consultation_date=payload.consultation.scheduled_at
             )
 
@@ -1283,7 +1290,7 @@ async def create_consultation(
             client_id=client.client_id,
             client_key=client_key,
             cl_ref_key=payload.consultation.cl_ref_key,
-            org_inn=owner_client.org_inn,
+            org_inn=owner_client_org_inn,
             lang=payload.consultation.lang or "ru",
             consultation_type=payload.consultation.consultation_type,
             comment=payload.consultation.comment or "",
@@ -1307,7 +1314,7 @@ async def create_consultation(
         # ВАЖНО: это поле должно быть непустым, иначе Chatwoot может вернуть ошибку
         code_abonent_value = custom_attrs.get("code_abonent")
         if not code_abonent_value or code_abonent_value == "":
-            logger.warning(f"code_abonent is empty for client {owner_client.client_id}, using default 'N/A'")
+            logger.warning(f"code_abonent is empty for client {owner_client_id}, using default 'N/A'")
             custom_attrs["code_abonent"] = "N/A"  # Дефолтное значение вместо пустой строки
         
         # Логируем финальные custom_attrs перед отправкой
@@ -1981,10 +1988,10 @@ async def create_consultation(
         logger.info(f"  consultation_type: {consultation_type}")
         logger.info(f"  should_send_to_cl: {should_send_to_cl}")
         logger.info(f"  client_key: {client_key}")
-        logger.info(f"  owner_client.cl_ref_key: {owner_client.cl_ref_key}")
-        logger.info(f"  owner_client.client_id: {owner_client.client_id}")
-        logger.info(f"  owner_client.org_inn: {owner_client.org_inn}")
-        logger.info(f"  owner_client.code_abonent: {owner_client.code_abonent}")
+        logger.info(f"  owner_client.cl_ref_key: {client_key}")
+        logger.info(f"  owner_client.client_id: {owner_client_id}")
+        logger.info(f"  owner_client.org_inn: {owner_client_org_inn}")
+        logger.info(f"  owner_client.code_abonent: {owner_client_code_abonent}")
         
         if client_key and should_send_to_cl:
             try:
@@ -1996,12 +2003,12 @@ async def create_consultation(
                     try:
                         await _check_consultation_limit(
                             db=db,
-                            code_abonent=owner_client.code_abonent,
-                            org_inn=owner_client.org_inn,
+                            code_abonent=owner_client_code_abonent,
+                            org_inn=owner_client_org_inn,
                             consultation_date=payload.consultation.scheduled_at,
                         )
-                        identifier = owner_client.code_abonent or owner_client.org_inn
-                        identifier_type = "code_abonent" if owner_client.code_abonent else "org_inn"
+                        identifier = owner_client_code_abonent or owner_client_org_inn
+                        identifier_type = "code_abonent" if owner_client_code_abonent else "org_inn"
                         logger.info(f"✓ Consultation limit check passed for {identifier_type}: {identifier}")
                     except HTTPException:
                         # Пробрасываем HTTPException как есть (это наш лимит)
