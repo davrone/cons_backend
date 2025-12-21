@@ -201,30 +201,55 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
     # ВАЖНО: Парсим name из 1C - там может быть полное название типа "Clobus OOO TOP AGRO TRADE 10240 (303045154)"
     # Нужно извлечь название компании и положить его в company_name
     # Формат: "Clobus <название> <код> (<ИНН>)"
+    # ВАЖНО: Если company_name уже содержит маску (например, "Clobus ... 10240 (303045154)"),
+    # нужно убрать все части маски рекурсивно, чтобы избежать двойной маски
     company_name = None
     name = None  # name должно содержать ФИО, а не название компании
     
+    def clean_company_name(name_str: str) -> str:
+        """
+        Очищает название компании от маски "Clobus + код + ИНН".
+        Рекурсивно убирает все части маски, чтобы избежать двойной маски.
+        """
+        if not name_str:
+            return ""
+        
+        cleaned = name_str.strip()
+        
+        # Убираем префикс "Clobus" (может быть несколько раз)
+        while True:
+            cleaned_before = cleaned
+            cleaned = re.sub(r'^Clobus\s+', '', cleaned, flags=re.IGNORECASE).strip()
+            if cleaned == cleaned_before:
+                break
+        
+        # Убираем ИНН в скобках в конце (может быть несколько раз)
+        while True:
+            cleaned_before = cleaned
+            cleaned = re.sub(r'\s*\(\d+\)\s*$', '', cleaned).strip()
+            if cleaned == cleaned_before:
+                break
+        
+        # Убираем код абонента (число в конце, может быть несколько раз)
+        # Код абонента - это число, которое стоит отдельно в конце строки
+        while True:
+            cleaned_before = cleaned
+            # Убираем число в конце, если оно стоит отдельно (перед ним пробел)
+            cleaned = re.sub(r'\s+\d+\s*$', '', cleaned).strip()
+            if cleaned == cleaned_before:
+                break
+        
+        return cleaned
+    
     if name_raw:
-        # Убираем префикс "Clobus" если есть
-        name_clean = re.sub(r'^Clobus\s+', '', name_raw, flags=re.IGNORECASE).strip()
+        # Очищаем название от маски
+        company_name = clean_company_name(name_raw)
         
-        # Пытаемся извлечь ИНН в скобках в конце
-        inn_match = re.search(r'\((\d+)\)\s*$', name_clean)
-        if inn_match:
-            inn_from_name = inn_match.group(1)
-            # Убираем ИНН из конца
-            name_clean = re.sub(r'\s*\(\d+\)\s*$', '', name_clean).strip()
+        # Если после очистки ничего не осталось, используем исходное значение
+        # (на случай, если формат не соответствует ожидаемому)
+        if not company_name:
+            company_name = name_raw.strip()
         
-        # Пытаемся извлечь код абонента (число в конце перед ИНН)
-        code_match = re.search(r'\s+(\d+)\s*$', name_clean)
-        if code_match:
-            code_from_name = code_match.group(1)
-            # Убираем код абонента из конца
-            name_clean = re.sub(r'\s+\d+\s*$', '', name_clean).strip()
-        
-        # Оставшаяся часть - это название компании
-        if name_clean:
-            company_name = name_clean
         # name оставляем пустым, так как ФИО должно приходить отдельно или из contact_name
     
     # ВАЖНО: Заполняем code_abonent из поля КодАбонентаClobus
@@ -268,9 +293,16 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
             updated = True
         # ВАЖНО: Обновляем company_name из распарсенного name
         # Не обновляем name, так как оно должно содержать ФИО, а не название компании
-        if company_name and existing_client.company_name != company_name:
-            existing_client.company_name = company_name
-            updated = True
+        # ВАЖНО: Если existing_client.company_name уже содержит маску, очищаем её перед сравнением
+        if company_name:
+            # Очищаем существующее company_name от маски для сравнения
+            existing_company_name_clean = clean_company_name(existing_client.company_name or "")
+            company_name_clean = clean_company_name(company_name)
+            
+            # Обновляем только если очищенные значения отличаются
+            if existing_company_name_clean != company_name_clean:
+                existing_client.company_name = company_name_clean
+                updated = True
         # ВАЖНО: Не перезаписываем name если оно было установлено вручную через фронт
         # name должно содержать ФИО клиента, а не название компании
         if code_abonent and existing_client.code_abonent != code_abonent:
@@ -313,6 +345,7 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
     else:
         # Создаем нового клиента
         # ВАЖНО: Для клиентов из ЦЛ всегда is_parent=true и parent_id=None
+        # ВАЖНО: Используем очищенное название компании (без маски)
         new_client = Client(
             cl_ref_key=ref_key,
             email=email,
@@ -320,7 +353,7 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
             org_inn=org_inn,
             name=None,  # Не заполняем name из 1C, так как там название компании, а не ФИО
             contact_name=None,  # ФИО должно приходить отдельно
-            company_name=company_name,  # Название компании из распарсенного name
+            company_name=company_name,  # Название компании уже очищено от маски функцией clean_company_name
             code_abonent=code_abonent,
             country=country,
             region=region,

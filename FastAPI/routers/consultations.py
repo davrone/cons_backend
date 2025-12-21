@@ -206,8 +206,13 @@ async def _adjust_scheduled_at_to_working_hours(
     # Получаем список доступных менеджеров для проверки рабочего времени
     if manager_key:
         # Если менеджер уже выбран, проверяем только его
+        # ВАЖНО: Проверяем, что менеджер не удален и не недействителен
         result = await db.execute(
-            select(User).where(User.cl_ref_key == manager_key)
+            select(User).where(
+                User.cl_ref_key == manager_key,
+                User.deletion_mark == False,
+                User.invalid == False
+            )
         )
         manager = result.scalar_one_or_none()
         managers = [manager] if manager else []
@@ -1710,7 +1715,11 @@ async def create_consultation(
                 else:
                     # Пробуем найти через users
                     user_result = await db.execute(
-                        select(User).where(User.cl_ref_key == selected_manager_key).limit(1)
+                        select(User).where(
+                            User.cl_ref_key == selected_manager_key,
+                            User.deletion_mark == False,
+                            User.invalid == False
+                        ).limit(1)
                     )
                     user = user_result.scalar_one_or_none()
                     if user and user.chatwoot_user_id:
@@ -1881,17 +1890,58 @@ async def create_consultation(
                     f"This might be a duplicate request. Existing consultation: {existing.cons_id}, "
                     f"client_id: {existing.client_id}, created_at: {existing.created_at}"
                 )
-                # Не обновляем cons_id, чтобы избежать конфликта уникальности
-                # Оставляем временный cons_id и логируем предупреждение
-                logger.warning(
-                    f"Keeping temporary cons_id={consultation.cons_id} to avoid unique constraint violation. "
-                    f"Chatwoot conversation {chatwoot_cons_id} is already linked to another consultation."
-                )
+                
+                # ВАЖНО: Проверяем, связана ли существующая консультация с тем же клиентом
+                # Если да - это дубликат запроса, используем существующую консультацию
+                if existing.client_id == client.client_id:
+                    logger.info(
+                        f"Duplicate request detected: consultation {chatwoot_cons_id} already exists for client {client.client_id}. "
+                        f"Using existing consultation instead of creating new one."
+                    )
+                    # Удаляем новую консультацию и используем существующую
+                    await db.delete(consultation)
+                    await db.flush()
+                    # Используем существующую консультацию
+                    consultation = existing
+                    # Обновляем chatwoot_source_id если нужно
+                    if chatwoot_source_id and not consultation.chatwoot_source_id:
+                        consultation.chatwoot_source_id = chatwoot_source_id
+                        await db.flush()
+                    # Пропускаем обновление cons_id, так как он уже правильный
+                    # chatwoot_cons_id уже равен existing.cons_id, так что используем его
+                    # Также обновляем chatwoot_source_id для ответа, если он был обновлен
+                    if consultation.chatwoot_source_id:
+                        chatwoot_source_id = consultation.chatwoot_source_id
+                    chatwoot_success = True  # Conversation уже существует
+                    is_duplicate_consultation = True  # Помечаем как дубликат
+                else:
+                    # Консультация связана с другим клиентом - это ошибка
+                    logger.error(
+                        f"Chatwoot conversation {chatwoot_cons_id} is already linked to consultation {existing.cons_id} "
+                        f"for different client {existing.client_id}. Current client: {client.client_id}. "
+                        f"This is a data inconsistency issue."
+                    )
+                    # Не обновляем cons_id, чтобы избежать конфликта уникальности
+                    # Оставляем временный cons_id и логируем ошибку
+                    logger.warning(
+                        f"Keeping temporary cons_id={consultation.cons_id} to avoid unique constraint violation. "
+                        f"Chatwoot conversation {chatwoot_cons_id} is already linked to another consultation."
+                    )
+                    # В этом случае chatwoot_cons_id не должен использоваться в ответе
+                    # так как он связан с другой консультацией
+        chatwoot_cons_id = None
+        chatwoot_success = False
+        is_duplicate_consultation = False  # Флаг для отслеживания дубликата консультации
             else:
                 # Консультации с таким cons_id нет - безопасно обновляем
                 consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
             
-            consultation.chatwoot_source_id = chatwoot_source_id  # source_id из contact (для виджета)
+            # Обновляем chatwoot_source_id только если consultation не была заменена на существующую
+            # is_duplicate_consultation устанавливается в True, если мы используем существующую консультацию
+            if not is_duplicate_consultation:
+                if consultation.cons_id != chatwoot_cons_id or not consultation.cons_id.startswith("temp_"):
+                    # Это новая консультация или существующая - обновляем source_id
+                    consultation.chatwoot_source_id = chatwoot_source_id  # source_id из contact (для виджета)
             
             # ВАЖНО: pubsub_token принадлежит контакту и уже сохранен в БД клиента при создании contact
             # pubsub_token НЕ возвращается в ответе создания conversation
@@ -1964,19 +2014,26 @@ async def create_consultation(
         
         # 4. Отправляем в 1C:ЦЛ через OData
         # ВАЖНО: Отправляем в ЦЛ только консультации с типом "Консультация по ведению учёта"
+        # Пропускаем отправку в 1C, если это дубликат консультации (уже существует)
         consultation_type = payload.consultation.consultation_type
         should_send_to_cl = consultation_type == "Консультация по ведению учёта"
         
-        logger.info(f"=== Preparing to send consultation to 1C ===")
-        logger.info(f"  consultation_type: {consultation_type}")
-        logger.info(f"  should_send_to_cl: {should_send_to_cl}")
-        logger.info(f"  client_key: {client_key}")
-        logger.info(f"  owner_client.cl_ref_key: {owner_client.cl_ref_key}")
-        logger.info(f"  owner_client.client_id: {owner_client.client_id}")
-        logger.info(f"  owner_client.org_inn: {owner_client.org_inn}")
-        logger.info(f"  owner_client.code_abonent: {owner_client.code_abonent}")
+        if is_duplicate_consultation:
+            logger.info(
+                f"Skipping 1C creation for duplicate consultation {consultation.cons_id}. "
+                f"Consultation already exists and was created earlier."
+            )
+        else:
+            logger.info(f"=== Preparing to send consultation to 1C ===")
+            logger.info(f"  consultation_type: {consultation_type}")
+            logger.info(f"  should_send_to_cl: {should_send_to_cl}")
+            logger.info(f"  client_key: {client_key}")
+            logger.info(f"  owner_client.cl_ref_key: {owner_client.cl_ref_key}")
+            logger.info(f"  owner_client.client_id: {owner_client.client_id}")
+            logger.info(f"  owner_client.org_inn: {owner_client.org_inn}")
+            logger.info(f"  owner_client.code_abonent: {owner_client.code_abonent}")
         
-        if client_key and should_send_to_cl:
+        if client_key and should_send_to_cl and not is_duplicate_consultation:
             try:
                 # Проверяем лимит консультаций в бэкенде перед отправкой в ЦЛ
                 # ВАЖНО: Приоритетно проверяем по code_abonent (выдается системой и не может быть изменен),

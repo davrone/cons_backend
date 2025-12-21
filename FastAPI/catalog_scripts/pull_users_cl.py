@@ -18,7 +18,7 @@ from datetime import datetime, time as dtime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -263,6 +263,9 @@ async def upsert_users(db: AsyncSession, users: List[Dict[str, Any]]) -> Tuple[i
         if cl_ref_key:
             existing_map[cl_ref_key] = account_id
 
+    # Собираем все cl_ref_key из ЦЛ (которые пришли в запросе)
+    cl_ref_keys_from_cl = {payload["cl_ref_key"] for payload in users if payload.get("cl_ref_key")}
+
     inserted = 0
     updated = 0
     for payload in users:
@@ -309,6 +312,46 @@ async def upsert_users(db: AsyncSession, users: List[Dict[str, Any]]) -> Tuple[i
                 )
             )
             inserted += 1
+
+    # ВАЖНО: Помечаем как удаленных/недействующих всех менеджеров,
+    # которые есть в БД, но не пришли из ЦЛ (были удалены в ЦЛ)
+    if cl_ref_keys_from_cl:
+        # Находим всех менеджеров в БД с cl_ref_key, которых нет в списке из ЦЛ
+        # И которые еще не помечены как удаленные/недействующие
+        deleted_users_query = select(User).where(
+            User.cl_ref_key.isnot(None),
+            User.cl_ref_key.notin_(cl_ref_keys_from_cl),
+            # Помечаем только тех, кто еще не помечен как удаленный/недействующий
+            # (чтобы не перезаписывать уже помеченных)
+            or_(
+                User.deletion_mark == False,
+                User.invalid == False
+            )
+        )
+        deleted_users_result = await db.execute(deleted_users_query)
+        deleted_users = deleted_users_result.scalars().all()
+        
+        if deleted_users:
+            deleted_count = 0
+            for deleted_user in deleted_users:
+                # Помечаем как удаленного и недействующего
+                stmt = (
+                    update(User)
+                    .where(User.account_id == deleted_user.account_id)
+                    .values(
+                        deletion_mark=True,
+                        invalid=True
+                    )
+                )
+                await db.execute(stmt)
+                deleted_count += 1
+                logger.info(
+                    f"Marked user {deleted_user.cl_ref_key} ({deleted_user.description or deleted_user.user_id}) "
+                    f"as deleted/invalid (not found in ЦЛ)"
+                )
+            
+            if deleted_count > 0:
+                logger.info(f"Marked {deleted_count} users as deleted/invalid (not found in ЦЛ)")
 
     return inserted, updated
 
