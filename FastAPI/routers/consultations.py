@@ -1107,6 +1107,8 @@ async def create_consultation(
         owner_client_org_inn = owner_client.org_inn
         owner_client_code_abonent = owner_client.code_abonent
         owner_client_name = owner_client.name
+        owner_client_contact_name = owner_client.contact_name
+        owner_client_company_name = owner_client.company_name
         
         if not client_key:
             logger.error(
@@ -1884,27 +1886,70 @@ async def create_consultation(
             
             # Сохраняем данные из ответа создания conversation
             # ВАЖНО: Проверяем, не существует ли уже консультация с таким cons_id
-            # Если существует - это ошибка (дубликат запроса от фронтенда)
+            # Если существует для того же клиента - возвращаем существующую (идемпотентность)
+            # Если существует для другого клиента - это ошибка
             existing_consultation = await db.execute(
                 select(Consultation).where(Consultation.cons_id == chatwoot_cons_id).limit(1)
             )
             existing = existing_consultation.scalar_one_or_none()
             
             if existing:
-                # Консультация с таким cons_id уже существует - это ошибка
-                # Фронтенд должен правильно обрабатывать кэш и не отправлять дубликаты
-                logger.error(
-                    f"Consultation with cons_id={chatwoot_cons_id} already exists. "
-                    f"Existing consultation: {existing.cons_id}, client_id: {existing.client_id}, "
-                    f"created_at: {existing.created_at}. This is a duplicate request from frontend."
-                )
-                # Откатываем транзакцию и возвращаем ошибку
-                await db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Consultation with cons_id={chatwoot_cons_id} already exists. "
-                           f"This is a duplicate request. Please check frontend cache."
-                )
+                # Консультация с таким cons_id уже существует
+                # Проверяем, для того же ли клиента
+                if str(existing.client_id) == str(owner_client_id):
+                    # Это повторный запрос для того же клиента - возвращаем существующую консультацию
+                    logger.info(
+                        f"Consultation with cons_id={chatwoot_cons_id} already exists for client {owner_client_id}. "
+                        f"This is a duplicate request (idempotency). Returning existing consultation."
+                    )
+                    # Откатываем текущую транзакцию (мы не создавали новую консультацию)
+                    await db.rollback()
+                    # Загружаем существующую консультацию в новой сессии для ответа
+                    from ..database import AsyncSessionLocal
+                    async with AsyncSessionLocal() as new_db:
+                        existing_loaded = await new_db.get(Consultation, existing.cons_id)
+                        if existing_loaded:
+                            # Загружаем связанные данные
+                            manager_name = await _get_manager_name(new_db, existing_loaded.manager)
+                            # Получаем pubsub_token из клиента
+                            from ..models.client import Client
+                            client_loaded = await new_db.get(Client, existing_loaded.client_id)
+                            final_pubsub_token = None
+                            if client_loaded and client_loaded.chatwoot_pubsub_token:
+                                if isinstance(client_loaded.chatwoot_pubsub_token, bytes):
+                                    final_pubsub_token = client_loaded.chatwoot_pubsub_token.decode('utf-8')
+                                else:
+                                    final_pubsub_token = str(client_loaded.chatwoot_pubsub_token)
+                            # Формируем ответ с существующей консультацией
+                            from ..schemas.consultations import ConsultationResponse, ConsultationRead
+                            from ..config import settings
+                            response = ConsultationResponse(
+                                consultation=ConsultationRead.from_model(existing_loaded, manager_name=manager_name),
+                                client_id=str(existing_loaded.client_id),
+                                message="Consultation already exists (idempotency)",
+                                source=existing_loaded.source or "SITE",
+                                chatwoot_conversation_id=existing_loaded.cons_id,
+                                chatwoot_source_id=existing_loaded.chatwoot_source_id,
+                                chatwoot_account_id=str(settings.CHATWOOT_ACCOUNT_ID) if settings.CHATWOOT_ACCOUNT_ID else None,
+                                chatwoot_inbox_id=settings.CHATWOOT_INBOX_ID,
+                                chatwoot_pubsub_token=final_pubsub_token,
+                            )
+                            return response
+                    # Если не удалось загрузить - продолжаем создание новой (fallback)
+                    logger.warning(f"Failed to load existing consultation {chatwoot_cons_id}, continuing with new creation")
+                else:
+                    # Консультация существует, но для другого клиента - это ошибка
+                    logger.error(
+                        f"Consultation with cons_id={chatwoot_cons_id} already exists for different client. "
+                        f"Existing client_id: {existing.client_id}, requested client_id: {owner_client_id}. "
+                        f"This indicates a data inconsistency."
+                    )
+                    await db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Consultation with cons_id={chatwoot_cons_id} already exists for a different client. "
+                               f"This indicates a data inconsistency. Please contact support."
+                    )
             
             # Консультации с таким cons_id нет - безопасно обновляем
             consultation.cons_id = chatwoot_cons_id  # ID conversation из ответа
@@ -1921,31 +1966,23 @@ async def create_consultation(
             try:
                 await db.flush()  # Сохраняем обновленный cons_id и source_id
             except IntegrityError as e:
-                # Если все же возникла ошибка уникальности, откатываем транзакцию
+                # Если все же возникла ошибка уникальности - это дубликат запроса
                 await db.rollback()
                 logger.error(
                     f"IntegrityError when updating cons_id to {chatwoot_cons_id}: {e}. "
-                    f"This might be a race condition or duplicate request. "
-                    f"Consultation will be created with temporary cons_id."
+                    f"This is a duplicate request. Consultation already exists."
                 )
-                # После rollback consultation.cons_id вернется к исходному значению (temp_...)
-                # Но нужно убедиться, что у нас есть временный ID
-                # Если consultation был создан с temp ID, он останется после rollback
-                # Если нет - генерируем новый
-                if not consultation.cons_id or not consultation.cons_id.startswith("temp_"):
-                    consultation.cons_id = f"temp_{uuid.uuid4()}"
-                    logger.warning(f"Generated new temporary cons_id={consultation.cons_id} after rollback")
-                else:
-                    logger.info(f"Keeping original temporary cons_id={consultation.cons_id} after rollback")
-                
-                logger.warning(
-                    f"Chatwoot conversation {chatwoot_cons_id} might be already linked to another consultation. "
-                    f"Consultation will be saved with temporary cons_id={consultation.cons_id}"
+                # Возвращаем ошибку - фронтенд должен правильно обрабатывать кэш
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Consultation with cons_id={chatwoot_cons_id} already exists. "
+                           f"This is a duplicate request. Please check frontend cache."
                 )
-                # После rollback сессия автоматически начнет новую транзакцию при следующем flush/commit
-                # consultation остается в сессии, но его изменения откатываются
             chatwoot_success = True
             logger.info(f"✓ Created Chatwoot conversation via Public API: {chatwoot_cons_id}, source_id: {chatwoot_source_id}, contact_id: {contact_id}")
+        except HTTPException:
+            # Пробрасываем HTTPException как есть (это наша ошибка дубликата)
+            raise
         except Exception as e:
             logger.error(
                 f"✗ Failed to create Chatwoot conversation: {e}",
@@ -1975,8 +2012,13 @@ async def create_consultation(
             # Сохраняем source_id для будущего использования
             # Если conversation создана - это source_id из ответа или contact_source_id
             # Если не создана - это contact_source_id (для будущей попытки создания через Public API)
-            consultation.chatwoot_source_id = chatwoot_source_id
-            await db.flush()
+            # ВАЖНО: Проверяем, что consultation все еще в сессии перед обращением к нему
+            try:
+                consultation.chatwoot_source_id = chatwoot_source_id
+                await db.flush()
+            except Exception as flush_error:
+                # Если consultation не persistent (после rollback), просто логируем
+                logger.warning(f"Failed to update consultation.chatwoot_source_id after Chatwoot error: {flush_error}")
             # Продолжаем - попробуем создать в 1C
         
         # 4. Отправляем в 1C:ЦЛ через OData
@@ -2036,7 +2078,15 @@ async def create_consultation(
                 contact_method = map_source_to_contact_method(payload.source) if payload.source else "ПоТелефону"
                 
                 # Название клиента для АбонентПредставление
-                client_display_name = _build_client_display_name(owner_client)
+                # ВАЖНО: Используем сохраненные значения, а не обращаемся к owner_client напрямую
+                # (после возможного rollback owner_client может быть не доступен)
+                base_name = owner_client_company_name or owner_client_name or owner_client_contact_name or "Клиент"
+                client_display_name_parts = ["Clobus", base_name]
+                if owner_client_code_abonent:
+                    client_display_name_parts.append(owner_client_code_abonent)
+                if owner_client_org_inn:
+                    client_display_name_parts.append(f"({owner_client_org_inn})")
+                client_display_name = " ".join(client_display_name_parts)
                 
                 # Валидация перед отправкой в 1C
                 if not client_key or len(client_key) != 36 or client_key.count("-") != 4:
@@ -2160,15 +2210,25 @@ async def create_consultation(
             await db.flush()
         
         # Убеждаемся, что переменная chatwoot_source_id установлена для ответа
+        # ВАЖНО: Не обращаемся к consultation.chatwoot_source_id напрямую, так как после rollback
+        # consultation может быть не persistent. Используем сохраненную переменную или contact_source_id.
         if chatwoot_source_id is None:
-            chatwoot_source_id = consultation.chatwoot_source_id
-            logger.debug(f"Using chatwoot_source_id from consultation: {chatwoot_source_id}")
+            # Если chatwoot_source_id не был установлен, используем contact_source_id
+            # (который был сохранен ранее в переменной contact_source_id)
+            chatwoot_source_id = contact_source_id if 'contact_source_id' in locals() else None
+            logger.debug(f"Using chatwoot_source_id from contact: {chatwoot_source_id}")
         
         # ВАЖНО: Коммитим транзакцию только если хотя бы одна внешняя система успешна
         # Если обе системы упали, все равно сохраняем в БД для последующей синхронизации
         try:
             await db.commit()
-            await db.refresh(consultation)
+            # ВАЖНО: Проверяем, что consultation все еще в сессии перед refresh
+            # После rollback consultation может быть не persistent
+            try:
+                await db.refresh(consultation)
+            except Exception as refresh_error:
+                # Если consultation не persistent, просто логируем и продолжаем
+                logger.warning(f"Failed to refresh consultation after commit: {refresh_error}. Consultation may not be persistent in session.")
         except Exception as e:
             logger.error(f"Failed to commit consultation to database: {e}", exc_info=True)
             try:
