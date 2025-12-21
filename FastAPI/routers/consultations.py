@@ -928,30 +928,42 @@ async def create_consultation(
                 )
 
         # 2. Автоматически выбираем менеджера для консультации
-        manager_selector = ManagerSelector(db)
+        # ВАЖНО: Для "Техническая поддержка" не подбираем менеджера автоматически
         selected_manager_key = None
         
-        # Получаем раздел программы из консультации (если есть)
-        # Пока используем online_question_cat как category_key для выбора менеджера
-        category_key = normalize_uuid(payload.consultation.online_question_cat)
-        
-        try:
-            selected_manager_key = await manager_selector.select_manager_for_consultation(
-                consultation=None,  # Консультация еще не создана
-                category_key=category_key,
-                current_time=datetime.now(timezone.utc),
-            )
+        if consultation_type == "Консультация по ведению учёта":
+            # Автоподбор менеджера только для консультаций по ведению учета
+            # Используются только менеджеры с лимитами (проверка в ManagerSelector)
+            manager_selector = ManagerSelector(db)
             
-            if selected_manager_key:
-                logger.info(f"Auto-selected manager {selected_manager_key} for consultation")
-            else:
-                logger.warning("No manager selected automatically, will use default or manual assignment")
-        except Exception as e:
-            logger.error(f"Failed to auto-select manager: {e}", exc_info=True)
-            # Продолжаем без автоматического выбора менеджера
+            # Получаем раздел программы из консультации (если есть)
+            # Пока используем online_question_cat как category_key для выбора менеджера
+            category_key = normalize_uuid(payload.consultation.online_question_cat)
+            
+            try:
+                selected_manager_key = await manager_selector.select_manager_for_consultation(
+                    consultation=None,  # Консультация еще не создана
+                    category_key=category_key,
+                    current_time=datetime.now(timezone.utc),
+                )
+                
+                if selected_manager_key:
+                    logger.info(f"Auto-selected manager {selected_manager_key} for consultation (Консультация по ведению учёта)")
+                else:
+                    logger.warning("No manager selected automatically for consultation (Консультация по ведению учёта), will use default or manual assignment")
+            except Exception as e:
+                logger.error(f"Failed to auto-select manager: {e}", exc_info=True)
+                # Продолжаем без автоматического выбора менеджера
+        elif consultation_type == "Техническая поддержка":
+            # Для технической поддержки не подбираем менеджера автоматически
+            logger.info("Skipping auto-assignment for Техническая поддержка (no manager selection needed)")
+        else:
+            # Для других типов консультаций (если появятся) также не подбираем автоматически
+            logger.info(f"Skipping auto-assignment for consultation_type={consultation_type}")
         
         # Если менеджер не выбран автоматически, используем дефолтного
-        if not selected_manager_key:
+        # ВАЖНО: Для "Техническая поддержка" менеджер не назначается автоматически
+        if not selected_manager_key and consultation_type == "Консультация по ведению учёта":
             selected_manager_key = await _get_default_manager_key(db)
 
         # 2. Обрабатываем Telegram пользователя если передан

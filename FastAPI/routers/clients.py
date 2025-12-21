@@ -626,12 +626,13 @@ async def _migrate_code_abonent_on_inn_change(
         return
     
     # Ищем клиента с новым ИНН (исключая текущего)
+    # ВАЖНО: Может быть несколько клиентов с одним ИНН, берем первый (самый старый)
     result = await db.execute(
         select(Client).where(
             Client.org_inn == new_inn,
             Client.is_parent == True,
             Client.client_id != current_client.client_id
-        ).order_by(Client.created_at.asc())
+        ).order_by(Client.created_at.asc()).limit(1)
     )
     existing_client_with_new_inn = result.scalar_one_or_none()
     
@@ -1185,11 +1186,12 @@ async def find_or_create_client(
     
     # 5. По ИНН (только если не найден по code_abonent)
     if parent_uuid is None and normalized_inn:
+        # ВАЖНО: Может быть несколько клиентов с одним ИНН, берем первый (самый старый)
         result = await db.execute(
             select(Client).where(
                 Client.org_inn == normalized_inn,
                 Client.is_parent == True
-            ).order_by(Client.created_at.asc())
+            ).order_by(Client.created_at.asc()).limit(1)
         )
         existing_owner = result.scalar_one_or_none()
         if existing_owner:
