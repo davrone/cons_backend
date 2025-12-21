@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # Время для аннулирования консультации
     CANCEL_CONSULTATION_TIMEOUT_MINUTES: int = Field(default=30, description="Время в минутах с момента создания, в течение которого можно аннулировать консультацию")
     
+    # Рабочее время для технической поддержки (формат: "HH:MM", например "09:00")
+    TECH_SUPPORT_WORKING_HOURS_START: str = Field(default="09:00", description="Время начала рабочего дня для технической поддержки (формат: HH:MM)")
+    TECH_SUPPORT_WORKING_HOURS_END: str = Field(default="18:00", description="Время окончания рабочего дня для технической поддержки (формат: HH:MM)")
+    
     # Автор по умолчанию для создания ТелефонныйЗвонок в ЦЛ
     ONEC_DEFAULT_AUTHOR_NAME: str = Field(default="<не определено>", description="Название менеджера (description) из справочника users для использования как Автор_Key при создании консультаций в ЦЛ")
     

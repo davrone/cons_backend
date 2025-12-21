@@ -152,80 +152,70 @@ async def _adjust_scheduled_at_to_working_hours(
     
     # Если выбранное время в прошлом, начинаем с текущего времени
     if scheduled_at < current_time:
+        logger.info(f"Scheduled time {scheduled_at} is in the past, adjusting to current time {current_time}")
         scheduled_at = current_time
     
+    # ВАЖНО: Для технической поддержки используем рабочее время из env, а не проверяем менеджеров из БД
+    if consultation_type == "Техническая поддержка":
+        # Получаем рабочее время из настроек
+        settings = get_settings()
+        try:
+            # Парсим время начала и конца рабочего дня из env (формат: "HH:MM")
+            start_hour_str = settings.TECH_SUPPORT_WORKING_HOURS_START
+            end_hour_str = settings.TECH_SUPPORT_WORKING_HOURS_END
+            
+            start_hour_parts = start_hour_str.split(":")
+            end_hour_parts = end_hour_str.split(":")
+            
+            work_start_hour = dt_time(int(start_hour_parts[0]), int(start_hour_parts[1]))
+            work_end_hour = dt_time(int(end_hour_parts[0]), int(end_hour_parts[1]))
+            
+            logger.info(f"Technical support working hours: {work_start_hour} - {work_end_hour}")
+        except (ValueError, IndexError, AttributeError) as e:
+            logger.warning(f"Failed to parse working hours from env, using default 9:00-18:00: {e}")
+            work_start_hour = dt_time(9, 0)
+            work_end_hour = dt_time(18, 0)
+        
+        # Проверяем, попадает ли выбранное время в рабочее время
+        scheduled_time_only = scheduled_at.time()
+        scheduled_date = scheduled_at.date()
+        
+        if work_start_hour <= scheduled_time_only <= work_end_hour:
+            # Время в пределах рабочего времени - оставляем как есть
+            logger.info(f"Scheduled time {scheduled_at} is within working hours, no adjustment needed")
+            return scheduled_at
+        
+        # Время вне рабочего времени - ищем ближайшее рабочее время
+        # Если выбранное время до начала рабочего дня - переносим на начало рабочего дня
+        if scheduled_time_only < work_start_hour:
+            # Если сегодня еще не начался рабочий день, переносим на начало рабочего дня сегодня
+            adjusted_time = datetime.combine(scheduled_date, work_start_hour).replace(tzinfo=timezone.utc)
+            if adjusted_time < current_time:
+                # Если начало рабочего дня сегодня уже прошло, переносим на завтра
+                adjusted_time = datetime.combine(scheduled_date + timedelta(days=1), work_start_hour).replace(tzinfo=timezone.utc)
+            logger.info(f"Adjusted scheduled_at from {scheduled_at} to {adjusted_time} (before working hours)")
+            return adjusted_time
+        
+        # Если выбранное время после окончания рабочего дня - переносим на начало рабочего дня следующего дня
+        adjusted_time = datetime.combine(scheduled_date + timedelta(days=1), work_start_hour).replace(tzinfo=timezone.utc)
+        logger.info(f"Adjusted scheduled_at from {scheduled_at} to {adjusted_time} (after working hours)")
+        return adjusted_time
+    
+    # Для консультаций по ведению учета проверяем менеджеров из БД
     # Получаем список доступных менеджеров для проверки рабочего времени
     if manager_key:
         # Если менеджер уже выбран, проверяем только его
         result = await db.execute(
             select(User).where(User.cl_ref_key == manager_key)
         )
-        managers = [result.scalar_one_or_none()] if result.scalar_one_or_none() else []
+        manager = result.scalar_one_or_none()
+        managers = [manager] if manager else []
     else:
-        # Если менеджер не выбран, получаем доступных менеджеров
-        # ВАЖНО: Для технической поддержки нужны все активные менеджеры (без фильтрации по consultation_enabled и con_limit)
-        # Для консультаций по ведению учета - только менеджеры с лимитами
-        if consultation_type == "Техническая поддержка":
-            # Для технической поддержки получаем всех активных менеджеров
-            current_time_only = scheduled_at.time()
-            query = select(User).where(
-                User.deletion_mark == False,
-                User.invalid == False,
-            ).where(
-                or_(
-                    # Менеджер работает всегда (start_hour и end_hour не установлены)
-                    and_(
-                        User.start_hour.is_(None),
-                        User.end_hour.is_(None)
-                    ),
-                    # Или текущее время в пределах рабочего времени
-                    and_(
-                        User.start_hour.isnot(None),
-                        User.end_hour.isnot(None),
-                        User.start_hour <= current_time_only,
-                        User.end_hour >= current_time_only,
-                    ),
-                    # Или рабочее время переходит через полночь (start_hour > end_hour)
-                    and_(
-                        User.start_hour.isnot(None),
-                        User.end_hour.isnot(None),
-                        User.start_hour > User.end_hour,
-                        or_(
-                            current_time_only >= User.start_hour,
-                            current_time_only <= User.end_hour,
-                        )
-                    )
-                )
-            )
-            result = await db.execute(query)
-            managers = result.scalars().all()
-            
-            # Фильтруем менеджеров с закрытой очередью
-            current_date = scheduled_at.date()
-            available_managers = []
-            for manager in managers:
-                if not manager.cl_ref_key:
-                    continue
-                
-                # Проверяем закрытие очереди
-                queue_closing_result = await db.execute(
-                    select(QueueClosing).where(
-                        QueueClosing.manager_key == manager.cl_ref_key,
-                        func.date_trunc('day', QueueClosing.period) == func.date_trunc('day', scheduled_at)
-                    ).limit(1)
-                )
-                if queue_closing_result.scalar_one_or_none():
-                    continue  # Очередь закрыта
-                
-                available_managers.append(manager)
-            
-            managers = available_managers
-        else:
-            # Для консультаций по ведению учета используем ManagerSelector (только менеджеры с лимитами)
-            manager_selector = ManagerSelector(db)
-            managers = await manager_selector.get_available_managers(
-                current_time=scheduled_at
-            )
+        # Для консультаций по ведению учета используем ManagerSelector (только менеджеры с лимитами)
+        manager_selector = ManagerSelector(db)
+        managers = await manager_selector.get_available_managers(
+            current_time=scheduled_at
+        )
     
     if not managers:
         # Если нет доступных менеджеров, переносим на следующее утро 9:00
@@ -286,7 +276,10 @@ async def _adjust_scheduled_at_to_working_hours(
     
     if working_manager:
         # Найден работающий менеджер - время корректно
+        logger.info(f"Found working manager {working_manager.cl_ref_key} for scheduled time {scheduled_at}")
         return scheduled_at
+    else:
+        logger.info(f"No working manager found for scheduled time {scheduled_at}, searching for nearest working time")
     
     # Не найден работающий менеджер - ищем ближайшее рабочее время
     # Начинаем с выбранной даты и ищем первое доступное время
