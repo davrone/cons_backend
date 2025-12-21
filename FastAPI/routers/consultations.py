@@ -218,9 +218,11 @@ async def _adjust_scheduled_at_to_working_hours(
         managers = [manager] if manager else []
     else:
         # Для консультаций по ведению учета используем ManagerSelector (только менеджеры с лимитами)
+        # ВАЖНО: Передаем consultation_type для правильной фильтрации менеджеров
         manager_selector = ManagerSelector(db)
         managers = await manager_selector.get_available_managers(
-            current_time=scheduled_at
+            current_time=scheduled_at,
+            consultation_type=consultation_type,  # Передаем тип консультации для фильтрации
         )
     
     if not managers:
@@ -1145,6 +1147,7 @@ async def create_consultation(
                     consultation=None,  # Консультация еще не создана
                     category_key=category_key,
                     current_time=datetime.now(timezone.utc),
+                    consultation_type=consultation_type,  # Передаем тип консультации для фильтрации
                 )
                 
                 if selected_manager_key:

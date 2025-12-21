@@ -277,12 +277,23 @@ async def pull_calls():
             # Получаем дату последней синхронизации
             last_sync = await get_last_sync_date(db)
             
+            # ВАЖНО: Всегда обновляем заявки на будущее
+            # Используем текущую дату минус 7 дней как минимальную дату для обновления
+            # Это гарантирует, что мы всегда обновляем актуальные данные
+            current_date = datetime.now(timezone.utc)
+            min_sync_date = current_date - timedelta(days=7)
+            
             if last_sync:
-                from_dt = last_sync - timedelta(hours=12)
+                # Используем минимум из: последняя синхронизация - 12 часов или текущая дата - 7 дней
+                # Это гарантирует, что мы всегда обновляем данные за последние 7 дней
+                from_dt = min(last_sync - timedelta(hours=12), min_sync_date)
                 from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
                 etl_logger.sync_info(last_sync, from_date, buffer_days=None)  # Буфер в часах, не днях
             else:
-                from_date = f"{INITIAL_FROM_DATE}T00:00:00"
+                # Если нет последней синхронизации, используем минимум из: начальная дата или текущая дата - 7 дней
+                initial_date = datetime.strptime(INITIAL_FROM_DATE, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                from_dt = min(initial_date, min_sync_date)
+                from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
                 etl_logger.sync_info(None, from_date)
             
             skip = 0
@@ -383,7 +394,15 @@ async def pull_calls():
                 skip += PAGE_SIZE
             
             # Финальное сохранение даты синхронизации
-            sync_date_to_save = last_processed_period or datetime.now(timezone.utc)
+            # ВАЖНО: Сохраняем максимальную дату из обработанных записей или текущую дату
+            # Это гарантирует, что мы не пропустим записи на будущее
+            if last_processed_period:
+                sync_date_to_save = last_processed_period
+            else:
+                # Если не было обработано ни одной записи, сохраняем текущую дату
+                # Это гарантирует, что при следующем запуске мы начнем с текущей даты - 7 дней
+                sync_date_to_save = datetime.now(timezone.utc)
+            
             await save_sync_date(db, sync_date_to_save)
             await db.commit()
             etl_logger.sync_state_saved(sync_date_to_save)

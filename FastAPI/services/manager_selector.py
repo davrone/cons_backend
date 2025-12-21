@@ -34,6 +34,7 @@ class ManagerSelector:
         po_section_key: Optional[str] = None,
         po_type_key: Optional[str] = None,
         category_key: Optional[str] = None,
+        consultation_type: Optional[str] = None,
     ) -> List[User]:
         """
         Получить список доступных менеджеров.
@@ -43,6 +44,7 @@ class ManagerSelector:
             po_section_key: Ключ раздела ПО из консультации
             po_type_key: Ключ типа ПО из консультации
             category_key: Ключ категории вопроса (из online_question_cat)
+            consultation_type: Тип консультации ("Консультация по ведению учёта" или "Техническая поддержка")
             current_time: Текущее время для проверки рабочего времени
         
         Returns:
@@ -60,15 +62,26 @@ class ManagerSelector:
             User.con_limit > 0,
         )
         
+        # ВАЖНО: Для "Консультация по ведению учёта" применяем дополнительные фильтры:
+        # - department = "ИТС консультанты"
+        # - start_hour is not null (обязательно должно быть установлено рабочее время)
+        if consultation_type == "Консультация по ведению учёта":
+            query = query.where(
+                User.department == "ИТС консультанты",
+                User.start_hour.isnot(None),  # Обязательно должно быть установлено рабочее время
+            )
+        
         # Фильтр по времени работы
         current_time_only = current_time.time()
         time_conditions = []
         
         # Если start_hour и end_hour установлены, проверяем время работы
         # Если не установлены, считаем что менеджер работает всегда
+        # ВАЖНО: Для "Консультация по ведению учёта" start_hour уже проверен выше (is not null)
         query = query.where(
             or_(
                 # Менеджер работает всегда (start_hour и end_hour не установлены)
+                # НО: для "Консультация по ведению учёта" это условие не применяется (start_hour обязателен)
                 and_(
                     User.start_hour.is_(None),
                     User.end_hour.is_(None)
@@ -261,6 +274,7 @@ class ManagerSelector:
         po_type_key: Optional[str] = None,
         category_key: Optional[str] = None,
         current_time: Optional[datetime] = None,
+        consultation_type: Optional[str] = None,
     ) -> Optional[str]:
         """
         Выбрать менеджера для консультации.
@@ -276,6 +290,7 @@ class ManagerSelector:
             po_type_key: Ключ типа ПО
             category_key: Ключ категории вопроса
             current_time: Текущее время
+            consultation_type: Тип консультации ("Консультация по ведению учёта" или "Техническая поддержка")
         
         Returns:
             cl_ref_key выбранного менеджера или None
@@ -289,6 +304,7 @@ class ManagerSelector:
             po_section_key=po_section_key,
             po_type_key=po_type_key,
             category_key=category_key,
+            consultation_type=consultation_type,
         )
         
         if not available_managers:

@@ -378,10 +378,58 @@ class OneCClient:
         else:
             payload["Важность"] = "Обычная"
         
+        # Формируем комментарий с информацией о выбранной категории и вопросе
+        comment_parts = []
+        
+        # Добавляем пометку о источнике создания
+        comment_parts.append("Создано из globus support")
+        
+        # Добавляем информацию о категории и вопросе, если они есть
+        if question_category_key and question_category_key != "00000000-0000-0000-0000-000000000000":
+            # Получаем название категории из БД, если доступна сессия
+            category_name = None
+            if db_session:
+                try:
+                    from sqlalchemy import select
+                    from ..models import OnlineQuestionCat
+                    result = await db_session.execute(
+                        select(OnlineQuestionCat.description)
+                        .where(OnlineQuestionCat.ref_key == question_category_key)
+                        .limit(1)
+                    )
+                    category_name = result.scalar_one_or_none()
+                except Exception as e:
+                    logger.debug(f"Failed to get category name: {e}")
+            
+            if category_name:
+                comment_parts.append(f"Категория вопроса: {category_name}")
+        
+        if question_key and question_key != "00000000-0000-0000-0000-000000000000":
+            # Получаем название вопроса из БД, если доступна сессия
+            question_name = None
+            if db_session:
+                try:
+                    from sqlalchemy import select
+                    from ..models import OnlineQuestion
+                    result = await db_session.execute(
+                        select(OnlineQuestion.description)
+                        .where(OnlineQuestion.ref_key == question_key)
+                        .limit(1)
+                    )
+                    question_name = result.scalar_one_or_none()
+                except Exception as e:
+                    logger.debug(f"Failed to get question name: {e}")
+            
+            if question_name:
+                comment_parts.append(f"Вопрос: {question_name}")
+        
+        # Добавляем пользовательский комментарий, если есть
         if comment:
-            payload["Комментарий"] = comment
-        else:
-            payload["Комментарий"] = ""  # Пустая строка для обязательного поля
+            comment_parts.append(comment)
+        
+        # Объединяем все части комментария
+        final_comment = "\n".join(comment_parts) if comment_parts else ""
+        payload["Комментарий"] = final_comment
         
         # ВАЖНО: Обязательные поля КонсультацииИТС и ВопросыИОтветы должны быть пустыми массивами
         # Они заполняются операторами после завершения консультации
