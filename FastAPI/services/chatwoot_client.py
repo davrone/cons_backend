@@ -857,16 +857,24 @@ class ChatwootClient:
         endpoint = f"/api/v1/accounts/{self.account_id}/teams"
         return await self._request("GET", endpoint)
     
-    async def find_team_by_name(self, team_name: str) -> Optional[int]:
+    async def find_team_by_name(self, team_name: str, expected_name: Optional[str] = None) -> Optional[int]:
         """
         Найти команду по имени (регистронезависимый поиск).
+        Если найдена команда с похожим названием, обновляет её название до expected_name.
+        
+        ВАЖНО: Не основывается на названии команд из Chatwoot, сначала делает GET,
+        после сравнивает что подходит, после делает PATCH чтобы названия сходились.
         
         Args:
-            team_name: Название команды
+            team_name: Название команды для поиска (может быть любым похожим)
+            expected_name: Ожидаемое название команды (если отличается от team_name)
             
         Returns:
             ID команды или None если не найдена
         """
+        if expected_name is None:
+            expected_name = team_name
+        
         try:
             teams = await self.get_teams()
             # teams может быть списком или словарем с ключом "payload"
@@ -880,13 +888,28 @@ class ChatwootClient:
             
             # Нормализуем имя команды для поиска (регистронезависимо)
             team_name_normalized = team_name.lower().strip()
+            expected_name_normalized = expected_name.lower().strip()
             
+            # Ищем команду по похожему названию
             for team in teams_list:
                 if isinstance(team, dict):
                     team_name_in_chatwoot = team.get("name", "")
-                    if team_name_in_chatwoot.lower().strip() == team_name_normalized:
+                    team_name_in_chatwoot_normalized = team_name_in_chatwoot.lower().strip()
+                    
+                    # Проверяем точное совпадение или похожее название
+                    if (team_name_in_chatwoot_normalized == team_name_normalized or
+                        team_name_in_chatwoot_normalized == expected_name_normalized):
                         team_id = team.get("id")
-                        logger.info(f"Found team '{team_name}' in Chatwoot: id={team_id}")
+                        
+                        # Если название отличается от ожидаемого, обновляем его
+                        if team_name_in_chatwoot_normalized != expected_name_normalized:
+                            try:
+                                await self.update_team(team_id=team_id, name=expected_name)
+                                logger.info(f"Updated team {team_id} name from '{team_name_in_chatwoot}' to '{expected_name}'")
+                            except Exception as update_error:
+                                logger.warning(f"Failed to update team {team_id} name: {update_error}")
+                        
+                        logger.info(f"Found team '{expected_name}' in Chatwoot: id={team_id}")
                         return team_id
             
             logger.warning(f"Team '{team_name}' not found in Chatwoot. Available teams: {[t.get('name') for t in teams_list if isinstance(t, dict)]}")
@@ -920,6 +943,70 @@ class ChatwootClient:
         except Exception as e:
             logger.warning(f"Failed to get team members for team {team_id}: {e}")
             return []
+    
+    async def update_team(
+        self,
+        team_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        allow_auto_assign: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """
+        Обновить команду в Chatwoot.
+        
+        Использует PATCH /api/v1/accounts/{account_id}/teams/{team_id}
+        
+        Args:
+            team_id: ID команды
+            name: Новое название команды
+            description: Описание команды
+            allow_auto_assign: Разрешить автоматическое назначение
+            
+        Returns:
+            Dict с данными обновленной команды
+        """
+        payload = {}
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if allow_auto_assign is not None:
+            payload["allow_auto_assign"] = allow_auto_assign
+        
+        if not payload:
+            logger.warning(f"No fields to update for team {team_id}")
+            return {}
+        
+        logger.info(f"Updating team {team_id} with: {payload}")
+        return await self._request(
+            "PATCH",
+            f"/api/v1/accounts/{self.account_id}/teams/{team_id}",
+            data=payload
+        )
+    
+    async def add_team_members(
+        self,
+        team_id: int,
+        user_ids: List[int]
+    ) -> Dict[str, Any]:
+        """
+        Добавить агентов в команду.
+        
+        Использует POST /api/v1/accounts/{account_id}/teams/{team_id}/team_members
+        
+        Args:
+            team_id: ID команды
+            user_ids: Список ID пользователей-агентов
+            
+        Returns:
+            Dict с результатом операции
+        """
+        logger.info(f"Adding {len(user_ids)} members to team {team_id}")
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.account_id}/teams/{team_id}/team_members",
+            data={"user_ids": user_ids}
+        )
         
         # Labels - метки беседы (используем для language и source)
         # ВАЖНО: Согласно ТЗ, labels лучше добавлять отдельным запросом после создания
@@ -1161,6 +1248,60 @@ class ChatwootClient:
             data=payload
         )
     
+    async def assign_conversation_team(
+        self,
+        conversation_id: str,
+        team_id: int
+    ) -> Dict[str, Any]:
+        """
+        Назначение команды беседе через assignments endpoint.
+        
+        ВАЖНО: Используется отдельный endpoint для назначения команды.
+        Сначала назначается команда, потом агент.
+        
+        Использует POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/assignments
+        
+        Args:
+            conversation_id: ID беседы
+            team_id: ID команды
+            
+        Returns:
+            Dict с данными обновленной беседы
+        """
+        logger.info(f"Assigning team {team_id} to conversation {conversation_id}")
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/assignments",
+            data={"team_id": team_id}
+        )
+    
+    async def assign_conversation_agent(
+        self,
+        conversation_id: str,
+        assignee_id: int
+    ) -> Dict[str, Any]:
+        """
+        Назначение агента беседе через assignments endpoint.
+        
+        ВАЖНО: Используется отдельный endpoint для назначения агента.
+        Сначала назначается команда, потом агент.
+        
+        Использует POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/assignments
+        
+        Args:
+            conversation_id: ID беседы
+            assignee_id: ID агента
+            
+        Returns:
+            Dict с данными обновленной беседы
+        """
+        logger.info(f"Assigning agent {assignee_id} to conversation {conversation_id}")
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/assignments",
+            data={"assignee_id": assignee_id}
+        )
+    
     async def toggle_conversation_status(
         self,
         conversation_id: str
@@ -1218,11 +1359,22 @@ class ChatwootClient:
                 f"/api/v1/accounts/{self.account_id}/labels"
             )
             
+            # Обрабатываем разные форматы ответа
+            labels_list = []
             if isinstance(labels_response, list):
-                existing_labels = [label.get("title") for label in labels_response if isinstance(label, dict)]
-                if label_title in existing_labels:
-                    ChatwootClient._labels_cache.add(label_title)
-                    return True
+                labels_list = labels_response
+            elif isinstance(labels_response, dict):
+                if "payload" in labels_response:
+                    labels_list = labels_response["payload"] if isinstance(labels_response["payload"], list) else []
+                elif "value" in labels_response:
+                    labels_list = labels_response["value"] if isinstance(labels_response["value"], list) else []
+            
+            # Проверяем существование label
+            existing_labels = [label.get("title") for label in labels_list if isinstance(label, dict)]
+            if label_title in existing_labels:
+                ChatwootClient._labels_cache.add(label_title)
+                logger.debug(f"Label '{label_title}' already exists in Chatwoot")
+                return True
             
             # Label не найден, создаем его
             # ВАЖНО: Используем человеко-читаемые названия для labels

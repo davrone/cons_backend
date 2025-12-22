@@ -55,17 +55,27 @@ DATABASE_URL = (
 )
 
 
-def map_status(vid_obrascheniya: Optional[str], end_date: Optional[datetime] = None) -> str:
+def map_status(
+    vid_obrascheniya: Optional[str], 
+    end_date: Optional[datetime] = None,
+    denied: bool = False
+) -> str:
     """
-    Маппинг ВидОбращения в статус с учетом поля Конец.
+    Маппинг ВидОбращения в статус с учетом поля Конец и ЗакрытоБезКонсультации.
     
     Логика:
-    - Если заполнено поле Конец (end_date) → статус "closed" (завершено/закрыто)
+    - ВАЖНО: Если ЗакрытоБезКонсультации = True → статус "cancelled" (отменено)
+      независимо от других полей (даже если Конец заполнен)
+    - Если заполнено поле Конец (end_date) и НЕ закрыто без консультации → статус "closed" (завершено/закрыто)
     - Если Конец не заполнено:
       - "КонсультацияИТС" → "open" (в работе)
       - "ВОчередьНаКонсультацию" → "pending" (в очереди)
       - "Другое" → "other"
     """
+    # ВАЖНО: Если закрыто без консультации, статус всегда "cancelled"
+    if denied:
+        return "cancelled"
+    
     # Если заполнено поле Конец, консультация завершена
     if end_date:
         return "closed"
@@ -304,13 +314,13 @@ async def process_consultation_item(
     start_date = clean_datetime(item.get("ДатаКонсультации"))
     end_date = clean_datetime(item.get("Конец"))
     
-    # Статус из ВидОбращения с учетом поля Конец
-    vid_obrascheniya = item.get("ВидОбращения")
-    status = map_status(vid_obrascheniya, end_date)
-    consultation_type = map_consultation_type(vid_obrascheniya)
-    
-    # Закрыто без консультации
+    # Закрыто без консультации (ВАЖНО: проверяем ДО определения статуса)
     denied = bool(item.get("ЗакрытоБезКонсультации", False))
+    
+    # Статус из ВидОбращения с учетом поля Конец и ЗакрытоБезКонсультации
+    vid_obrascheniya = item.get("ВидОбращения")
+    status = map_status(vid_obrascheniya, end_date, denied)
+    consultation_type = map_consultation_type(vid_obrascheniya)
     
     # Другие поля
     comment = item.get("Описание") or item.get("Вопрос") or ""
