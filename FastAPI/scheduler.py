@@ -28,6 +28,9 @@ ETL_QUEUE_CLOSING_INTERVAL = int(os.getenv("ETL_QUEUE_CLOSING_INTERVAL", "1"))
 ETL_USERS_CRON_HOUR = int(os.getenv("ETL_USERS_CRON_HOUR", "3"))
 ETL_USERS_CRON_MINUTE = int(os.getenv("ETL_USERS_CRON_MINUTE", "15"))
 
+# ВАЖНО: Если интервал = 0, ETL процесс отключается
+# Для отключения загрузки пользователей установите ETL_USERS_CRON_HOUR=-1
+
 
 async def run_etl_script(script_name: str):
     """Запуск ETL скрипта с защитой от параллельных запусков"""
@@ -120,80 +123,110 @@ def setup_scheduler():
     # ВАЖНО: pull_cons_cl запускается только после завершения pull_clients_cl
     # Используем ETL_CONS_INCREMENTAL_INTERVAL для частоты запуска инкремента консультаций
     # (клиенты загружаются перед консультациями, но частота определяется по консультациям)
-    scheduler.add_job(
-        run_clients_then_consultations,
-        IntervalTrigger(minutes=ETL_CONS_INCREMENTAL_INTERVAL),
-        id='pull_clients_then_cons',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=ETL_CONS_INCREMENTAL_INTERVAL * 2,  # Пропустить если опоздал больше чем в 2 раза
-    )
+    # Если интервал = 0, задача не добавляется (ETL отключен)
+    if ETL_CONS_INCREMENTAL_INTERVAL > 0:
+        scheduler.add_job(
+            run_clients_then_consultations,
+            IntervalTrigger(minutes=ETL_CONS_INCREMENTAL_INTERVAL),
+            id='pull_clients_then_cons',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=ETL_CONS_INCREMENTAL_INTERVAL * 2,  # Пропустить если опоздал больше чем в 2 раза
+        )
+    else:
+        logger.info("ETL incremental consultations disabled (ETL_CONS_INCREMENTAL_INTERVAL=0)")
+        print("⚠ ETL incremental consultations disabled (ETL_CONS_INCREMENTAL_INTERVAL=0)")
     
     # Обновление открытых консультаций по Ref_Key - частота из env
     # Запускается отдельно от инкремента для обновления открытых заявок
-    scheduler.add_job(
-        run_consultations_open_update,
-        IntervalTrigger(minutes=ETL_CONS_OPEN_UPDATE_INTERVAL),
-        id='pull_cons_open_update',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=ETL_CONS_OPEN_UPDATE_INTERVAL * 2,
-    )
+    if ETL_CONS_OPEN_UPDATE_INTERVAL > 0:
+        scheduler.add_job(
+            run_consultations_open_update,
+            IntervalTrigger(minutes=ETL_CONS_OPEN_UPDATE_INTERVAL),
+            id='pull_cons_open_update',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=ETL_CONS_OPEN_UPDATE_INTERVAL * 2,
+        )
+    else:
+        logger.info("ETL open consultations update disabled (ETL_CONS_OPEN_UPDATE_INTERVAL=0)")
+        print("⚠ ETL open consultations update disabled (ETL_CONS_OPEN_UPDATE_INTERVAL=0)")
     
     # Загрузка переносов - частота из env
-    scheduler.add_job(
-        run_etl_script,
-        IntervalTrigger(minutes=ETL_CONS_REDATE_INTERVAL),
-        args=['pull_cons_redate_cl'],
-        id='pull_cons_redate_cl',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=ETL_CONS_REDATE_INTERVAL * 2,
-    )
+    if ETL_CONS_REDATE_INTERVAL > 0:
+        scheduler.add_job(
+            run_etl_script,
+            IntervalTrigger(minutes=ETL_CONS_REDATE_INTERVAL),
+            args=['pull_cons_redate_cl'],
+            id='pull_cons_redate_cl',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=ETL_CONS_REDATE_INTERVAL * 2,
+        )
+    else:
+        logger.info("ETL consultations redate disabled (ETL_CONS_REDATE_INTERVAL=0)")
+        print("⚠ ETL consultations redate disabled (ETL_CONS_REDATE_INTERVAL=0)")
     
     # Загрузка оценок - частота из env
-    scheduler.add_job(
-        run_etl_script,
-        IntervalTrigger(minutes=ETL_CONS_RATES_INTERVAL),
-        args=['pull_cons_rates_cl'],
-        id='pull_cons_rates_cl',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=ETL_CONS_RATES_INTERVAL * 2,
-    )
+    if ETL_CONS_RATES_INTERVAL > 0:
+        scheduler.add_job(
+            run_etl_script,
+            IntervalTrigger(minutes=ETL_CONS_RATES_INTERVAL),
+            args=['pull_cons_rates_cl'],
+            id='pull_cons_rates_cl',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=ETL_CONS_RATES_INTERVAL * 2,
+        )
+    else:
+        logger.info("ETL consultations rates disabled (ETL_CONS_RATES_INTERVAL=0)")
+        print("⚠ ETL consultations rates disabled (ETL_CONS_RATES_INTERVAL=0)")
     
     # Загрузка дозвонов - частота из env
-    scheduler.add_job(
-        run_etl_script,
-        IntervalTrigger(minutes=ETL_CALLS_INTERVAL),
-        args=['pull_calls_cl'],
-        id='pull_calls_cl',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=ETL_CALLS_INTERVAL * 2,
-    )
+    if ETL_CALLS_INTERVAL > 0:
+        scheduler.add_job(
+            run_etl_script,
+            IntervalTrigger(minutes=ETL_CALLS_INTERVAL),
+            args=['pull_calls_cl'],
+            id='pull_calls_cl',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=ETL_CALLS_INTERVAL * 2,
+        )
+    else:
+        logger.info("ETL calls disabled (ETL_CALLS_INTERVAL=0)")
+        print("⚠ ETL calls disabled (ETL_CALLS_INTERVAL=0)")
     
     # Загрузка закрытия очереди - частота из env
-    scheduler.add_job(
-        run_etl_script,
-        IntervalTrigger(minutes=ETL_QUEUE_CLOSING_INTERVAL),
-        args=['pull_queue_closing_cl'],
-        id='pull_queue_closing_cl',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=ETL_QUEUE_CLOSING_INTERVAL * 2,
-    )
+    if ETL_QUEUE_CLOSING_INTERVAL > 0:
+        scheduler.add_job(
+            run_etl_script,
+            IntervalTrigger(minutes=ETL_QUEUE_CLOSING_INTERVAL),
+            args=['pull_queue_closing_cl'],
+            id='pull_queue_closing_cl',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=ETL_QUEUE_CLOSING_INTERVAL * 2,
+        )
+    else:
+        logger.info("ETL queue closing disabled (ETL_QUEUE_CLOSING_INTERVAL=0)")
+        print("⚠ ETL queue closing disabled (ETL_QUEUE_CLOSING_INTERVAL=0)")
     
     # Загрузка пользователей - ежедневно в указанное время (из env)
-    scheduler.add_job(
-        run_etl_script,
-        CronTrigger(hour=ETL_USERS_CRON_HOUR, minute=ETL_USERS_CRON_MINUTE),
-        args=['pull_users_cl'],
-        id='pull_users_cl',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=3600,  # 1 час для ежедневных задач
-    )
+    # Для отключения можно установить ETL_USERS_CRON_HOUR=-1
+    if ETL_USERS_CRON_HOUR >= 0:
+        scheduler.add_job(
+            run_etl_script,
+            CronTrigger(hour=ETL_USERS_CRON_HOUR, minute=ETL_USERS_CRON_MINUTE),
+            args=['pull_users_cl'],
+            id='pull_users_cl',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=3600,  # 1 час для ежедневных задач
+        )
+    else:
+        logger.info("ETL users disabled (ETL_USERS_CRON_HOUR=-1)")
+        print("⚠ ETL users disabled (ETL_USERS_CRON_HOUR=-1)")
     
     logger.info("Scheduler configured with ETL tasks")
     logger.info(f"ETL intervals: clients={ETL_CLIENTS_INTERVAL}min, "
