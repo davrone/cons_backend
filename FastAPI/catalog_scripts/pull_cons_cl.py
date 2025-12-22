@@ -32,6 +32,11 @@ LOG_LEVEL = os.getenv("ETL_LOG_LEVEL", "INFO")
 PAGE_SIZE = int(os.getenv("ODATA_PAGE_SIZE", "1000"))
 INITIAL_FROM_DATE = os.getenv("ETL_INITIAL_FROM_DATE", "2025-01-01")
 MAX_ERROR_LOGS = int(os.getenv("ETL_MAX_ERROR_LOGS", "10"))  # Максимум ошибок для логирования
+INCREMENTAL_BUFFER_DAYS = int(os.getenv("ETL_CONS_INCREMENTAL_BUFFER_DAYS", "7"))  # Буфер для инкремента
+REF_KEY_BATCH_SIZE = int(os.getenv("ETL_CONS_REF_KEY_BATCH_SIZE", "50"))  # Размер батча для запросов по Ref_Key
+
+# Режим работы ETL: "incremental" (по умолчанию) или "open_update"
+ETL_MODE = os.getenv("ETL_CONS_MODE", "incremental")
 
 ENTITY = "Document_ТелефонныйЗвонок"
 
@@ -596,29 +601,284 @@ async def process_consultation_item(
     return result_date
 
 
-async def pull_consultations():
-    """Основная функция загрузки консультаций"""
-    etl_logger = ETLLogger("pull_cons_cl", ENTITY)
+async def pull_open_consultations_by_ref_key(db: AsyncSession, auth: tuple):
+    """
+    Обновление открытых консультаций по Ref_Key из БД.
     
-    if not (ODATA_BASEURL and ODATA_USER and ODATA_PASSWORD):
-        etl_logger.critical_error("ODATA config missing. Check ODATA_BASEURL_CL, ODATA_USER, ODATA_PASSWORD")
-        sys.exit(1)
+    Получает список всех открытых консультаций из БД и обновляет их через OData запросы.
+    Это позволяет узнавать о закрытии старых открытых заявок.
+    """
+    etl_logger = ETLLogger("pull_cons_cl_open_update", ENTITY)
+    
+    # Получаем список открытых консультаций из БД
+    result = await db.execute(
+        text("""
+            SELECT DISTINCT cl_ref_key 
+            FROM cons.cons 
+            WHERE cl_ref_key IS NOT NULL 
+            AND cl_ref_key != ''
+            AND status NOT IN ('closed', 'resolved', 'cancelled')
+            ORDER BY cl_ref_key
+        """)
+    )
+    open_ref_keys = [row[0] for row in result.fetchall()]
+    
+    if not open_ref_keys:
+        logger.info("No open consultations found in database")
+        return
+    
+    logger.info(f"Found {len(open_ref_keys)} open consultations to update")
+    etl_logger.start({
+        "mode": "open_update",
+        "open_consultations_count": len(open_ref_keys),
+        "batch_size": REF_KEY_BATCH_SIZE
+    })
+    
+    # Батчим запросы по Ref_Key
+    total_updated = 0
+    total_created = 0
+    total_errors = 0
+    
+    for batch_start in range(0, len(open_ref_keys), REF_KEY_BATCH_SIZE):
+        batch_ref_keys = open_ref_keys[batch_start:batch_start + REF_KEY_BATCH_SIZE]
+        batch_num = batch_start // REF_KEY_BATCH_SIZE + 1
+        
+        # Формируем фильтр по Ref_Key: Ref_Key eq 'guid1' or Ref_Key eq 'guid2' or ...
+        ref_key_filters = [f"Ref_Key eq guid'{key}'" for key in batch_ref_keys]
+        filter_part = " or ".join(ref_key_filters)
+        
+        encoded_filter = quote(filter_part, safe="'()=<>", encoding='utf-8')
+        
+        url = (
+            f"{ODATA_BASEURL}{ENTITY}?$format=json"
+            f"&$filter={encoded_filter}"
+            f"&$top={PAGE_SIZE}"
+        )
+        
+        try:
+            resp = http_get_with_backoff(url, auth, timeout=120)
+            response_data = resp.json()
+            batch = response_data.get("value", [])
+            
+            logger.info(f"Batch {batch_num}: fetched {len(batch)} consultations from OData")
+            
+            for item in batch:
+                try:
+                    ref_key = item.get("Ref_Key")
+                    if not ref_key:
+                        continue
+                    
+                    # Проверяем существование перед обработкой
+                    existing_check = await db.execute(
+                        select(Consultation).where(Consultation.cl_ref_key == ref_key).limit(1)
+                    )
+                    was_existing = existing_check.scalar_one_or_none() is not None
+                    
+                    await process_consultation_item(db, item)
+                    
+                    if was_existing:
+                        total_updated += 1
+                    else:
+                        total_created += 1
+                        
+                except Exception as e:
+                    total_errors += 1
+                    logger.warning(f"Error processing consultation {item.get('Ref_Key', 'N/A')}: {e}")
+                    continue
+            
+            await db.commit()
+            logger.info(f"Batch {batch_num}: updated {total_updated}, created {total_created}, errors {total_errors}")
+            
+        except Exception as e:
+            logger.error(f"Error fetching batch {batch_num}: {e}")
+            await db.rollback()
+            total_errors += len(batch_ref_keys)
+            continue
+    
+    etl_logger.finish(success=True)
+    logger.info(f"Open consultations update completed: updated={total_updated}, created={total_created}, errors={total_errors}")
+
+
+async def pull_consultations_incremental(db: AsyncSession, auth: tuple):
+    """
+    Инкрементальная загрузка консультаций по дате создания и дате консультации.
+    
+    Загружает:
+    - Новые консультации (по ДатаСоздания)
+    - Консультации на будущее (по ДатаКонсультации)
+    """
+    etl_logger = ETLLogger("pull_cons_cl_incremental", ENTITY)
+    
+    # Получаем дату последней синхронизации
+    last_sync = await get_last_sync_date(db)
+    
+    if last_sync:
+        # Инкрементальная загрузка с буфером
+        from_dt = last_sync - timedelta(days=INCREMENTAL_BUFFER_DAYS)
+        from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        logger.info(f"Incremental sync from {from_date} (last sync: {last_sync}, buffer: {INCREMENTAL_BUFFER_DAYS} days)")
+    else:
+        from_date = f"{INITIAL_FROM_DATE}T00:00:00"
+        logger.info(f"First run — loading from {from_date}")
+    
+    # Текущая дата для фильтра по ДатаКонсультации (заявки на будущее)
+    today = datetime.now(timezone.utc).date()
+    today_str = today.strftime("%Y-%m-%dT00:00:00")
     
     etl_logger.start({
-        "ODATA_BASEURL": ODATA_BASEURL,
-        "ENTITY": ENTITY,
-        "INITIAL_FROM_DATE": INITIAL_FROM_DATE,
+        "mode": "incremental",
+        "from_date": from_date,
+        "today": today_str,
+        "buffer_days": INCREMENTAL_BUFFER_DAYS,
         "PAGE_SIZE": PAGE_SIZE
     })
     
+    skip = 0
+    last_processed_at: Optional[datetime] = None
+    if last_sync:
+        if last_sync.tzinfo is None:
+            last_processed_at = last_sync.replace(tzinfo=timezone.utc)
+        else:
+            last_processed_at = last_sync
+    
+    error_logs = 0
+    
+    while True:
+        # Улучшенный фильтр: загружаем по ДатаСоздания ИЛИ по ДатаКонсультации (на будущее)
+        # Формат: (ДатаСоздания ge datetime'...' OR ДатаКонсультации ge datetime'...')
+        filter_part = f"(ДатаСоздания ge datetime'{from_date}' or ДатаКонсультации ge datetime'{today_str}')"
+        
+        # ВАЖНО: OData требует правильного кодирования кириллицы
+        encoded_filter = quote(filter_part, safe="'()=<>", encoding='utf-8')
+        encoded_orderby = quote("ДатаСоздания asc", safe=",", encoding='utf-8')
+        
+        url = (
+            f"{ODATA_BASEURL}{ENTITY}?$format=json"
+            f"&$filter={encoded_filter}"
+            f"&$orderby={encoded_orderby}"
+            f"&$top={PAGE_SIZE}&$skip={skip}"
+        )
+        
+        batch_num = skip // PAGE_SIZE + 1
+        etl_logger.batch_start(batch_num, skip, PAGE_SIZE)
+        
+        try:
+            resp = http_get_with_backoff(url, auth, timeout=120)
+        except requests.HTTPError as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 400:
+                etl_logger.critical_error("400 Bad Request - stopping execution. Check OData filter syntax.", e)
+                sys.exit(1)
+            etl_logger.batch_error(batch_num, e, skip)
+            break
+        except Exception as e:
+            etl_logger.batch_error(batch_num, e, skip)
+            break
+        
+        # Парсим JSON ответ
+        try:
+            response_data = resp.json()
+            batch = response_data.get("value", [])
+        except Exception as json_error:
+            etl_logger.batch_error(batch_num, json_error, skip)
+            logger.error(f"[pull_cons_cl] Response text (first 500 chars): {resp.text[:500]}")
+            break
+        
+        if len(batch) == 0:
+            if "error" in response_data:
+                etl_logger.batch_error(batch_num, Exception(f"OData error: {response_data.get('error')}"), skip)
+            break
+        
+        # Обрабатываем каждую консультацию
+        batch_created = 0
+        batch_updated = 0
+        batch_errors = 0
+        for idx, item in enumerate(batch):
+            try:
+                ref_key = item.get("Ref_Key")
+                if not ref_key:
+                    batch_errors += 1
+                    continue
+                
+                # Проверяем существование перед обработкой
+                existing_check = await db.execute(
+                    select(Consultation).where(Consultation.cl_ref_key == ref_key).limit(1)
+                )
+                was_existing = existing_check.scalar_one_or_none() is not None
+                
+                processed_at = await process_consultation_item(db, item)
+                
+                if was_existing:
+                    batch_updated += 1
+                else:
+                    batch_created += 1
+                
+                if processed_at:
+                    if processed_at.tzinfo is None:
+                        processed_at = processed_at.replace(tzinfo=timezone.utc)
+                    if last_processed_at is None or processed_at > last_processed_at:
+                        last_processed_at = processed_at
+                else:
+                    batch_errors += 1
+            except Exception as e:
+                batch_errors += 1
+                error_logs += 1
+                if error_logs <= MAX_ERROR_LOGS:
+                    etl_logger.item_error(item.get('Ref_Key', 'N/A'), e, "consultation", full_traceback=True)
+                elif error_logs == MAX_ERROR_LOGS + 1:
+                    logger.warning(f"[pull_cons_cl] Further processing errors suppressed (showing first {MAX_ERROR_LOGS} errors)")
+                continue
+        
+        # Коммитим транзакцию
+        try:
+            await db.commit()
+        except Exception as commit_error:
+            etl_logger.batch_error(batch_num, commit_error, skip)
+            await db.rollback()
+            raise
+        
+        # Логируем прогресс батча
+        etl_logger.batch_progress(batch_num, len(batch), batch_created, batch_updated, batch_errors)
+        
+        # ВАЖНО: Сохраняем sync_state после каждого батча для устойчивости при прерывании
+        if last_processed_at:
+            try:
+                await save_sync_date(db, last_processed_at)
+                await db.commit()
+                etl_logger.sync_state_saved(last_processed_at, batch_num)
+            except Exception as sync_error:
+                logger.warning(f"[pull_cons_cl] Failed to save sync state after batch: {sync_error}")
+        
+        if len(batch) < PAGE_SIZE:
+            break
+        
+        skip += PAGE_SIZE
+    
+    # Финальное сохранение даты синхронизации
+    if last_processed_at:
+        await save_sync_date(db, last_processed_at)
+        try:
+            await db.commit()
+            etl_logger.sync_state_saved(last_processed_at)
+        except Exception as commit_error:
+            logger.error(f"[pull_cons_cl] Failed to save final sync date: {commit_error}", exc_info=True)
+            await db.rollback()
+    
+    etl_logger.finish(success=True)
+
+
+async def pull_consultations():
+    """Основная функция загрузки консультаций"""
+    if not (ODATA_BASEURL and ODATA_USER and ODATA_PASSWORD):
+        logger.error("ODATA config missing. Check ODATA_BASEURL_CL, ODATA_USER, ODATA_PASSWORD")
+        sys.exit(1)
+    
     auth = (ODATA_USER, ODATA_PASSWORD)
     # ВАЖНО: Настраиваем пул соединений для ETL скрипта
-    # Используем небольшой пул, так как скрипт запускается как отдельный процесс
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_size=2,  # Минимальный пул для ETL скрипта
-        max_overflow=2,  # Максимум 4 соединения на скрипт
+        pool_size=2,
+        max_overflow=2,
         pool_pre_ping=True,
         pool_recycle=3600,
         pool_timeout=30
@@ -627,37 +887,17 @@ async def pull_consultations():
     
     try:
         async with AsyncSessionLocal() as db:
-            # Получаем дату последней синхронизации
-            last_sync = await get_last_sync_date(db)
-            
-            if last_sync:
-                # Инкрементальная загрузка с буфером
-                # ВАЖНО: Используем буфер 7 дней для надежности
-                from_dt = last_sync - timedelta(days=7)
-                from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
-                logger.info("Incremental sync from %s (last sync: %s, buffer: 7 days)", from_date, last_sync)
+            if ETL_MODE == "open_update":
+                # Режим обновления открытых консультаций
+                await pull_open_consultations_by_ref_key(db, auth)
             else:
-                from_date = f"{INITIAL_FROM_DATE}T00:00:00"
-                logger.info("First run — loading from %s", from_date)
-            
-            # Логируем информацию о фильтре для отладки
-            logger.info(f"Starting sync from {from_date} (last sync: {last_sync or 'never'})")
-            
-            skip = 0
-            last_processed_at: Optional[datetime] = None
-            # ВАЖНО: Нормализуем last_sync к UTC если он есть
-            if last_sync:
-                if last_sync.tzinfo is None:
-                    last_processed_at = last_sync.replace(tzinfo=timezone.utc)
-                else:
-                    last_processed_at = last_sync
-            
-            error_logs = 0  # Счетчик ошибок для ограничения логирования
-            
-            while True:
-                # Формируем фильтр только по ДатаСоздания
-                # ВАЖНО: Используем только ДатаСоздания для фильтрации
-                filter_part = f"ДатаСоздания ge datetime'{from_date}'"
+                # Режим инкрементальной загрузки (по умолчанию)
+                await pull_consultations_incremental(db, auth)
+    except Exception as e:
+        logger.error(f"ETL failed: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        await engine.dispose()
                 
                 # ВАЖНО: OData требует правильного кодирования кириллицы
                 # Используем quote с encoding='utf-8' для правильного кодирования кириллицы

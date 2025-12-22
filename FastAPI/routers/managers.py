@@ -132,11 +132,14 @@ async def get_available_managers(
         current_time = datetime.now(timezone.utc)
     
     try:
+        # Для эндпоинта /available показываем всех менеджеров с лимитами
+        # без фильтрации по времени работы (чтобы видеть всех менеджеров)
         managers = await manager_selector.get_available_managers(
             current_time=current_time,
             po_section_key=po_section_key,
             po_type_key=po_type_key,
             category_key=category_key,
+            filter_by_working_hours=False,  # Показываем всех менеджеров, независимо от времени работы
         )
         
         # Добавляем информацию о загрузке для каждого менеджера
