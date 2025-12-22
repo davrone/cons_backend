@@ -7,7 +7,6 @@ import asyncio
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +24,9 @@ ETL_CONS_REDATE_INTERVAL = int(os.getenv("ETL_CONS_REDATE_INTERVAL", "1"))
 ETL_CONS_RATES_INTERVAL = int(os.getenv("ETL_CONS_RATES_INTERVAL", "1"))
 ETL_CALLS_INTERVAL = int(os.getenv("ETL_CALLS_INTERVAL", "1"))
 ETL_QUEUE_CLOSING_INTERVAL = int(os.getenv("ETL_QUEUE_CLOSING_INTERVAL", "1"))
-ETL_USERS_CRON_HOUR = int(os.getenv("ETL_USERS_CRON_HOUR", "3"))
-ETL_USERS_CRON_MINUTE = int(os.getenv("ETL_USERS_CRON_MINUTE", "15"))
+ETL_USERS_INTERVAL = int(os.getenv("ETL_USERS_INTERVAL", "60"))  # По умолчанию каждый час
 
 # ВАЖНО: Если интервал = 0, ETL процесс отключается
-# Для отключения загрузки пользователей установите ETL_USERS_CRON_HOUR=-1
 
 
 async def run_etl_script(script_name: str):
@@ -212,21 +209,21 @@ def setup_scheduler():
         logger.info("ETL queue closing disabled (ETL_QUEUE_CLOSING_INTERVAL=0)")
         print("⚠ ETL queue closing disabled (ETL_QUEUE_CLOSING_INTERVAL=0)")
     
-    # Загрузка пользователей - ежедневно в указанное время (из env)
-    # Для отключения можно установить ETL_USERS_CRON_HOUR=-1
-    if ETL_USERS_CRON_HOUR >= 0:
+    # Загрузка пользователей - частота из env (в минутах)
+    # По умолчанию каждый час (60 минут)
+    if ETL_USERS_INTERVAL > 0:
         scheduler.add_job(
             run_etl_script,
-            CronTrigger(hour=ETL_USERS_CRON_HOUR, minute=ETL_USERS_CRON_MINUTE),
+            IntervalTrigger(minutes=ETL_USERS_INTERVAL),
             args=['pull_users_cl'],
             id='pull_users_cl',
             replace_existing=True,
             max_instances=1,
-            misfire_grace_time=3600,  # 1 час для ежедневных задач
+            misfire_grace_time=ETL_USERS_INTERVAL * 2,
         )
     else:
-        logger.info("ETL users disabled (ETL_USERS_CRON_HOUR=-1)")
-        print("⚠ ETL users disabled (ETL_USERS_CRON_HOUR=-1)")
+        logger.info("ETL users disabled (ETL_USERS_INTERVAL=0)")
+        print("⚠ ETL users disabled (ETL_USERS_INTERVAL=0)")
     
     logger.info("Scheduler configured with ETL tasks")
     logger.info(f"ETL intervals: clients={ETL_CLIENTS_INTERVAL}min, "
@@ -236,7 +233,7 @@ def setup_scheduler():
                 f"rates={ETL_CONS_RATES_INTERVAL}min, "
                 f"calls={ETL_CALLS_INTERVAL}min, "
                 f"queue_closing={ETL_QUEUE_CLOSING_INTERVAL}min, "
-                f"users={ETL_USERS_CRON_HOUR}:{ETL_USERS_CRON_MINUTE:02d} UTC")
+                f"users={ETL_USERS_INTERVAL}min")
     print(f"✓ Scheduler configured with {len(scheduler.get_jobs())} ETL tasks")
     print(f"  Intervals: clients={ETL_CLIENTS_INTERVAL}min, "
           f"cons_incremental={ETL_CONS_INCREMENTAL_INTERVAL}min, "
@@ -245,7 +242,7 @@ def setup_scheduler():
           f"rates={ETL_CONS_RATES_INTERVAL}min, "
           f"calls={ETL_CALLS_INTERVAL}min, "
           f"queue_closing={ETL_QUEUE_CLOSING_INTERVAL}min, "
-          f"users={ETL_USERS_CRON_HOUR}:{ETL_USERS_CRON_MINUTE:02d} UTC")
+          f"users={ETL_USERS_INTERVAL}min")
 
 
 def start_scheduler():
