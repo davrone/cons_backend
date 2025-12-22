@@ -455,31 +455,53 @@ async def process_consultation_item(
                 if consultation.number:
                     custom_attrs_to_update["number_con"] = str(consultation.number)
                 
-                # Дата консультации
+                # Дата консультации (date_con) - всегда обновляем если есть
                 if consultation.start_date:
-                    # Форматируем дату в ISO формат без timezone для Chatwoot
+                    # Проверяем тип: может быть datetime или date
                     dt = consultation.start_date
-                    if dt.tzinfo:
-                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-                    custom_attrs_to_update["date_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    if isinstance(dt, datetime):
+                        # Это datetime - обрабатываем timezone
+                        if dt.tzinfo:
+                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                        custom_attrs_to_update["date_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    elif hasattr(dt, 'strftime'):
+                        # Это date - просто форматируем
+                        custom_attrs_to_update["date_con"] = dt.strftime("%Y-%m-%dT00:00:00")
                 
-                # Дата окончания (con_end из etl_cons_cl)
+                # Дата окончания (con_end из etl_cons_cl) - всегда обновляем если есть
                 if consultation.end_date:
                     dt = consultation.end_date
-                    if dt.tzinfo:
-                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-                    custom_attrs_to_update["con_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    if isinstance(dt, datetime):
+                        if dt.tzinfo:
+                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                        custom_attrs_to_update["con_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    elif hasattr(dt, 'strftime'):
+                        custom_attrs_to_update["con_end"] = dt.strftime("%Y-%m-%dT00:00:00")
                 
                 # Перенос (дата) - redate_con из etl_redate_cl
+                # ВАЖНО: redate имеет тип Date (не DateTime), поэтому нет tzinfo
                 if consultation.redate:
-                    dt = consultation.redate
-                    if dt.tzinfo:
-                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-                    custom_attrs_to_update["redate_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    # redate - это date объект, не datetime
+                    if isinstance(consultation.redate, datetime):
+                        dt = consultation.redate
+                        if dt.tzinfo:
+                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                        custom_attrs_to_update["redate_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    elif hasattr(consultation.redate, 'strftime'):
+                        # Это date объект
+                        custom_attrs_to_update["redate_con"] = consultation.redate.strftime("%Y-%m-%dT00:00:00")
                 
-                # Перенос (время) - retime_con из etl_redate_cl
+                # Перенос (время) - retime_con из etl_redate_cl - всегда обновляем если есть
                 if consultation.redate_time:
-                    custom_attrs_to_update["retime_con"] = consultation.redate_time.strftime("%H:%M")
+                    if hasattr(consultation.redate_time, 'strftime'):
+                        custom_attrs_to_update["retime_con"] = consultation.redate_time.strftime("%H:%M")
+                    else:
+                        # Если это строка или другой формат
+                        custom_attrs_to_update["retime_con"] = str(consultation.redate_time)
+                
+                # Вид обращения (consultation_type) - всегда обновляем если есть
+                if consultation.consultation_type:
+                    custom_attrs_to_update["consultation_type"] = str(consultation.consultation_type)
                 
                 # Закрыто без консультации - closed_without_con из etl_cons_cl
                 if consultation.denied is not None:
@@ -493,7 +515,7 @@ async def process_consultation_item(
                     )
                     logger.info(f"Synced consultation fields to Chatwoot for {consultation.cons_id}: {list(custom_attrs_to_update.keys())}")
             except Exception as sync_error:
-                logger.warning(f"Failed to sync consultation fields to Chatwoot {consultation.cons_id}: {sync_error}")
+                logger.warning(f"Failed to sync consultation fields to Chatwoot {consultation.cons_id}: {sync_error}", exc_info=True)
         
         if client_key and consultation.client_key != client_key:
             consultation.client_key = client_key
@@ -712,11 +734,16 @@ async def pull_open_consultations_by_ref_key(db: AsyncSession, auth: tuple):
             
             logger.info(f"Batch {batch_num}: fetched {len(batch)} consultations from OData")
             
+            # Собираем Ref_Key из ответа
+            returned_ref_keys = set()
+            
             for item in batch:
                 try:
                     ref_key = item.get("Ref_Key")
                     if not ref_key:
                         continue
+                    
+                    returned_ref_keys.add(ref_key)
                     
                     # Проверяем существование перед обработкой
                     existing_check = await db.execute(
@@ -735,6 +762,43 @@ async def pull_open_consultations_by_ref_key(db: AsyncSession, auth: tuple):
                     total_errors += 1
                     logger.warning(f"Error processing consultation {item.get('Ref_Key', 'N/A')}: {e}")
                     continue
+            
+            # Проверяем консультации, которые были в БД, но не вернулись в ответе от ЦЛ
+            # Это означает, что они были удалены в ЦЛ
+            missing_ref_keys = set(batch_ref_keys) - returned_ref_keys
+            if missing_ref_keys:
+                logger.info(f"Batch {batch_num}: found {len(missing_ref_keys)} consultations missing from ЦЛ response (possibly deleted)")
+                for ref_key in missing_ref_keys:
+                    try:
+                        # Находим консультацию в БД
+                        result = await db.execute(
+                            select(Consultation).where(Consultation.cl_ref_key == ref_key).limit(1)
+                        )
+                        consultation = result.scalar_one_or_none()
+                        
+                        if consultation and consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+                            # Обновляем статус на cancelled (удалено в ЦЛ)
+                            old_status = consultation.status
+                            if old_status not in ("closed", "resolved", "cancelled"):
+                                consultation.status = "cancelled"
+                                
+                                # Закрываем в Chatwoot
+                                try:
+                                    chatwoot_client = ChatwootClient()
+                                    await chatwoot_client.toggle_conversation_status(
+                                        conversation_id=consultation.cons_id,
+                                        status="resolved"
+                                    )
+                                    await chatwoot_client.send_message(
+                                        conversation_id=consultation.cons_id,
+                                        content="Заявка была удалена в системе.",
+                                        message_type="outgoing"
+                                    )
+                                    logger.info(f"Marked consultation {ref_key} as cancelled and closed in Chatwoot (deleted in ЦЛ)")
+                                except Exception as sync_error:
+                                    logger.warning(f"Failed to close consultation {ref_key} in Chatwoot: {sync_error}")
+                    except Exception as e:
+                        logger.warning(f"Error processing deleted consultation {ref_key}: {e}")
             
             await db.commit()
             logger.info(f"Batch {batch_num}: updated {total_updated}, created {total_created}, errors {total_errors}")
