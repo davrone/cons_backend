@@ -13,7 +13,8 @@ from ..schemas.telegram import (
     TelegramUserLinkResponse,
     TelegramMessagesResponse,
     TelegramMessage,
-    ConsultationInfoResponse
+    ConsultationInfoResponse,
+    TelegramUserContactCheckResponse
 )
 from ..services.chatwoot_client import ChatwootClient
 from ..services.telegram_bot import TelegramBotService
@@ -634,6 +635,43 @@ async def get_consultation_info(
         raise
     except Exception as e:
         logger.error(f"Error getting consultation info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/check-contact/{telegram_user_id}", response_model=TelegramUserContactCheckResponse)
+async def check_telegram_user_contact(
+    telegram_user_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Проверка наличия контакта у Telegram пользователя.
+    
+    Используется для проверки, может ли пользователь открыть Web App.
+    Web App должен быть доступен только после отправки контакта.
+    """
+    try:
+        result = await db.execute(
+            select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
+        )
+        telegram_user = result.scalar_one_or_none()
+        
+        if telegram_user and telegram_user.phone_number:
+            return TelegramUserContactCheckResponse(
+                has_contact=True,
+                telegram_user_id=telegram_user_id,
+                phone_number=telegram_user.phone_number,
+                message=None
+            )
+        else:
+            return TelegramUserContactCheckResponse(
+                has_contact=False,
+                telegram_user_id=telegram_user_id,
+                phone_number=None,
+                message="Для работы с порталом поддержки необходимо отправить контакт. Пожалуйста, отправьте команду /start и нажмите кнопку отправки контакта."
+            )
+        
+    except Exception as e:
+        logger.error(f"Error checking Telegram user contact: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

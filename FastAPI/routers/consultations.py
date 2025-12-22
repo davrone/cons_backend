@@ -2322,7 +2322,7 @@ async def create_consultation(
                 # ВАЖНО: Для "Техническая поддержка" не показываем очередь, только сообщение о времени связи
                 consultation_type = consultation.consultation_type or payload.consultation.consultation_type
                 if consultation_type == "Техническая поддержка":
-                    info_message_parts.append("Мы свяжемся с вами в течение 15-20 минут.")
+                    info_message_parts.append("Мы свяжемся с вами в течении 15-20 минут.")
                 elif selected_manager_key:
                     try:
                         wait_info = await manager_selector.calculate_wait_time(selected_manager_key)

@@ -114,6 +114,13 @@ async def lifespan(app: FastAPI):
                 await telegram_bot_service.application.initialize()
                 await telegram_bot_service.application.start()
                 logger.info("Telegram bot application initialized")
+                
+                # Настраиваем кнопку меню для Web App
+                menu_button_success = await telegram_bot_service.setup_menu_button()
+                if menu_button_success:
+                    print("✓ Кнопка меню для Web App настроена")
+                else:
+                    print("⚠️  Не удалось настроить кнопку меню для Web App")
             
             # Настраиваем webhook или polling
             if settings.TELEGRAM_WEBHOOK_URL:

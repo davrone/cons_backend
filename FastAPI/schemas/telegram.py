@@ -56,3 +56,10 @@ class ConsultationInfoResponse(BaseModel):
     is_open: bool  # True если консультация открыта (можно отправлять сообщения)
     message: Optional[str] = None  # Сообщение для пользователя (если закрыта)
 
+
+class TelegramUserContactCheckResponse(BaseModel):
+    """Ответ при проверке наличия контакта у Telegram пользователя"""
+    has_contact: bool  # True если у пользователя есть сохраненный контакт
+    telegram_user_id: int
+    phone_number: Optional[str] = None
+    message: Optional[str] = None  # Сообщение для пользователя (если контакта нет)

@@ -382,7 +382,7 @@ class OneCClient:
         comment_parts = []
         
         # Добавляем пометку о источнике создания
-        comment_parts.append("Создано из globus support")
+        comment_parts.append("Создано из Clobus.uz")
         
         # Добавляем информацию о категории и вопросе, если они есть
         if question_category_key and question_category_key != "00000000-0000-0000-0000-000000000000":

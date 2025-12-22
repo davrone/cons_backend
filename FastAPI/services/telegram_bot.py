@@ -1,7 +1,7 @@
 """Сервис для работы с Telegram ботом"""
 import logging
 from typing import Optional, Dict, Any
-from telegram import Bot, Update, WebAppInfo
+from telegram import Bot, Update, WebAppInfo, MenuButtonWebApp
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.request import HTTPXRequest
 
@@ -64,6 +64,11 @@ class TelegramBotService:
         if not update.message:
             return
         
+        # ВАЖНО: Обрабатываем только личные сообщения, игнорируем команды из групп
+        if update.message.chat.type != "private":
+            logger.debug(f"Ignoring /start command from non-private chat: chat_type={update.message.chat.type}, chat_id={update.message.chat.id}")
+            return
+        
         user = update.message.from_user
         telegram_user_id = user.id
         
@@ -96,13 +101,21 @@ class TelegramBotService:
         
         from telegram import ReplyKeyboardMarkup, KeyboardButton
         
+        # Кнопка отправки контакта в ReplyKeyboardMarkup (основная кнопка)
+        # ВАЖНО: request_contact работает только в ReplyKeyboardMarkup, не в InlineKeyboard
         keyboard = [[KeyboardButton("📱 Отправить контакт", request_contact=True)]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        
         await update.message.reply_text(
             welcome_text,
             reply_markup=reply_markup
         )
+        
+        # Дополнительное сообщение с подсказкой для тех, кто не видит кнопку
+        hint_text = (
+            "💡 Если вы не видите кнопку отправки контакта, "
+            "попробуйте обновить приложение Telegram или используйте меню бота."
+        )
+        await update.message.reply_text(hint_text)
     
     async def open_consultation_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cons_id: str, telegram_user_id: int):
         """Открытие чата с консультацией и загрузка истории"""
@@ -295,6 +308,11 @@ class TelegramBotService:
         if not update.message or not update.message.contact:
             return
         
+        # ВАЖНО: Обрабатываем только личные сообщения, игнорируем сообщения из групп
+        if update.message.chat.type != "private":
+            logger.debug(f"Ignoring contact from non-private chat: chat_type={update.message.chat.type}, chat_id={update.message.chat.id}")
+            return
+        
         contact = update.message.contact
         # Получаем telegram_user_id из контакта (если это контакт пользователя) или из сообщения
         telegram_user_id = contact.user_id if contact.user_id else update.message.from_user.id
@@ -387,8 +405,10 @@ class TelegramBotService:
             )
             
             # Отправляем отдельное сообщение с кнопкой web app
+            # Это важно для тех, кто не видит menu button (кнопку меню)
             await update.message.reply_text(
-                "Нажмите кнопку ниже, чтобы открыть портал поддержки:",
+                "📱 Нажмите кнопку ниже, чтобы открыть портал поддержки:\n\n"
+                "💡 Также вы можете использовать кнопку меню (4 квадрата) рядом с чатом.",
                 reply_markup=reply_markup
             )
             
@@ -401,6 +421,11 @@ class TelegramBotService:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка текстовых сообщений от пользователя"""
         if not update.message or not update.message.text:
+            return
+        
+        # ВАЖНО: Обрабатываем только личные сообщения, игнорируем сообщения из групп
+        if update.message.chat.type != "private":
+            logger.debug(f"Ignoring message from non-private chat: chat_type={update.message.chat.type}, chat_id={update.message.chat.id}")
             return
         
         telegram_user_id = update.message.from_user.id
@@ -698,6 +723,11 @@ class TelegramBotService:
         if not update.message:
             return
         
+        # ВАЖНО: Обрабатываем только личные сообщения, игнорируем сообщения из групп
+        if update.message.chat.type != "private":
+            logger.debug(f"Ignoring media from non-private chat: chat_type={update.message.chat.type}, chat_id={update.message.chat.id}")
+            return
+        
         telegram_user_id = update.message.from_user.id
         
         try:
@@ -844,6 +874,50 @@ class TelegramBotService:
             return True
         except Exception as e:
             logger.warning(f"Failed to setup webhook: {e}. Will fallback to polling.")
+            return False
+    
+    async def setup_menu_button(self) -> bool:
+        """
+        Настройка кнопки меню (menu button) для открытия Web App.
+        
+        Кнопка меню отображается в интерфейсе Telegram рядом с чатом
+        (4 маленьких квадрата в одном большом квадрате).
+        
+        Returns:
+            True если кнопка успешно установлена, False если произошла ошибка
+        """
+        if not self.bot:
+            logger.warning("Bot not initialized, cannot setup menu button")
+            return False
+        
+        try:
+            # Определяем URL для Web App
+            if settings.TELEGRAM_WEBAPP_URL:
+                web_app_url = settings.TELEGRAM_WEBAPP_URL.rstrip("/")
+                if "/subscriptions" not in web_app_url:
+                    web_app_url = f"{web_app_url}/subscriptions"
+            elif settings.TELEGRAM_WEBHOOK_URL:
+                base_url = settings.TELEGRAM_WEBHOOK_URL.replace("/api/telegram/webhook", "").rstrip("/")
+                if "backdev" in base_url:
+                    base_url = base_url.replace("backdev", "dev")
+                web_app_url = f"{base_url}/subscriptions"
+            else:
+                logger.warning("TELEGRAM_WEBAPP_URL or TELEGRAM_WEBHOOK_URL not set, cannot setup menu button")
+                return False
+            
+            # Создаем кнопку меню с Web App
+            menu_button = MenuButtonWebApp(
+                text="📱 Портал поддержки",
+                web_app=WebAppInfo(url=web_app_url)
+            )
+            
+            # Устанавливаем кнопку меню для всех пользователей (chat_id=None означает глобальная настройка)
+            await self.bot.set_chat_menu_button(chat_id=None, menu_button=menu_button)
+            
+            logger.info(f"Menu button setup successfully with Web App URL: {web_app_url}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to setup menu button: {e}", exc_info=True)
             return False
     
     async def shutdown(self):
