@@ -2331,6 +2331,17 @@ async def create_consultation(
                     private=False  # Видно клиенту
                 )
                 logger.info(f"Sent info message to Chatwoot conversation {chatwoot_cons_id}")
+                
+                # Обновляем custom_attributes с номером консультации если он есть
+                if consultation.number:
+                    try:
+                        await chatwoot_client.update_conversation_custom_attributes(
+                            conversation_id=chatwoot_cons_id,
+                            custom_attributes={"number_con": str(consultation.number)}
+                        )
+                        logger.info(f"Updated custom_attributes with number_con={consultation.number} for conversation {chatwoot_cons_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to update custom_attributes with number_con: {e}")
             except Exception as e:
                 logger.warning(f"Failed to send info message to Chatwoot: {e}", exc_info=True)
         

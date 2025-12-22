@@ -1302,17 +1302,44 @@ class ChatwootClient:
             data={"assignee_id": assignee_id}
         )
     
-    async def toggle_conversation_status(
+    async def update_conversation_custom_attributes(
         self,
-        conversation_id: str
+        conversation_id: str,
+        custom_attributes: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Переключение статуса консультации (открыть/закрыть) через Application API.
+        Обновление custom_attributes беседы через отдельный endpoint.
+        
+        Использует POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/custom_attributes
+        
+        Args:
+            conversation_id: ID беседы
+            custom_attributes: Словарь с custom_attributes для обновления
+            
+        Returns:
+            Dict с данными обновленной беседы
+        """
+        logger.info(f"Updating custom_attributes for conversation {conversation_id}: {list(custom_attributes.keys())}")
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/custom_attributes",
+            data={"custom_attributes": custom_attributes}
+        )
+    
+    async def toggle_conversation_status(
+        self,
+        conversation_id: str,
+        status: str = "resolved"
+    ) -> Dict[str, Any]:
+        """
+        Изменение статуса консультации через Application API.
         
         Использует POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_status
+        с параметром status в теле запроса.
         
         Args:
             conversation_id: ID консультации
+            status: Статус для установки (open, resolved, pending, snoozed)
             
         Returns:
             Dict с данными обновленной консультации
@@ -1320,7 +1347,7 @@ class ChatwootClient:
         return await self._request(
             "POST",
             f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/toggle_status",
-            data={}
+            data={"status": status}
         )
     
     async def get_conversation(self, conversation_id: str) -> Dict[str, Any]:

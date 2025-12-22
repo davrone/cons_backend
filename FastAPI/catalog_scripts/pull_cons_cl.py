@@ -399,13 +399,35 @@ async def process_consultation_item(
             if consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
                 try:
                     chatwoot_client = ChatwootClient()
-                    # Если статус "closed" - закрываем в Chatwoot
+                    # Если статус "closed" - закрываем в Chatwoot с сообщением о длительности разговора
                     if status == "closed" and old_status != "closed":
-                        await chatwoot_client.update_conversation(
+                        # Вычисляем длительность разговора
+                        duration_message = ""
+                        if consultation.start_date and consultation.end_date:
+                            duration = consultation.end_date - consultation.start_date
+                            duration_minutes = int(duration.total_seconds() / 60)
+                            if duration_minutes > 0:
+                                duration_message = f" Заявка была закрыта менеджером. Разговор состоялся {duration_minutes} минут."
+                            else:
+                                duration_message = " Заявка была закрыта менеджером."
+                        else:
+                            duration_message = " Заявка была закрыта менеджером."
+                        
+                        # Закрываем беседу через toggle_status
+                        await chatwoot_client.toggle_conversation_status(
                             conversation_id=consultation.cons_id,
-                            status="resolved"  # Chatwoot использует "resolved" для закрытых бесед
+                            status="resolved"
                         )
-                        logger.info(f"Automatically closed consultation {consultation.cons_id} in Chatwoot (closed in 1C:ЦЛ)")
+                        
+                        # Отправляем сообщение о закрытии
+                        if duration_message:
+                            await chatwoot_client.send_message(
+                                conversation_id=consultation.cons_id,
+                                content=duration_message.strip(),
+                                message_type="outgoing"
+                            )
+                        
+                        logger.info(f"Automatically closed consultation {consultation.cons_id} in Chatwoot (closed in 1C:ЦЛ) with message")
                     # Если статус "open" (КонсультацияИТС с пустым Конец) - открываем в Chatwoot
                     elif status == "open" and old_status != "open":
                         await chatwoot_client.update_conversation(
@@ -413,6 +435,13 @@ async def process_consultation_item(
                             status="open"  # Открываем заявку в Chatwoot
                         )
                         logger.info(f"Automatically opened consultation {consultation.cons_id} in Chatwoot (opened in 1C:ЦЛ)")
+                    # Если статус "pending" - устанавливаем pending в Chatwoot
+                    elif status == "pending" and old_status != "pending":
+                        await chatwoot_client.update_conversation(
+                            conversation_id=consultation.cons_id,
+                            status="pending"  # Устанавливаем статус pending в Chatwoot
+                        )
+                        logger.info(f"Automatically set pending status for consultation {consultation.cons_id} in Chatwoot")
                 except Exception as sync_error:
                     logger.warning(f"Failed to sync consultation status {consultation.cons_id} in Chatwoot: {sync_error}")
         
@@ -422,32 +451,43 @@ async def process_consultation_item(
                 chatwoot_client = ChatwootClient()
                 custom_attrs_to_update = {}
                 
-                # Номер консультации
+                # Номер консультации (используем правильный ключ number_con)
                 if consultation.number:
-                    custom_attrs_to_update["consultation_number"] = consultation.number
+                    custom_attrs_to_update["number_con"] = str(consultation.number)
                 
                 # Дата консультации
                 if consultation.start_date:
-                    custom_attrs_to_update["date_con"] = consultation.start_date.isoformat()
+                    # Форматируем дату в ISO формат без timezone для Chatwoot
+                    dt = consultation.start_date
+                    if dt.tzinfo:
+                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    custom_attrs_to_update["date_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
                 
-                # Дата окончания
+                # Дата окончания (con_end из etl_cons_cl)
                 if consultation.end_date:
-                    custom_attrs_to_update["con_end"] = consultation.end_date.isoformat()
+                    dt = consultation.end_date
+                    if dt.tzinfo:
+                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    custom_attrs_to_update["con_end"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
                 
-                # Перенос (дата)
+                # Перенос (дата) - redate_con из etl_redate_cl
                 if consultation.redate:
-                    custom_attrs_to_update["redate_con"] = consultation.redate.isoformat()
+                    dt = consultation.redate
+                    if dt.tzinfo:
+                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    custom_attrs_to_update["redate_con"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
                 
-                # Перенос (время)
+                # Перенос (время) - retime_con из etl_redate_cl
                 if consultation.redate_time:
                     custom_attrs_to_update["retime_con"] = consultation.redate_time.strftime("%H:%M")
                 
-                # Закрыто без консультации
-                custom_attrs_to_update["closed_without_con"] = consultation.denied
+                # Закрыто без консультации - closed_without_con из etl_cons_cl
+                if consultation.denied is not None:
+                    custom_attrs_to_update["closed_without_con"] = bool(consultation.denied)
                 
                 # Обновляем только если есть изменения
                 if custom_attrs_to_update:
-                    await chatwoot_client.update_conversation(
+                    await chatwoot_client.update_conversation_custom_attributes(
                         conversation_id=consultation.cons_id,
                         custom_attributes=custom_attrs_to_update
                     )
