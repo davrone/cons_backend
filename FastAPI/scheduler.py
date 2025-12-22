@@ -15,16 +15,36 @@ scheduler = AsyncIOScheduler()
 # Блокировки для предотвращения параллельных запусков
 running_tasks = set()
 
+def get_etl_interval(env_var: str, default: int) -> int:
+    """
+    Получить интервал ETL из переменной окружения с обработкой пустых значений.
+    
+    Args:
+        env_var: Имя переменной окружения
+        default: Значение по умолчанию
+    
+    Returns:
+        Интервал в минутах (int)
+    """
+    value = os.getenv(env_var)
+    if not value or value.strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"Invalid value for {env_var}: '{value}', using default {default}")
+        return default
+
 # Переменные окружения для частоты запуска ETL процессов (в минутах)
 # Значения по умолчанию для обратной совместимости
-ETL_CLIENTS_INTERVAL = int(os.getenv("ETL_CLIENTS_INTERVAL", "1"))
-ETL_CONS_INCREMENTAL_INTERVAL = int(os.getenv("ETL_CONS_INCREMENTAL_INTERVAL", "5"))
-ETL_CONS_OPEN_UPDATE_INTERVAL = int(os.getenv("ETL_CONS_OPEN_UPDATE_INTERVAL", "30"))
-ETL_CONS_REDATE_INTERVAL = int(os.getenv("ETL_CONS_REDATE_INTERVAL", "1"))
-ETL_CONS_RATES_INTERVAL = int(os.getenv("ETL_CONS_RATES_INTERVAL", "1"))
-ETL_CALLS_INTERVAL = int(os.getenv("ETL_CALLS_INTERVAL", "1"))
-ETL_QUEUE_CLOSING_INTERVAL = int(os.getenv("ETL_QUEUE_CLOSING_INTERVAL", "1"))
-ETL_USERS_INTERVAL = int(os.getenv("ETL_USERS_INTERVAL", "60"))  # По умолчанию каждый час
+ETL_CLIENTS_INTERVAL = get_etl_interval("ETL_CLIENTS_INTERVAL", 1)
+ETL_CONS_INCREMENTAL_INTERVAL = get_etl_interval("ETL_CONS_INCREMENTAL_INTERVAL", 5)
+ETL_CONS_OPEN_UPDATE_INTERVAL = get_etl_interval("ETL_CONS_OPEN_UPDATE_INTERVAL", 30)
+ETL_CONS_REDATE_INTERVAL = get_etl_interval("ETL_CONS_REDATE_INTERVAL", 1)
+ETL_CONS_RATES_INTERVAL = get_etl_interval("ETL_CONS_RATES_INTERVAL", 1)
+ETL_CALLS_INTERVAL = get_etl_interval("ETL_CALLS_INTERVAL", 1)
+ETL_QUEUE_CLOSING_INTERVAL = get_etl_interval("ETL_QUEUE_CLOSING_INTERVAL", 1)
+ETL_USERS_INTERVAL = get_etl_interval("ETL_USERS_INTERVAL", 60)  # По умолчанию каждый час
 
 # ВАЖНО: Если интервал = 0, ETL процесс отключается
 
