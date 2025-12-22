@@ -103,18 +103,54 @@ def normalize_uuid(uuid_str: Optional[str]) -> Optional[str]:
     return uuid_str
 
 
-async def _get_default_manager_key(db: AsyncSession) -> Optional[str]:
+async def _get_default_manager_key(
+    db: AsyncSession, 
+    consultation_type: Optional[str] = None
+) -> Optional[str]:
     """
-    Получает cl_ref_key первого активного менеджера из БД для использования по умолчанию.
+    Получает cl_ref_key первого доступного менеджера из БД для использования по умолчанию.
+    
+    ВАЖНО: Использует ту же логику фильтрации, что и ManagerSelector:
+    - Только менеджеры с лимитами (con_limit > 0)
+    - Только менеджеры с разрешением на консультации (consultation_enabled = True)
+    - Для консультаций по ведению учета: только отдел "ИТС консультанты" с установленными часами работы
+    
+    Args:
+        db: Сессия БД
+        consultation_type: Тип консультации ("Консультация по ведению учёта" или "Техническая поддержка")
+    
+    Returns:
+        cl_ref_key менеджера или None если нет доступных менеджеров
     """
-    result = await db.execute(
-        select(User.cl_ref_key)
-        .where(User.cl_ref_key.isnot(None))
-        .where(User.cl_ref_key != "")
-        .where(User.deletion_mark == False)
-        .limit(1)
+    query = select(User.cl_ref_key).where(
+        User.cl_ref_key.isnot(None),
+        User.cl_ref_key != "",
+        User.deletion_mark == False,
+        User.invalid == False,
+        User.consultation_enabled == True,  # Только менеджеры с разрешением на консультации
+        User.con_limit.isnot(None),
+        User.con_limit > 0,  # Только менеджеры с установленными лимитами
     )
+    
+    # ВАЖНО: Для "Консультация по ведению учёта" применяем дополнительные фильтры:
+    # - department = "ИТС консультанты"
+    # - start_hour и end_hour обязательны (должно быть установлено рабочее время)
+    if consultation_type == "Консультация по ведению учёта":
+        query = query.where(
+            User.department == "ИТС консультанты",
+            User.start_hour.isnot(None),  # Обязательно должно быть установлено рабочее время начала
+            User.end_hour.isnot(None),    # Обязательно должно быть установлено рабочее время окончания
+        )
+    
+    result = await db.execute(query.limit(1))
     manager = result.scalar_one_or_none()
+    
+    if not manager:
+        logger.warning(
+            f"No default manager found with required criteria "
+            f"(consultation_type={consultation_type})"
+        )
+    
     return manager
 
 
@@ -1167,7 +1203,7 @@ async def create_consultation(
         # Если менеджер не выбран автоматически, используем дефолтного
         # ВАЖНО: Для "Техническая поддержка" менеджер не назначается автоматически
         if not selected_manager_key and consultation_type == "Консультация по ведению учёта":
-            selected_manager_key = await _get_default_manager_key(db)
+            selected_manager_key = await _get_default_manager_key(db, consultation_type=consultation_type)
         
         # ВАЖНО: Корректируем scheduled_at на ближайшее рабочее время после выбора менеджера
         if payload.consultation.scheduled_at:
@@ -1878,6 +1914,18 @@ async def create_consultation(
                     inbox_id=settings.CHATWOOT_INBOX_ID
                 )
                 chatwoot_source_id = conversation_source_id_from_response if conversation_source_id_from_response else contact_source_id
+                
+                # Обновляем assignee и team через Application API после создания через Public API
+                if assignee_id or team_id:
+                    try:
+                        await chatwoot_client.update_conversation(
+                            conversation_id=chatwoot_cons_id,
+                            assignee_id=assignee_id,
+                            team_id=team_id
+                        )
+                        logger.info(f"✓ Updated conversation {chatwoot_cons_id} with assignee/team via Application API (after Public API creation)")
+                    except Exception as update_error:
+                        logger.warning(f"Failed to update assignee/team after Public API creation: {update_error}")
             
             # ВАЖНО: pubsub_token НЕ возвращается в ответе создания conversation
             # pubsub_token возвращается ТОЛЬКО в ответе POST создания contact через Public API
@@ -2087,7 +2135,7 @@ async def create_consultation(
                     manager_key = None  # Не назначаем менеджера для технической поддержки
                     logger.info("Техническая поддержка: менеджер не назначается, будет назначен через Chatwoot")
                 else:
-                    manager_key = selected_manager_key or await _get_default_manager_key(db)
+                    manager_key = selected_manager_key or await _get_default_manager_key(db, consultation_type=consultation_type)
                     if not manager_key:
                         logger.warning("No manager found, consultation will be created without manager_key")
                 
@@ -2556,16 +2604,19 @@ async def create_redate(
 
     clients_key = consultation.client_key or (str(consultation.client_id) if consultation.client_id else consultation.cl_ref_key)
     
+    # Получаем тип консультации для правильной фильтрации менеджеров
+    consultation_type = consultation.consultation_type
+    
     # Получаем менеджера - используем из payload, consultation или дефолтного из БД
     manager_key = payload.manager_key or consultation.manager
     if not manager_key:
-        # Получаем менеджера по умолчанию из БД
-        manager_key = await _get_default_manager_key(db)
+        # Получаем менеджера по умолчанию из БД с учетом типа консультации
+        manager_key = await _get_default_manager_key(db, consultation_type=consultation_type)
     
     # Валидация: manager_key должен быть валидным GUID, не "FRONT" или пустой строкой
     if not manager_key or manager_key == "FRONT" or len(manager_key) != 36 or manager_key.count("-") != 4:
         logger.warning(f"Invalid manager_key '{manager_key}' for consultation {cons_id}, using default manager")
-        manager_key = await _get_default_manager_key(db)
+        manager_key = await _get_default_manager_key(db, consultation_type=consultation_type)
         if not manager_key:
             raise HTTPException(
                 status_code=400,
@@ -2734,8 +2785,9 @@ async def submit_ratings(
             # Валидация manager_key - должен быть валидным GUID
             answer_manager_key = answer.manager_key or consultation.manager
             if not answer_manager_key or answer_manager_key == "FRONT" or len(answer_manager_key) != 36 or answer_manager_key.count("-") != 4:
-                # Получаем менеджера по умолчанию из БД
-                answer_manager_key = await _get_default_manager_key(db)
+                # Получаем менеджера по умолчанию из БД с учетом типа консультации
+                consultation_type = consultation.consultation_type
+                answer_manager_key = await _get_default_manager_key(db, consultation_type=consultation_type)
                 if not answer_manager_key:
                     logger.warning(f"Invalid manager_key for rating question {answer.question_number}, skipping 1C sync")
                     continue

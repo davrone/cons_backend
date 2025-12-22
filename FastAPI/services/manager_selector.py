@@ -64,54 +64,88 @@ class ManagerSelector:
         
         # ВАЖНО: Для "Консультация по ведению учёта" применяем дополнительные фильтры:
         # - department = "ИТС консультанты"
-        # - start_hour is not null (обязательно должно быть установлено рабочее время)
+        # - start_hour и end_hour обязательны (должно быть установлено рабочее время)
         if consultation_type == "Консультация по ведению учёта":
             query = query.where(
                 User.department == "ИТС консультанты",
-                User.start_hour.isnot(None),  # Обязательно должно быть установлено рабочее время
+                User.start_hour.isnot(None),  # Обязательно должно быть установлено рабочее время начала
+                User.end_hour.isnot(None),    # Обязательно должно быть установлено рабочее время окончания
             )
         
         # Фильтр по времени работы
         current_time_only = current_time.time()
-        time_conditions = []
         
-        # Если start_hour и end_hour установлены, проверяем время работы
-        # Если не установлены, считаем что менеджер работает всегда
-        # ВАЖНО: Для "Консультация по ведению учёта" start_hour уже проверен выше (is not null)
-        query = query.where(
-            or_(
-                # Менеджер работает всегда (start_hour и end_hour не установлены)
-                # НО: для "Консультация по ведению учёта" это условие не применяется (start_hour обязателен)
-                and_(
-                    User.start_hour.is_(None),
-                    User.end_hour.is_(None)
-                ),
-                # Или текущее время в пределах рабочего времени
-                and_(
-                    User.start_hour.isnot(None),
-                    User.end_hour.isnot(None),
-                    User.start_hour <= current_time_only,
-                    User.end_hour >= current_time_only,
-                ),
-                # Или рабочее время переходит через полночь (start_hour > end_hour)
-                and_(
-                    User.start_hour.isnot(None),
-                    User.end_hour.isnot(None),
-                    User.start_hour > User.end_hour,
-                    or_(
-                        current_time_only >= User.start_hour,
-                        current_time_only <= User.end_hour,
+        # ВАЖНО: Для "Консультация по ведению учёта" start_hour и end_hour уже проверены выше (is not null)
+        # Поэтому для них проверяем только соответствие текущего времени рабочему времени
+        if consultation_type == "Консультация по ведению учёта":
+            # Для консультаций по ведению учета проверяем только рабочее время
+            # (start_hour и end_hour уже гарантированно не null)
+            query = query.where(
+                or_(
+                    # Текущее время в пределах рабочего времени (обычный случай: start_hour < end_hour)
+                    and_(
+                        User.start_hour <= User.end_hour,  # Обычный рабочий день
+                        User.start_hour <= current_time_only,
+                        User.end_hour >= current_time_only,
+                    ),
+                    # Рабочее время переходит через полночь (start_hour > end_hour)
+                    and_(
+                        User.start_hour > User.end_hour,  # Работа через полночь
+                        or_(
+                            current_time_only >= User.start_hour,  # После начала работы (вечер)
+                            current_time_only <= User.end_hour,    # До окончания работы (утро)
+                        )
                     )
                 )
             )
-        )
+        else:
+            # Для других типов консультаций: если время не установлено, считаем что менеджер работает всегда
+            query = query.where(
+                or_(
+                    # Менеджер работает всегда (start_hour и end_hour не установлены)
+                    and_(
+                        User.start_hour.is_(None),
+                        User.end_hour.is_(None)
+                    ),
+                    # Или текущее время в пределах рабочего времени
+                    and_(
+                        User.start_hour.isnot(None),
+                        User.end_hour.isnot(None),
+                        User.start_hour <= User.end_hour,  # Обычный рабочий день
+                        User.start_hour <= current_time_only,
+                        User.end_hour >= current_time_only,
+                    ),
+                    # Или рабочее время переходит через полночь (start_hour > end_hour)
+                    and_(
+                        User.start_hour.isnot(None),
+                        User.end_hour.isnot(None),
+                        User.start_hour > User.end_hour,  # Работа через полночь
+                        or_(
+                            current_time_only >= User.start_hour,  # После начала работы (вечер)
+                            current_time_only <= User.end_hour,   # До окончания работы (утро)
+                        )
+                    )
+                )
+            )
         
         managers = await self.db.execute(query)
         all_managers = managers.scalars().all()
         
         if not all_managers:
-            logger.warning("No available managers found (with limits and working hours)")
+            logger.warning(
+                f"No available managers found (with limits and working hours). "
+                f"consultation_type={consultation_type}, current_time={current_time}. "
+                f"Filters: deletion_mark=False, invalid=False, consultation_enabled=True, "
+                f"con_limit > 0"
+                + (f", department='ИТС консультанты', start_hour IS NOT NULL, end_hour IS NOT NULL" 
+                   if consultation_type == "Консультация по ведению учёта" else "")
+            )
             return []
+        
+        logger.debug(
+            f"Found {len(all_managers)} managers after initial filtering "
+            f"(consultation_type={consultation_type})"
+        )
         
         # Фильтруем менеджеров с закрытой очередью на текущую дату
         # Проверяем закрытие очереди по дате (period) - если есть запись с period = текущая дата
@@ -311,9 +345,19 @@ class ManagerSelector:
             consultation_id = consultation.cons_id if consultation else "N/A (not created yet)"
             logger.warning(
                 f"No available managers for consultation {consultation_id}. "
-                f"po_section_key={po_section_key}, category_key={category_key}"
+                f"consultation_type={consultation_type}, "
+                f"po_section_key={po_section_key}, category_key={category_key}, "
+                f"current_time={current_time}. "
+                f"Check: managers must have con_limit > 0, consultation_enabled=True, "
+                f"and for 'Консультация по ведению учёта' also department='ИТС консультанты' "
+                f"and start_hour/end_hour must be set."
             )
             return None
+        
+        logger.info(
+            f"Found {len(available_managers)} available managers for consultation_type={consultation_type}, "
+            f"category_key={category_key}"
+        )
         
         # Считаем очередь для каждого менеджера
         manager_loads = []

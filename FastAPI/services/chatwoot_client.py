@@ -894,6 +894,32 @@ class ChatwootClient:
         except Exception as e:
             logger.warning(f"Failed to find team '{team_name}' in Chatwoot: {e}")
             return None
+    
+    async def get_team_members(self, team_id: int) -> List[Dict[str, Any]]:
+        """
+        Получить список участников команды в Chatwoot.
+        
+        Args:
+            team_id: ID команды
+            
+        Returns:
+            Список участников команды с полями id, email, name и т.д.
+        """
+        endpoint = f"/api/v1/accounts/{self.account_id}/teams/{team_id}/team_members"
+        try:
+            response = await self._request("GET", endpoint)
+            # response может быть списком или словарем с ключом "payload"
+            if isinstance(response, list):
+                return response
+            elif isinstance(response, dict):
+                if "payload" in response:
+                    return response["payload"] if isinstance(response["payload"], list) else []
+                elif "value" in response:
+                    return response["value"] if isinstance(response["value"], list) else []
+            return []
+        except Exception as e:
+            logger.warning(f"Failed to get team members for team {team_id}: {e}")
+            return []
         
         # Labels - метки беседы (используем для language и source)
         # ВАЖНО: Согласно ТЗ, labels лучше добавлять отдельным запросом после создания
@@ -1078,6 +1104,9 @@ class ChatwootClient:
         """
         Обновление консультации в Chatwoot через Application API.
         
+        ВАЖНО: Для назначения команды и агента использует PUT метод, как указано в документации Chatwoot.
+        Для других полей использует PATCH.
+        
         Args:
             conversation_id: ID консультации
             status: Статус консультации
@@ -1085,13 +1114,36 @@ class ChatwootClient:
             team_id: ID команды
             custom_attributes: Кастомные атрибуты для обновления
         """
+        # ВАЖНО: Для назначения команды и агента используем PUT метод
+        # Согласно документации Chatwoot: PUT /api/v1/accounts/{account_id}/conversations/{conversation_id}
+        # с полями assignee_id и team_id
+        if assignee_id is not None or team_id is not None:
+            payload = {}
+            if assignee_id is not None:  # Разрешаем 0 для снятия назначения
+                payload["assignee_id"] = assignee_id
+            if team_id is not None:
+                payload["team_id"] = team_id
+            
+            # Также добавляем другие поля если они указаны
+            if status:
+                payload["status"] = status
+            if custom_attributes:
+                # Применяем ту же очистку, что и при создании
+                cleaned_custom_attrs = self._clean_custom_attributes(custom_attributes)
+                if cleaned_custom_attrs:
+                    payload["custom_attributes"] = cleaned_custom_attrs
+            
+            logger.info(f"Updating conversation {conversation_id} with PUT (assignee_id={assignee_id}, team_id={team_id})")
+            return await self._request(
+                "PUT",
+                f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}",
+                data=payload
+            )
+        
+        # Для обновления только status или custom_attributes без assignee/team используем PATCH
         payload = {}
         if status:
             payload["status"] = status
-        if assignee_id is not None:  # Разрешаем 0 для снятия назначения
-            payload["assignee_id"] = assignee_id
-        if team_id is not None:
-            payload["team_id"] = team_id
         if custom_attributes:
             # Применяем ту же очистку, что и при создании
             cleaned_custom_attrs = self._clean_custom_attributes(custom_attributes)
@@ -1102,6 +1154,7 @@ class ChatwootClient:
             logger.warning(f"No fields to update for conversation {conversation_id}")
             return {}
         
+        logger.info(f"Updating conversation {conversation_id} with PATCH (status={status}, custom_attributes={bool(custom_attributes)})")
         return await self._request(
             "PATCH",
             f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}",
