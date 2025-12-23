@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..models import (
-    User, UserSkill, Consultation, QAndA, UserMapping, QueueClosing
+    User, UserSkill, Consultation, QAndA, UserMapping, QueueClosing, OnlineQuestionCat
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class ManagerSelector:
         category_key: Optional[str] = None,
         consultation_type: Optional[str] = None,
         filter_by_working_hours: bool = True,
+        language: Optional[str] = None,
     ) -> List[User]:
         """
         Получить список доступных менеджеров.
@@ -46,7 +47,8 @@ class ManagerSelector:
             po_type_key: Ключ типа ПО из консультации
             category_key: Ключ категории вопроса (из online_question_cat)
             consultation_type: Тип консультации ("Консультация по ведению учёта" или "Техническая поддержка")
-            current_time: Текущее время для проверки рабочего времени
+            filter_by_working_hours: Фильтровать по рабочему времени
+            language: Язык консультации ("ru" или "uz")
         
         Returns:
             Список доступных менеджеров, отсортированный по приоритету
@@ -186,6 +188,19 @@ class ManagerSelector:
             skilled_managers = []
             universal_managers = []
             
+            # Для "Консультация по ведению учёта" получаем информацию о категории вопроса
+            category_language = None
+            if consultation_type == "Консультация по ведению учёта" and category_key:
+                category_query = select(OnlineQuestionCat.language).where(
+                    OnlineQuestionCat.ref_key == category_key
+                )
+                category_result = await self.db.execute(category_query)
+                category_language = category_result.scalar_one_or_none()
+                logger.debug(
+                    f"Category {category_key} has language: {category_language}, "
+                    f"consultation language: {language}"
+                )
+            
             for manager in available_managers:
                 # Проверяем навыки менеджера
                 skills_query = select(UserSkill).where(
@@ -198,27 +213,73 @@ class ManagerSelector:
                 manager_category_keys = {skill.category_key for skill in manager_skills}
                 
                 # Если у менеджера нет навыков, считаем его универсальным
-                # (знает все разделы)
+                # (знает все разделы) - но только если это не "Консультация по ведению учёта"
                 if not manager_category_keys:
+                    if consultation_type == "Консультация по ведению учёта":
+                        # Для консультаций по ведению учета требуются точные навыки
+                        continue
                     universal_managers.append(manager)
                     continue
                 
-                # Проверяем, знает ли менеджер нужную категорию
-                # category_key из users_skill соответствует КатегорияВопроса_Key
-                # Если указан category_key, проверяем его
-                if category_key and category_key in manager_category_keys:
+                # Для "Консультация по ведению учёта" применяем строгую проверку:
+                # 1. Точное совпадение category_key
+                # 2. Соответствие языка менеджера языку категории вопроса
+                if consultation_type == "Консультация по ведению учёта" and category_key:
+                    # Проверяем точное совпадение категории
+                    if category_key not in manager_category_keys:
+                        continue
+                    
+                    # Проверяем соответствие языка
+                    # Если указан язык консультации, проверяем его
+                    if language:
+                        # Проверяем, что менеджер знает нужный язык
+                        if language.lower() == "ru" and not manager.ru:
+                            logger.debug(
+                                f"Manager {manager.cl_ref_key} doesn't know Russian, skipping"
+                            )
+                            continue
+                        if language.lower() == "uz" and not manager.uz:
+                            logger.debug(
+                                f"Manager {manager.cl_ref_key} doesn't know Uzbek, skipping"
+                            )
+                            continue
+                    
+                    # Если есть информация о языке категории, проверяем соответствие
+                    if category_language:
+                        # Проверяем, что менеджер знает язык категории
+                        if category_language.lower() == "ru" and not manager.ru:
+                            logger.debug(
+                                f"Manager {manager.cl_ref_key} doesn't know Russian "
+                                f"(required by category language), skipping"
+                            )
+                            continue
+                        if category_language.lower() == "uz" and not manager.uz:
+                            logger.debug(
+                                f"Manager {manager.cl_ref_key} doesn't know Uzbek "
+                                f"(required by category language), skipping"
+                            )
+                            continue
+                    
+                    # Все проверки пройдены - менеджер подходит
                     skilled_managers.append(manager)
-                # Если category_key не указан, но указан po_section_key,
-                # то пока считаем менеджера подходящим (в будущем можно добавить
-                # прямую связь между po_section_key и category_key)
-                elif not category_key and po_section_key:
-                    # Пока считаем всех менеджеров с навыками подходящими
-                    # TODO: добавить маппинг po_section_key -> category_key если нужно
-                    skilled_managers.append(manager)
-                # Если указан только po_section_key без category_key,
-                # и у менеджера есть навыки, считаем его подходящим
-                elif po_section_key and not category_key:
-                    skilled_managers.append(manager)
+                else:
+                    # Для других типов консультаций используем старую логику
+                    # Проверяем, знает ли менеджер нужную категорию
+                    # category_key из users_skill соответствует КатегорияВопроса_Key
+                    # Если указан category_key, проверяем его
+                    if category_key and category_key in manager_category_keys:
+                        skilled_managers.append(manager)
+                    # Если category_key не указан, но указан po_section_key,
+                    # то пока считаем менеджера подходящим (в будущем можно добавить
+                    # прямую связь между po_section_key и category_key)
+                    elif not category_key and po_section_key:
+                        # Пока считаем всех менеджеров с навыками подходящими
+                        # TODO: добавить маппинг po_section_key -> category_key если нужно
+                        skilled_managers.append(manager)
+                    # Если указан только po_section_key без category_key,
+                    # и у менеджера есть навыки, считаем его подходящим
+                    elif po_section_key and not category_key:
+                        skilled_managers.append(manager)
             
             # Возвращаем сначала менеджеров с навыками, потом универсальных
             return skilled_managers + universal_managers
@@ -312,6 +373,7 @@ class ManagerSelector:
         category_key: Optional[str] = None,
         current_time: Optional[datetime] = None,
         consultation_type: Optional[str] = None,
+        language: Optional[str] = None,
     ) -> Optional[str]:
         """
         Выбрать менеджера для консультации.
@@ -328,6 +390,7 @@ class ManagerSelector:
             category_key: Ключ категории вопроса
             current_time: Текущее время
             consultation_type: Тип консультации ("Консультация по ведению учёта" или "Техническая поддержка")
+            language: Язык консультации ("ru" или "uz")
         
         Returns:
             cl_ref_key выбранного менеджера или None
@@ -342,6 +405,7 @@ class ManagerSelector:
             po_type_key=po_type_key,
             category_key=category_key,
             consultation_type=consultation_type,
+            language=language,
         )
         
         if not available_managers:
@@ -350,16 +414,16 @@ class ManagerSelector:
                 f"No available managers for consultation {consultation_id}. "
                 f"consultation_type={consultation_type}, "
                 f"po_section_key={po_section_key}, category_key={category_key}, "
-                f"current_time={current_time}. "
+                f"language={language}, current_time={current_time}. "
                 f"Check: managers must have con_limit > 0, consultation_enabled=True, "
-                f"and for 'Консультация по ведению учёта' also department='ИТС консультанты' "
-                f"and start_hour/end_hour must be set."
+                f"and for 'Консультация по ведению учёта' also department='ИТС консультанты', "
+                f"start_hour/end_hour must be set, and must have matching skills and language."
             )
             return None
         
         logger.info(
             f"Found {len(available_managers)} available managers for consultation_type={consultation_type}, "
-            f"category_key={category_key}"
+            f"category_key={category_key}, language={language}"
         )
         
         # Считаем очередь для каждого менеджера

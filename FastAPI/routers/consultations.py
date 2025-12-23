@@ -1179,11 +1179,15 @@ async def create_consultation(
             category_key = normalize_uuid(payload.consultation.online_question_cat)
             
             try:
+                # Получаем язык консультации для проверки соответствия языка менеджера
+                consultation_language = payload.consultation.lang
+                
                 selected_manager_key = await manager_selector.select_manager_for_consultation(
                     consultation=None,  # Консультация еще не создана
                     category_key=category_key,
                     current_time=datetime.now(timezone.utc),
                     consultation_type=consultation_type,  # Передаем тип консультации для фильтрации
+                    language=consultation_language,  # Передаем язык для проверки соответствия
                 )
                 
                 if selected_manager_key:
