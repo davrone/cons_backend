@@ -560,7 +560,12 @@ class TelegramBotService:
             )
     
     async def send_message_to_telegram(self, telegram_user_id: int, message_text: str):
-        """Отправка сообщения пользователю в Telegram"""
+        """
+        Отправка сообщения пользователю в Telegram.
+        
+        ВАЖНО: Обрабатывает ошибку "Chat not found" как нормальную ситуацию
+        (пользователь заблокировал бота или удалил чат), не прерывает выполнение.
+        """
         print(f"[TELEGRAM BOT] send_message_to_telegram called: user_id={telegram_user_id}, message_length={len(message_text)}")
         
         if not self.bot:
@@ -577,9 +582,23 @@ class TelegramBotService:
             print(f"[TELEGRAM BOT] Message sent successfully: message_id={result.message_id if result else 'N/A'}")
             logger.info(f"Message sent to Telegram user {telegram_user_id}, message_id={result.message_id if result else 'N/A'}")
         except Exception as e:
+            error_message = str(e)
+            
+            # Обработка ошибки "Chat not found" - чат недоступен (пользователь заблокировал бота, удалил чат и т.д.)
+            if "Chat not found" in error_message or "chat not found" in error_message.lower():
+                logger.warning(
+                    f"Chat not found for Telegram user {telegram_user_id}. "
+                    f"User may have blocked the bot or deleted the chat. "
+                    f"Skipping message send."
+                )
+                print(f"[TELEGRAM BOT] WARNING: Chat not found for user {telegram_user_id}, skipping message")
+                # Не пробрасываем ошибку - это нормальная ситуация, когда пользователь заблокировал бота
+                return
+            
+            # Для других ошибок логируем и пробрасываем
             print(f"[TELEGRAM BOT] ERROR sending message: {e}")
             logger.error(f"Error sending message to Telegram: {e}", exc_info=True)
-            raise  # Пробрасываем ошибку, чтобы увидеть её в webhook
+            raise  # Пробрасываем ошибку для других случаев
     
     async def send_media_to_telegram(
         self, 

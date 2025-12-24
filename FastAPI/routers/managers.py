@@ -207,7 +207,11 @@ async def get_consultation_queue_info(
     manager_selector = ManagerSelector(db)
     
     try:
-        wait_info = await manager_selector.calculate_wait_time(consultation.manager)
+        # Передаем cons_id для расчета позиции именно этой консультации в очереди
+        wait_info = await manager_selector.calculate_wait_time(
+            consultation.manager,
+            cons_id=cons_id  # Передаем ID консультации для получения её реальной позиции
+        )
         wait_info["manager_key"] = consultation.manager
         return wait_info
     except Exception as e:

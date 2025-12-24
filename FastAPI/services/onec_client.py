@@ -598,8 +598,44 @@ class OneCClient:
         params = {
             "$format": "json",
             "$top": "1",
-            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus",
+            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
             "$filter": f"ИНН eq '{filter_value}'",
+        }
+        response = await self._odata_request("GET", f"/{self.clients_entity}", params=params)
+        rows = response.get("value", []) if isinstance(response, dict) else []
+        return rows[0] if rows else None
+
+    async def find_client_by_code_and_inn(
+        self, 
+        code_abonent: Optional[str], 
+        org_inn: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Поиск клиента (Catalog_Контрагенты) по коду абонента и ИНН.
+        
+        Возвращает клиента, если найден по обоим параметрам.
+        Если code_abonent не указан, ищет только по ИНН.
+        
+        Returns:
+            Dict с данными клиента, включая Parent_Key, или None если не найден
+        """
+        if not org_inn:
+            return None
+        
+        filter_value_inn = org_inn.replace("'", "''")
+        
+        # Формируем фильтр
+        if code_abonent:
+            filter_value_code = code_abonent.replace("'", "''")
+            filter_str = f"ИНН eq '{filter_value_inn}' and КодАбонентаClobus eq '{filter_value_code}'"
+        else:
+            filter_str = f"ИНН eq '{filter_value_inn}'"
+        
+        params = {
+            "$format": "json",
+            "$top": "1",
+            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
+            "$filter": filter_str,
         }
         response = await self._odata_request("GET", f"/{self.clients_entity}", params=params)
         rows = response.get("value", []) if isinstance(response, dict) else []

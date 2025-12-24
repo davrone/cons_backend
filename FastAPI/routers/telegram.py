@@ -521,9 +521,22 @@ async def chatwoot_webhook_for_telegram(
                         print(f"[TELEGRAM WEBHOOK] Successfully sent message to Telegram user {telegram_user.telegram_user_id}")
                         logger.info(f"Successfully sent message from Chatwoot to Telegram user {telegram_user.telegram_user_id}")
                     except Exception as send_error:
-                        print(f"[TELEGRAM WEBHOOK] ERROR sending to Telegram: {send_error}")
-                        logger.error(f"Error sending message to Telegram: {send_error}", exc_info=True)
-                        raise
+                        error_message = str(send_error)
+                        
+                        # Обработка ошибки "Chat not found" - не прерываем обработку webhook
+                        if "Chat not found" in error_message or "chat not found" in error_message.lower():
+                            print(f"[TELEGRAM WEBHOOK] WARNING: Chat not found for user {telegram_user.telegram_user_id}, skipping message")
+                            logger.warning(
+                                f"Chat not found for Telegram user {telegram_user.telegram_user_id}. "
+                                f"User may have blocked the bot or deleted the chat. "
+                                f"Webhook processing continues."
+                            )
+                            # Не пробрасываем ошибку - продолжаем обработку webhook
+                        else:
+                            # Для других ошибок логируем и пробрасываем
+                            print(f"[TELEGRAM WEBHOOK] ERROR sending to Telegram: {send_error}")
+                            logger.error(f"Error sending message to Telegram: {send_error}", exc_info=True)
+                            raise
             else:
                 logger.info(f"Skipping message from client: message_type={message_type}, original_sender_type={original_sender_type}, sender_type_lower={sender_type_lower}")
         else:

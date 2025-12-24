@@ -8,10 +8,44 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..services.chatwoot_client import ChatwootClient
 from ..services.manager_selector import ManagerSelector
-from ..models import Consultation, User
+from ..models import Consultation, User, UserMapping
 from ..utils.notification_helpers import check_and_log_notification
+from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
+
+
+def is_valid_chatwoot_conversation_id(cons_id: Optional[str]) -> bool:
+    """
+    Проверяет, является ли cons_id валидным числовым ID Chatwoot.
+    
+    Chatwoot использует числовые ID для conversations (например, 12345),
+    а не UUID. Если cons_id это UUID или временный ID (temp_, cl_), 
+    то это невалидный ID для запросов к Chatwoot.
+    
+    Args:
+        cons_id: ID консультации из БД
+        
+    Returns:
+        True если cons_id валидный числовой ID Chatwoot, False иначе
+    """
+    if not cons_id:
+        return False
+    
+    # Пропускаем временные ID
+    if cons_id.startswith(("temp_", "cl_")):
+        return False
+    
+    # Проверяем, что это числовой ID (не UUID)
+    # UUID имеет формат: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 символов с дефисами)
+    # Числовой ID: только цифры
+    if len(cons_id) > 10:  # UUID обычно длиннее 10 символов
+        # Проверяем, не UUID ли это (содержит дефисы)
+        if '-' in cons_id:
+            return False
+    
+    # Проверяем, что это число (или строка из цифр)
+    return cons_id.isdigit()
 
 
 async def send_manager_reassignment_notification(
@@ -31,8 +65,8 @@ async def send_manager_reassignment_notification(
         new_manager_key: Новый менеджер (cl_ref_key)
         reason: Причина переназначения (опционально)
     """
-    if not consultation.cons_id or consultation.cons_id.startswith("cl_"):
-        logger.debug(f"Skipping notification for consultation {consultation.cons_id} (no Chatwoot ID)")
+    if not is_valid_chatwoot_conversation_id(consultation.cons_id):
+        logger.debug(f"Skipping notification for consultation {consultation.cons_id} (invalid Chatwoot ID - UUID or temporary)")
         return
     
     chatwoot_client = ChatwootClient()
@@ -104,6 +138,68 @@ async def send_manager_reassignment_notification(
         )
         
         logger.info(f"Sent manager reassignment notification to Chatwoot for consultation {consultation.cons_id}")
+        
+        # ВАЖНО: Обновляем агента в conversation через Chatwoot API
+        # Это синхронизирует назначение менеджера в Chatwoot с данными из ЦЛ
+        if new_manager_key:
+            assignee_id = None
+            
+            # Сначала пытаемся найти маппинг через таблицу user_mapping
+            mapping_result = await db.execute(
+                select(UserMapping).where(UserMapping.cl_manager_key == new_manager_key).limit(1)
+            )
+            mapping = mapping_result.scalar_one_or_none()
+            if mapping:
+                assignee_id = mapping.chatwoot_user_id
+                logger.info(f"Mapped manager {new_manager_key} to Chatwoot user {assignee_id} via UserMapping")
+            else:
+                # Если маппинга нет, пробуем найти через таблицу users
+                user_result = await db.execute(
+                    select(User).where(
+                        User.cl_ref_key == new_manager_key,
+                        User.deletion_mark == False,
+                        User.invalid == False
+                    ).limit(1)
+                )
+                user = user_result.scalar_one_or_none()
+                if user and user.chatwoot_user_id:
+                    assignee_id = user.chatwoot_user_id
+                    logger.info(f"Found Chatwoot user {assignee_id} for manager {new_manager_key} via User table")
+            
+            # Обновляем агента в Chatwoot conversation через отдельный endpoint /assignments
+            # ВАЖНО: Используем assign_conversation_agent, а не update_conversation
+            # Это правильный способ назначения агента в Chatwoot
+            if assignee_id:
+                try:
+                    await chatwoot_client.assign_conversation_agent(
+                        conversation_id=consultation.cons_id,
+                        assignee_id=assignee_id
+                    )
+                    logger.info(f"Assigned agent {assignee_id} to conversation {consultation.cons_id} (manager {new_manager_key})")
+                except Exception as assign_error:
+                    logger.warning(
+                        f"Failed to assign agent to conversation in Chatwoot for consultation {consultation.cons_id}: {assign_error}",
+                        exc_info=True
+                    )
+            else:
+                logger.warning(
+                    f"Manager {new_manager_key} not found in Chatwoot (no mapping or chatwoot_user_id). "
+                    f"Conversation {consultation.cons_id} assignee not updated. "
+                    f"Please run sync_users_to_chatwoot.py to sync this user."
+                )
+        else:
+            # Если new_manager_key None, снимаем назначение агента
+            try:
+                await chatwoot_client.update_conversation(
+                    conversation_id=consultation.cons_id,
+                    assignee_id=None  # Снимаем назначение
+                )
+                logger.info(f"Removed assignee from conversation {consultation.cons_id} (manager was unassigned)")
+            except Exception as unassign_error:
+                logger.warning(
+                    f"Failed to remove conversation assignee in Chatwoot for consultation {consultation.cons_id}: {unassign_error}"
+                )
+                
     except Exception as e:
         logger.error(f"Failed to send manager reassignment notification: {e}", exc_info=True)
 
@@ -124,8 +220,8 @@ async def send_queue_update_notification(
         consultation: Консультация
         manager_key: Ключ менеджера (если не указан, берется из consultation.manager)
     """
-    if not consultation.cons_id or consultation.cons_id.startswith("cl_"):
-        logger.debug(f"Skipping queue notification for consultation {consultation.cons_id} (no Chatwoot ID)")
+    if not is_valid_chatwoot_conversation_id(consultation.cons_id):
+        logger.debug(f"Skipping queue notification for consultation {consultation.cons_id} (invalid Chatwoot ID - UUID or temporary)")
         return
     
     # ВАЖНО: Для "Техническая поддержка" не отправляем уведомления об очереди

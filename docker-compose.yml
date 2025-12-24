@@ -6,9 +6,9 @@ services:
     container_name: cons_api
     env_file: .env
     extra_hosts:
-      - "${BACKEND_DOMAIN}:10.130.10.17"
-      - "${SUPPORT_DOMAIN}:10.130.10.17"
-      - "${SITE_DOMAIN}:10.130.10.17"
+      - "${BACKEND_DOMAIN}:${HAPROXY_IP:-host-gateway}"
+      - "${SUPPORT_DOMAIN}:${HAPROXY_IP:-host-gateway}"
+      - "${SITE_DOMAIN}:${HAPROXY_IP:-host-gateway}"
     ports:
       - "7070:7070"
     restart: unless-stopped
@@ -17,7 +17,10 @@ services:
       - LOAD_DICTS_ON_START=${LOAD_DICTS_ON_START:-true}
       - SYNC_USERS_ON_START=${SYNC_USERS_ON_START:-true}
       - ENABLE_SCHEDULER=${ENABLE_SCHEDULER:-false}  # Отключаем scheduler в API контейнере, если запущен отдельный
-  
+      - TZ=Asia/Tashkent    
+    volumes:
+      - /etc/localtime:/etc/localtime:ro # Синхронизирует системное время
+      - /etc/timezone:/etc/timezone:ro   # Синхронизирует название зоны
   cons_scheduler:
     build:
       context: .
@@ -25,17 +28,21 @@ services:
     container_name: cons_scheduler
     env_file: .env
     extra_hosts:
-      - "${BACKEND_DOMAIN}:10.130.10.17"
-      - "${SUPPORT_DOMAIN}:10.130.10.17"
-      - "${SITE_DOMAIN}:10.130.10.17"
+      - "${BACKEND_DOMAIN}:${HAPROXY_IP:-host-gateway}"
+      - "${SUPPORT_DOMAIN}:${HAPROXY_IP:-host-gateway}"
+      - "${SITE_DOMAIN}:${HAPROXY_IP:-host-gateway}"
     restart: unless-stopped
     entrypoint: ["bash", "/app/scheduler_entrypoint.sh"]
     environment:
       - ETL_LOG_LEVEL=${ETL_LOG_LEVEL:-INFO}
       - ODATA_PAGE_SIZE=${ODATA_PAGE_SIZE:-1000}
-      - ETL_INITIAL_FROM_DATE=${ETL_INITIAL_FROM_DATE:-2025-01-01}
+      - ETL_INITIAL_FROM_DATE=${ETL_INITIAL_FROM_DATE:-2025-12-01}
       - LOAD_DICTS_ON_START=false  # Отключаем загрузку справочников в scheduler
       - SYNC_USERS_ON_START=false  # Отключаем синхронизацию пользователей в scheduler
+      - TZ=Asia/Tashkent    
+    volumes:
+      - /etc/localtime:/etc/localtime:ro # Синхронизирует системное время
+      - /etc/timezone:/etc/timezone:ro   # Синхронизирует название зоны
     # Логи scheduler будут видны отдельно
     logging:
       driver: "json-file"

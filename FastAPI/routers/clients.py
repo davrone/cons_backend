@@ -466,11 +466,15 @@ async def _sync_client_to_onec(
     Создает или обновляет клиента в 1C:ЦЛ при создании/обновлении в БД.
     
     Логика:
-    - Если у клиента есть cl_ref_key - обновляем существующего клиента в 1C
-    - Если cl_ref_key нет, но есть code_abonent - создаем нового клиента в 1C
-    - Если клиент найден по ИНН в 1C - обновляем его и сохраняем Ref_Key в БД
+    - Если у клиента есть cl_ref_key - проверяем Parent_Key в ЦЛ, если правильный - обновляем, если нет - создаем нового
+    - Если cl_ref_key нет - ищем клиента по коду абонента и ИНН
+    - Если найден - проверяем Parent_Key, если правильный - обновляем, если нет - создаем нового (дубль)
+    - Если не найден - создаем нового
     
-    ВАЖНО: В 1C:ЦЛ имя формируется с префиксом CLOBUS: CLOBUS + Наименование + КодАбонента + ИНН
+    ВАЖНО: 
+    - В 1C:ЦЛ имя формируется с префиксом CLOBUS: CLOBUS + Наименование + КодАбонента + ИНН
+    - Нужный Parent_Key: "7ccd31ca-887b-11eb-938b-00e04cd03b68"
+    - Если найденный клиент имеет другой Parent_Key, создаем дубль с нужным Parent_Key
     """
     from ..services.onec_client import OneCClient
     from ..routers.consultations import _build_client_display_name
@@ -485,94 +489,143 @@ async def _sync_client_to_onec(
         logger.warning(f"Cannot sync client {client.client_id} to 1C: missing org_inn")
         return
     
+    # Нужный Parent_Key для клиентов из Clobus
+    REQUIRED_PARENT_KEY = "7ccd31ca-887b-11eb-938b-00e04cd03b68"
+    
     onec_client = OneCClient()
     
     try:
-            # Если у клиента есть cl_ref_key, значит он уже существует в 1C - обновляем
+        # Если у клиента есть cl_ref_key, проверяем его Parent_Key в ЦЛ
         if client.cl_ref_key:
-            logger.info(f"Updating client {client.client_id} in 1C:ЦЛ (Ref_Key={client.cl_ref_key[:20]})")
+            logger.info(f"Client {client.client_id} has cl_ref_key={client.cl_ref_key[:20]}, checking Parent_Key in ЦЛ")
             
-            # Формируем имя с префиксом CLOBUS для 1C:ЦЛ
-            display_name = _build_client_display_name(client)
-            
-            # Формируем данные для обновления
-            update_data = {}
-            if display_name:
-                update_data["name"] = display_name
-            if client.org_inn:
-                update_data["org_inn"] = client.org_inn
-            if client.code_abonent:
-                update_data["code_abonent"] = client.code_abonent
-            if client.phone_number:
-                update_data["phone"] = client.phone_number
-            if client.email:
-                update_data["email"] = client.email
-            
-            if update_data:
-                response = await onec_client.update_client_odata(
-                    ref_key=client.cl_ref_key,
-                    name=update_data.get("name"),
-                    org_inn=update_data.get("org_inn"),
-                    code_abonent=update_data.get("code_abonent"),
-                    phone=update_data.get("phone"),
-                    email=update_data.get("email"),
-                )
-                logger.info(f"✓ Updated client {client.client_id} in 1C:ЦЛ")
-            else:
-                logger.debug(f"No fields to update for client {client.client_id} in 1C")
-        else:
-            # Клиента нет в 1C - создаем или находим существующего
-            # Для создания нужен code_abonent
-            if not client.code_abonent:
-                logger.warning(f"Cannot create client {client.client_id} in 1C: missing code_abonent")
-                return
-            
-            logger.info(f"Creating client {client.client_id} in 1C:ЦЛ (org_inn={client.org_inn}, code_abonent={client.code_abonent})")
-            
-            # Проверяем, не существует ли уже клиент с таким ИНН
-            existing_client = await onec_client.find_client_by_inn(client.org_inn)
-            if existing_client:
-                # Клиент уже существует в 1C - обновляем его Ref_Key в БД и обновляем данные
-                existing_ref_key = existing_client.get("Ref_Key")
-                if existing_ref_key:
-                    logger.info(f"Found existing client in 1C with Ref_Key={existing_ref_key[:20]}, updating")
-                    client.cl_ref_key = existing_ref_key
-                    await db.flush()
-                    
-                    # Формируем имя с префиксом CLOBUS для 1C:ЦЛ
-                    display_name = _build_client_display_name(client)
-                    
-                    # Обновляем данные в 1C
-                    response = await onec_client.update_client_odata(
-                        ref_key=existing_ref_key,
-                        name=display_name,
-                        org_inn=client.org_inn,
-                        code_abonent=client.code_abonent,
-                        phone=client.phone_number,
-                        email=client.email,
-                    )
-                    logger.info(f"✓ Updated existing client in 1C:ЦЛ (Ref_Key={existing_ref_key[:20]})")
-                    return
-            
-            # Создаем нового клиента в 1C
-            # Формируем имя с префиксом CLOBUS для 1C:ЦЛ
-            display_name = _build_client_display_name(client)
-            response = await onec_client.create_client_odata(
-                name=display_name,
-                org_inn=client.org_inn,
+            # Получаем данные клиента из ЦЛ для проверки Parent_Key
+            # Используем поиск по ИНН и коду абонента для получения актуальных данных
+            existing_client_data = await onec_client.find_client_by_code_and_inn(
                 code_abonent=client.code_abonent,
-                phone=client.phone_number,
-                email=client.email,
+                org_inn=client.org_inn
             )
             
-            # Сохраняем Ref_Key из ответа 1C
-            ref_key = response.get("Ref_Key")
-            if ref_key:
-                client.cl_ref_key = ref_key
+            # Если не найден по коду и ИНН, пробуем найти по cl_ref_key через поиск по ИНН
+            if not existing_client_data:
+                existing_client_data = await onec_client.find_client_by_inn(client.org_inn)
+            
+            # Проверяем Parent_Key найденного клиента
+            if existing_client_data:
+                existing_parent_key = existing_client_data.get("Parent_Key")
+                existing_ref_key = existing_client_data.get("Ref_Key")
+                
+                # Если найденный клиент имеет другой Ref_Key или другой Parent_Key - создаем дубль
+                if existing_ref_key != client.cl_ref_key or existing_parent_key != REQUIRED_PARENT_KEY:
+                    logger.warning(
+                        f"Client {client.client_id} has cl_ref_key={client.cl_ref_key[:20]}, "
+                        f"but found client in ЦЛ with Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
+                        f"Parent_Key={existing_parent_key}. "
+                        f"Required Parent_Key={REQUIRED_PARENT_KEY}. "
+                        f"Creating duplicate client with correct Parent_Key."
+                    )
+                    # Сбрасываем cl_ref_key и создаем нового клиента
+                    client.cl_ref_key = None
+                    await db.flush()
+                    # Продолжаем выполнение - создадим нового клиента ниже
+                else:
+                    # Parent_Key правильный - обновляем существующего клиента
+                    logger.info(f"Client {client.client_id} has correct Parent_Key, updating in ЦЛ")
+                    display_name = _build_client_display_name(client)
+                    
+                    update_data = {}
+                    if display_name:
+                        update_data["name"] = display_name
+                    if client.org_inn:
+                        update_data["org_inn"] = client.org_inn
+                    if client.code_abonent:
+                        update_data["code_abonent"] = client.code_abonent
+                    if client.phone_number:
+                        update_data["phone"] = client.phone_number
+                    if client.email:
+                        update_data["email"] = client.email
+                    
+                    if update_data:
+                        response = await onec_client.update_client_odata(
+                            ref_key=client.cl_ref_key,
+                            name=update_data.get("name"),
+                            org_inn=update_data.get("org_inn"),
+                            code_abonent=update_data.get("code_abonent"),
+                            phone=update_data.get("phone"),
+                            email=update_data.get("email"),
+                        )
+                        logger.info(f"✓ Updated client {client.client_id} in 1C:ЦЛ")
+                    else:
+                        logger.debug(f"No fields to update for client {client.client_id} in 1C")
+                    return
+        
+        # Клиента нет в 1C или нужно создать дубль - ищем существующего по коду абонента и ИНН
+        # Для создания нужен code_abonent
+        if not client.code_abonent:
+            logger.warning(f"Cannot create client {client.client_id} in 1C: missing code_abonent")
+            return
+        
+        logger.info(f"Searching/creating client {client.client_id} in 1C:ЦЛ (org_inn={client.org_inn}, code_abonent={client.code_abonent})")
+        
+        # Ищем клиента по коду абонента и ИНН
+        existing_client = await onec_client.find_client_by_code_and_inn(
+            code_abonent=client.code_abonent,
+            org_inn=client.org_inn
+        )
+        
+        if existing_client:
+            existing_ref_key = existing_client.get("Ref_Key")
+            existing_parent_key = existing_client.get("Parent_Key")
+            
+            # Проверяем Parent_Key найденного клиента
+            if existing_parent_key == REQUIRED_PARENT_KEY:
+                # Parent_Key правильный - обновляем существующего клиента
+                logger.info(
+                    f"Found existing client in 1C with Ref_Key={existing_ref_key[:20]}, "
+                    f"Parent_Key={existing_parent_key} (correct), updating"
+                )
+                client.cl_ref_key = existing_ref_key
                 await db.flush()
-                logger.info(f"✓ Created client {client.client_id} in 1C:ЦЛ (Ref_Key={ref_key[:20]})")
+                
+                display_name = _build_client_display_name(client)
+                
+                response = await onec_client.update_client_odata(
+                    ref_key=existing_ref_key,
+                    name=display_name,
+                    org_inn=client.org_inn,
+                    code_abonent=client.code_abonent,
+                    phone=client.phone_number,
+                    email=client.email,
+                )
+                logger.info(f"✓ Updated existing client in 1C:ЦЛ (Ref_Key={existing_ref_key[:20]})")
+                return
             else:
-                logger.warning(f"1C returned response without Ref_Key for client {client.client_id}: {response}")
+                # Parent_Key не тот - создаем дубль с нужным Parent_Key
+                logger.warning(
+                    f"Found existing client in 1C with Ref_Key={existing_ref_key[:20]}, "
+                    f"Parent_Key={existing_parent_key} (incorrect, required: {REQUIRED_PARENT_KEY}). "
+                    f"Creating duplicate client with correct Parent_Key."
+                )
+                # Продолжаем выполнение - создадим нового клиента ниже
+        
+        # Создаем нового клиента в 1C (или дубль, если найденный имел неправильный Parent_Key)
+        display_name = _build_client_display_name(client)
+        response = await onec_client.create_client_odata(
+            name=display_name,
+            org_inn=client.org_inn,
+            code_abonent=client.code_abonent,
+            phone=client.phone_number,
+            email=client.email,
+        )
+        
+        # Сохраняем Ref_Key из ответа 1C
+        ref_key = response.get("Ref_Key")
+        if ref_key:
+            client.cl_ref_key = ref_key
+            await db.flush()
+            logger.info(f"✓ Created client {client.client_id} in 1C:ЦЛ (Ref_Key={ref_key[:20]})")
+        else:
+            logger.warning(f"1C returned response without Ref_Key for client {client.client_id}: {response}")
     except Exception as e:
         # Не блокируем создание/обновление клиента в БД при ошибке синхронизации с 1C
         logger.error(f"Failed to sync client {client.client_id} to 1C:ЦЛ: {e}", exc_info=True)

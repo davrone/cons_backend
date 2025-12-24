@@ -41,7 +41,7 @@ from FastAPI.utils.notification_helpers import check_and_log_notification
 
 LOG_LEVEL = os.getenv("ETL_LOG_LEVEL", "INFO")
 PAGE_SIZE = int(os.getenv("ODATA_PAGE_SIZE", "1000"))
-INITIAL_FROM_DATE = os.getenv("ETL_RATES_INITIAL_FROM", "2025-01-01")
+INITIAL_FROM_DATE = os.getenv("ETL_RATES_INITIAL_FROM", "2025-12-01")
 MAX_ERROR_LOGS = int(os.getenv("ETL_MAX_ERROR_LOGS", "5"))
 
 ENTITY = "InformationRegister_ОценкаКонсультацийПоЗаявкам"

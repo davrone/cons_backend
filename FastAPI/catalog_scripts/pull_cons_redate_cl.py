@@ -36,7 +36,7 @@ from FastAPI.services.onec_client import OneCClient
 from FastAPI.utils.etl_logging import ETLLogger
 
 LOG_LEVEL = os.getenv("ETL_LOG_LEVEL", "INFO")
-INITIAL_FROM_DATE = os.getenv("ETL_REDATE_INITIAL_FROM", "2025-01-01")
+INITIAL_FROM_DATE = os.getenv("ETL_REDATE_INITIAL_FROM", "2025-12-01")
 PAGE_SIZE = int(os.getenv("ODATA_PAGE_SIZE", "1000"))
 MAX_ERROR_LOGS = int(os.getenv("ETL_MAX_ERROR_LOGS", "5"))
 

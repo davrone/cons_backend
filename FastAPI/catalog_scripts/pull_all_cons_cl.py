@@ -32,7 +32,7 @@ from FastAPI.models import Consultation, QAndA, Client
 # Конфигурация
 LOG_LEVEL = os.getenv("ETL_LOG_LEVEL", "INFO")
 PAGE_SIZE = int(os.getenv("ODATA_PAGE_SIZE", "1000"))
-INITIAL_FROM_DATE = os.getenv("ETL_INITIAL_FROM_DATE", "2025-01-01")
+INITIAL_FROM_DATE = os.getenv("ETL_INITIAL_FROM_DATE", "2025-12-01")
 
 ENTITY = "Document_ТелефонныйЗвонок_ALL"  # Отдельная сущность для отслеживания синхронизации
 

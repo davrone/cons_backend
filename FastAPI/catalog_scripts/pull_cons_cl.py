@@ -6,7 +6,9 @@
 - cons.cons (консультации)
 - cons.q_and_a (вопросы и ответы)
 
-Использует инкрементальную загрузку по дате изменения.
+Использует инкрементальную загрузку по полю ДатаИзменения.
+Это позволяет эффективно загружать только измененные документы,
+а не все новые и будущие консультации.
 """
 import os
 import sys
@@ -16,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote, quote_plus
 import requests
+import httpx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
@@ -127,6 +130,39 @@ def clean_datetime(dt_str: Optional[str]) -> Optional[datetime]:
         return dt
     except:
         return None
+
+
+def is_valid_chatwoot_conversation_id(cons_id: Optional[str]) -> bool:
+    """
+    Проверяет, является ли cons_id валидным числовым ID Chatwoot.
+    
+    Chatwoot использует числовые ID для conversations (например, 12345),
+    а не UUID. Если cons_id это UUID или временный ID (temp_, cl_), 
+    то это невалидный ID для запросов к Chatwoot.
+    
+    Args:
+        cons_id: ID консультации из БД
+        
+    Returns:
+        True если cons_id валидный числовой ID Chatwoot, False иначе
+    """
+    if not cons_id:
+        return False
+    
+    # Пропускаем временные ID
+    if cons_id.startswith(("temp_", "cl_")):
+        return False
+    
+    # Проверяем, что это числовой ID (не UUID)
+    # UUID имеет формат: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 символов с дефисами)
+    # Числовой ID: только цифры
+    if len(cons_id) > 10:  # UUID обычно длиннее 10 символов
+        # Проверяем, не UUID ли это (содержит дефисы)
+        if '-' in cons_id:
+            return False
+    
+    # Проверяем, что это число (или строка из цифр)
+    return cons_id.isdigit()
 
 
 def http_get_with_backoff(url: str, auth: tuple, max_retries: int = 6, timeout: int = 120):
@@ -313,6 +349,8 @@ async def process_consultation_item(
     create_date = clean_datetime(item.get("ДатаСоздания"))
     start_date = clean_datetime(item.get("ДатаКонсультации"))
     end_date = clean_datetime(item.get("Конец"))
+    # ВАЖНО: ДатаИзменения используется для инкрементального обновления
+    change_date = clean_datetime(item.get("ДатаИзменения"))
     
     # Закрыто без консультации (ВАЖНО: проверяем ДО определения статуса)
     denied = bool(item.get("ЗакрытоБезКонсультации", False))
@@ -395,8 +433,8 @@ async def process_consultation_item(
             has_changes = True
             
             # ВАЖНО: Синхронизируем статус с Chatwoot при изменении
-            # Если статус изменился и есть cons_id (не временный), обновляем в Chatwoot
-            if consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+            # Если статус изменился и есть валидный cons_id, обновляем в Chatwoot
+            if is_valid_chatwoot_conversation_id(consultation.cons_id):
                 try:
                     chatwoot_client = ChatwootClient()
                     # Если статус "closed" - закрываем в Chatwoot с сообщением о длительности разговора
@@ -443,10 +481,25 @@ async def process_consultation_item(
                         )
                         logger.info(f"Automatically set pending status for consultation {consultation.cons_id} in Chatwoot")
                 except Exception as sync_error:
-                    logger.warning(f"Failed to sync consultation status {consultation.cons_id} in Chatwoot: {sync_error}")
+                    # ВАЖНО: Не прерываем обработку консультации из-за ошибок Chatwoot
+                    # Логируем ошибку, но продолжаем обработку остальных полей
+                    error_msg = str(sync_error)
+                    if "ConnectError" in error_msg or "connection" in error_msg.lower():
+                        logger.warning(
+                            f"Chatwoot connection error while syncing consultation status {consultation.cons_id}: {sync_error}. "
+                            f"Chatwoot may be unavailable. Continuing ETL process..."
+                        )
+                    else:
+                        logger.warning(f"Failed to sync consultation status {consultation.cons_id} in Chatwoot: {sync_error}")
+            elif consultation.cons_id:
+                # Логируем, если cons_id есть, но невалидный (UUID или временный)
+                logger.debug(
+                    f"Skipping Chatwoot status sync for consultation {consultation.cl_ref_key}: "
+                    f"cons_id={consultation.cons_id} is not a valid Chatwoot conversation ID (UUID or temporary)"
+                )
         
         # Синхронизируем номер консультации и другие поля в Chatwoot custom_attributes
-        if consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+        if is_valid_chatwoot_conversation_id(consultation.cons_id):
             try:
                 chatwoot_client = ChatwootClient()
                 custom_attrs_to_update = {}
@@ -509,13 +562,48 @@ async def process_consultation_item(
                 
                 # Обновляем только если есть изменения
                 if custom_attrs_to_update:
-                    await chatwoot_client.update_conversation_custom_attributes(
-                        conversation_id=consultation.cons_id,
-                        custom_attributes=custom_attrs_to_update
-                    )
-                    logger.info(f"Synced consultation fields to Chatwoot for {consultation.cons_id}: {list(custom_attrs_to_update.keys())}")
+                    try:
+                        await chatwoot_client.update_conversation_custom_attributes(
+                            conversation_id=consultation.cons_id,
+                            custom_attributes=custom_attrs_to_update
+                        )
+                        logger.info(f"Synced consultation fields to Chatwoot for {consultation.cons_id}: {list(custom_attrs_to_update.keys())}")
+                    except httpx.HTTPStatusError as http_error:
+                        # Обработка ошибок HTTP (404, 403 и т.д.)
+                        if http_error.response.status_code == 404:
+                            # Conversation не найдена в Chatwoot (возможно, была удалена)
+                            logger.warning(
+                                f"Conversation {consultation.cons_id} not found in Chatwoot (404). "
+                                f"Possibly deleted. Skipping custom_attributes update."
+                            )
+                        else:
+                            # Другие HTTP ошибки
+                            logger.warning(
+                                f"HTTP error {http_error.response.status_code} while updating custom_attributes "
+                                f"for conversation {consultation.cons_id}: {http_error}"
+                            )
+                    except Exception as update_error:
+                        logger.warning(
+                            f"Failed to update custom_attributes for conversation {consultation.cons_id}: {update_error}",
+                            exc_info=True
+                        )
             except Exception as sync_error:
-                logger.warning(f"Failed to sync consultation fields to Chatwoot {consultation.cons_id}: {sync_error}", exc_info=True)
+                # ВАЖНО: Не прерываем обработку консультации из-за ошибок Chatwoot
+                # Логируем ошибку, но продолжаем обработку остальных полей
+                error_msg = str(sync_error)
+                if "ConnectError" in error_msg or "connection" in error_msg.lower():
+                    logger.warning(
+                        f"Chatwoot connection error while syncing consultation fields {consultation.cons_id}: {sync_error}. "
+                        f"Chatwoot may be unavailable. Continuing ETL process..."
+                    )
+                else:
+                    logger.warning(f"Failed to sync consultation fields to Chatwoot {consultation.cons_id}: {sync_error}", exc_info=True)
+        elif consultation.cons_id:
+            # Логируем, если cons_id есть, но невалидный (UUID или временный)
+            logger.debug(
+                f"Skipping Chatwoot custom_attributes sync for consultation {consultation.cl_ref_key}: "
+                f"cons_id={consultation.cons_id} is not a valid Chatwoot conversation ID (UUID or temporary)"
+            )
         
         if client_key and consultation.client_key != client_key:
             consultation.client_key = client_key
@@ -666,8 +754,10 @@ async def process_consultation_item(
     
     await db.flush()
 
-    # ВАЖНО: Убеждаемся, что возвращаемый datetime всегда offset-aware (UTC)
-    result_date = create_date or start_date or datetime.now(timezone.utc)
+    # ВАЖНО: Возвращаем ДатаИзменения для отслеживания последней синхронизации
+    # Это позволяет эффективно отслеживать инкрементальные обновления
+    # Если ДатаИзменения отсутствует, используем create_date или start_date как fallback
+    result_date = change_date or create_date or start_date or datetime.now(timezone.utc)
     if result_date.tzinfo is None:
         result_date = result_date.replace(tzinfo=timezone.utc)
     return result_date
@@ -776,7 +866,7 @@ async def pull_open_consultations_by_ref_key(db: AsyncSession, auth: tuple):
                         )
                         consultation = result.scalar_one_or_none()
                         
-                        if consultation and consultation.cons_id and not consultation.cons_id.startswith(("temp_", "cl_")):
+                        if consultation and is_valid_chatwoot_conversation_id(consultation.cons_id):
                             # Обновляем статус на cancelled (удалено в ЦЛ)
                             old_status = consultation.status
                             if old_status not in ("closed", "resolved", "cancelled"):
@@ -815,56 +905,69 @@ async def pull_open_consultations_by_ref_key(db: AsyncSession, auth: tuple):
 
 async def pull_consultations_incremental(db: AsyncSession, auth: tuple):
     """
-    Инкрементальная загрузка консультаций по дате создания и дате консультации.
+    Инкрементальная загрузка консультаций по дате изменения.
     
-    Загружает:
-    - Новые консультации (по ДатаСоздания)
-    - Консультации на будущее (по ДатаКонсультации)
+    Использует новое поле ДатаИзменения из OData для эффективного инкрементального обновления.
+    Загружает только те документы, которые были изменены с момента последней синхронизации.
     """
     etl_logger = ETLLogger("pull_cons_cl_incremental", ENTITY)
     
     # Получаем дату последней синхронизации
     last_sync = await get_last_sync_date(db)
     
+    # ВАЖНО: Получаем текущую дату/время для ограничения last_sync
+    # Это предотвращает проблемы с будущими датами в last_sync
+    current_time = datetime.now(timezone.utc)
+    
+    # ВАЖНО: Если last_sync в будущем (из-за запланированных консультаций),
+    # используем текущую дату вместо неё
+    effective_last_sync: Optional[datetime] = None
     if last_sync:
-        # Инкрементальная загрузка с буфером
-        from_dt = last_sync - timedelta(days=INCREMENTAL_BUFFER_DAYS)
+        if last_sync > current_time:
+            logger.warning(
+                f"last_sync ({last_sync}) is in the future, using current time ({current_time}) instead. "
+                f"This can happen if there are scheduled consultations with future ДатаИзменения."
+            )
+            effective_last_sync = current_time
+        else:
+            effective_last_sync = last_sync
+    
+    if effective_last_sync:
+        # Инкрементальная загрузка с буфером (для надежности, на случай пропущенных изменений)
+        from_dt = effective_last_sync - timedelta(days=INCREMENTAL_BUFFER_DAYS)
         from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        logger.info(f"Incremental sync from {from_date} (last sync: {last_sync}, buffer: {INCREMENTAL_BUFFER_DAYS} days)")
+        logger.info(f"Incremental sync from {from_date} (effective last sync: {effective_last_sync}, buffer: {INCREMENTAL_BUFFER_DAYS} days)")
     else:
         from_date = f"{INITIAL_FROM_DATE}T00:00:00"
         logger.info(f"First run — loading from {from_date}")
     
-    # Текущая дата для фильтра по ДатаКонсультации (заявки на будущее)
-    today = datetime.now(timezone.utc).date()
-    today_str = today.strftime("%Y-%m-%dT00:00:00")
-    
     etl_logger.start({
         "mode": "incremental",
         "from_date": from_date,
-        "today": today_str,
         "buffer_days": INCREMENTAL_BUFFER_DAYS,
-        "PAGE_SIZE": PAGE_SIZE
+        "PAGE_SIZE": PAGE_SIZE,
+        "field": "ДатаИзменения"
     })
     
     skip = 0
     last_processed_at: Optional[datetime] = None
-    if last_sync:
-        if last_sync.tzinfo is None:
-            last_processed_at = last_sync.replace(tzinfo=timezone.utc)
+    if effective_last_sync:
+        # Используем effective_last_sync (уже ограниченный current_time выше)
+        if effective_last_sync.tzinfo is None:
+            last_processed_at = effective_last_sync.replace(tzinfo=timezone.utc)
         else:
-            last_processed_at = last_sync
+            last_processed_at = effective_last_sync
     
     error_logs = 0
     
     while True:
-        # Улучшенный фильтр: загружаем по ДатаСоздания ИЛИ по ДатаКонсультации (на будущее)
-        # Формат: (ДатаСоздания ge datetime'...' OR ДатаКонсультации ge datetime'...')
-        filter_part = f"(ДатаСоздания ge datetime'{from_date}' or ДатаКонсультации ge datetime'{today_str}')"
+        # Используем новое поле ДатаИзменения для инкрементального обновления
+        # Это позволяет загружать только измененные документы, что более эффективно
+        filter_part = f"ДатаИзменения ge datetime'{from_date}'"
         
         # ВАЖНО: OData требует правильного кодирования кириллицы
         encoded_filter = quote(filter_part, safe="'()=<>", encoding='utf-8')
-        encoded_orderby = quote("ДатаСоздания asc", safe=",", encoding='utf-8')
+        encoded_orderby = quote("ДатаИзменения asc", safe=",", encoding='utf-8')
         
         url = (
             f"{ODATA_BASEURL}{ENTITY}?$format=json"
@@ -929,8 +1032,26 @@ async def pull_consultations_incremental(db: AsyncSession, auth: tuple):
                 if processed_at:
                     if processed_at.tzinfo is None:
                         processed_at = processed_at.replace(tzinfo=timezone.utc)
-                    if last_processed_at is None or processed_at > last_processed_at:
-                        last_processed_at = processed_at
+                    
+                    # ВАЖНО: Ограничиваем last_processed_at текущей датой/временем
+                    # Это предотвращает сдвиг last_sync в будущее из-за запланированных консультаций
+                    # Если ДатаИзменения в будущем, мы обрабатываем запись, но не используем её дату для last_sync
+                    if processed_at <= current_time:
+                        if last_processed_at is None or processed_at > last_processed_at:
+                            last_processed_at = processed_at
+                    else:
+                        # Если processed_at в будущем, логируем это для отладки
+                        logger.debug(
+                            f"Skipping future date for last_sync: {processed_at} (current: {current_time}) "
+                            f"for consultation {item.get('Ref_Key', 'N/A')[:20]}"
+                        )
+                        # Если processed_at в будущем, но last_processed_at еще не установлен,
+                        # устанавливаем его на текущее время (но не больше)
+                        if last_processed_at is None:
+                            last_processed_at = current_time
+                        # Если last_processed_at уже установлен, но меньше current_time, обновляем до current_time
+                        elif last_processed_at < current_time:
+                            last_processed_at = current_time
                 else:
                     batch_errors += 1
             except Exception as e:

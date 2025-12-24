@@ -48,6 +48,10 @@ from ..schemas.consultation_meta import (
 )
 from ..routers.clients import find_or_create_client
 from ..services.chatwoot_client import ChatwootClient, is_valid_email
+from ..services.manager_notifications import is_valid_chatwoot_conversation_id
+
+# Константа для менеджера "не определено"
+UNDEFINED_MANAGER_KEY = "062699c7-24b2-11e9-a1e3-60a44cafb67d"
 from ..services.onec_client import OneCClient, ConsultationLimitExceeded
 from ..services.consultation_ratings import recalc_consultation_ratings
 from ..services.manager_selector import ManagerSelector
@@ -573,6 +577,39 @@ async def _get_owner_client(db: AsyncSession, client: Client) -> Client:
     return owner
 
 
+def _is_company_name(name: Optional[str]) -> bool:
+    """
+    Проверяет, является ли строка названием компании (а не ФИО).
+    
+    Args:
+        name: Строка для проверки
+        
+    Returns:
+        True если строка похожа на название компании, False если похожа на ФИО
+    """
+    if not name:
+        return False
+    
+    name_lower = name.lower().strip()
+    
+    # Индикаторы названий компаний
+    company_indicators = [
+        'ооо', 'оао', 'зао', 'пао', 'ип', 'llc', 'ltd', 'inc', 
+        'mchj', 'ip', 'yatt', 'ятт', 'мчж', 'ао', 'чп'
+    ]
+    
+    # Проверяем наличие индикаторов компании
+    if any(indicator in name_lower for indicator in company_indicators):
+        return True
+    
+    # Дополнительные проверки: если строка содержит только заглавные буквы и цифры
+    # (типично для названий компаний)
+    if name.isupper() and len(name) > 5:
+        return True
+    
+    return False
+
+
 def _build_client_display_name(client: Client) -> str:
     """
     Читаемое имя клиента для 1С по правилу: CLOBUS + Наименование + КодАбонентаClobus + ИНН.
@@ -596,8 +633,19 @@ def _build_client_display_name(client: Client) -> str:
 
 
 def _build_contact_hint(client: Client, owner: Client, source: Optional[str]) -> Optional[str]:
-    """Формирует строку для поля 'КакСвязаться'."""
+    """
+    Формирует строку для поля 'КакСвязаться'.
+    
+    ВАЖНО: Логирует предупреждение, если phone_number отсутствует.
+    """
     phone = client.phone_number or owner.phone_number
+    
+    if not phone:
+        logger.warning(
+            f"Номер телефона отсутствует для клиента {client.client_id} или владельца {owner.client_id}. "
+            f"contact_hint будет создан без номера телефона."
+        )
+    
     name = (
         client.contact_name
         or client.name
@@ -614,7 +662,15 @@ async def _ensure_owner_synced_with_cl(
     owner: Client,
     onec_client: OneCClient,
 ) -> Client:
-    """Убеждаемся, что владелец создан в 1С и имеет Ref_Key."""
+    """
+    Убеждаемся, что владелец создан в 1С и имеет Ref_Key.
+    
+    ВАЖНО: Проверяет Parent_Key найденного клиента в ЦЛ.
+    Если Parent_Key != "7ccd31ca-887b-11eb-938b-00e04cd03b68", создает дубль с правильным Parent_Key.
+    """
+    # Нужный Parent_Key для клиентов из Clobus
+    REQUIRED_PARENT_KEY = "7ccd31ca-887b-11eb-938b-00e04cd03b68"
+    
     logger.info(f"=== Ensuring owner client is synced with 1C ===")
     logger.info(f"  Owner client_id: {owner.client_id}")
     logger.info(f"  Owner cl_ref_key: {owner.cl_ref_key}")
@@ -622,16 +678,57 @@ async def _ensure_owner_synced_with_cl(
     logger.info(f"  Owner code_abonent: {owner.code_abonent}")
     
     if owner.cl_ref_key:
-        logger.info(f"✓ Owner already has cl_ref_key: {owner.cl_ref_key}")
-        return owner
+        # Проверяем Parent_Key существующего клиента в ЦЛ
+        try:
+            # Ищем клиента по коду абонента и ИНН для проверки Parent_Key
+            existing_client_data = await onec_client.find_client_by_code_and_inn(
+                code_abonent=owner.code_abonent,
+                org_inn=owner.org_inn
+            )
+            
+            if existing_client_data:
+                existing_parent_key = existing_client_data.get("Parent_Key")
+                existing_ref_key = existing_client_data.get("Ref_Key")
+                
+                # Если найденный клиент имеет другой Ref_Key или другой Parent_Key - создаем дубль
+                if existing_ref_key != owner.cl_ref_key or existing_parent_key != REQUIRED_PARENT_KEY:
+                    logger.warning(
+                        f"Owner client {owner.client_id} has cl_ref_key={owner.cl_ref_key[:20]}, "
+                        f"but found client in ЦЛ with Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
+                        f"Parent_Key={existing_parent_key}. "
+                        f"Required Parent_Key={REQUIRED_PARENT_KEY}. "
+                        f"Creating duplicate client with correct Parent_Key."
+                    )
+                    # Сбрасываем cl_ref_key и создадим нового клиента ниже
+                    owner.cl_ref_key = None
+                    await db.flush()
+                else:
+                    logger.info(f"✓ Owner already has correct cl_ref_key: {owner.cl_ref_key}")
+                    return owner
+            else:
+                # Клиент не найден в ЦЛ - возможно был удален, создадим нового
+                logger.warning(f"Owner client {owner.client_id} has cl_ref_key={owner.cl_ref_key[:20]}, but client not found in ЦЛ. Creating new client.")
+                owner.cl_ref_key = None
+                await db.flush()
+        except Exception as e:
+            logger.warning(f"Failed to verify cl_ref_key in ЦЛ: {e}. Proceeding with existing cl_ref_key.")
+            return owner
     
     if not owner.org_inn:
         logger.error(f"✗ Owner client {owner.client_id} has no org_inn - cannot sync with 1C")
         raise HTTPException(status_code=400, detail="Owner client requires INN")
 
     try:
-        logger.info(f"Searching for existing client in 1C by INN: {owner.org_inn}")
-        existing = await onec_client.find_client_by_inn(owner.org_inn)
+        # Ищем клиента по коду абонента и ИНН (приоритетно)
+        if owner.code_abonent:
+            logger.info(f"Searching for existing client in 1C by code_abonent={owner.code_abonent} and INN={owner.org_inn}")
+            existing = await onec_client.find_client_by_code_and_inn(
+                code_abonent=owner.code_abonent,
+                org_inn=owner.org_inn
+            )
+        else:
+            logger.info(f"Searching for existing client in 1C by INN: {owner.org_inn}")
+            existing = await onec_client.find_client_by_inn(owner.org_inn)
     except Exception as e:
         logger.warning(
             "Failed to fetch client from 1C by INN %s: %s. Proceeding without sync.",
@@ -641,13 +738,25 @@ async def _ensure_owner_synced_with_cl(
         return owner
 
     if existing:
+        existing_parent_key = existing.get("Parent_Key")
         ref_key = existing.get("Ref_Key")
-        logger.info(f"✓ Found existing client in 1C with Ref_Key: {ref_key}")
-        owner.cl_ref_key = ref_key
-        owner.code_abonent = owner.code_abonent or existing.get("КодАбонентаClobus")
-        await db.flush()
-        logger.info(f"✓ Saved cl_ref_key to owner: {ref_key}")
-        return owner
+        
+        # Проверяем Parent_Key найденного клиента
+        if existing_parent_key == REQUIRED_PARENT_KEY:
+            logger.info(f"✓ Found existing client in 1C with Ref_Key: {ref_key}, Parent_Key: {existing_parent_key} (correct)")
+            owner.cl_ref_key = ref_key
+            owner.code_abonent = owner.code_abonent or existing.get("КодАбонентаClobus")
+            await db.flush()
+            logger.info(f"✓ Saved cl_ref_key to owner: {ref_key}")
+            return owner
+        else:
+            # Parent_Key не тот - создаем дубль с правильным Parent_Key
+            logger.warning(
+                f"Found existing client in 1C with Ref_Key: {ref_key}, "
+                f"Parent_Key: {existing_parent_key} (incorrect, required: {REQUIRED_PARENT_KEY}). "
+                f"Creating duplicate client with correct Parent_Key."
+            )
+            # Продолжаем выполнение - создадим нового клиента ниже
 
     if not owner.code_abonent:
         logger.warning(
@@ -1147,6 +1256,29 @@ async def create_consultation(
         owner_client_name = owner_client.name
         owner_client_contact_name = owner_client.contact_name
         owner_client_company_name = owner_client.company_name
+        owner_client_phone_number = owner_client.phone_number
+        client_phone_number = client.phone_number
+        
+        # ВАЖНО: Проверка обязательных полей для создания консультации
+        # Номер телефона обязателен для связи с клиентом
+        if not owner_client_phone_number and not client_phone_number:
+            logger.error(
+                f"Номер телефона отсутствует для клиента {client.client_id} и владельца {owner_client_id}. "
+                f"Невозможно создать консультацию без контактных данных."
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Номер телефона обязателен для создания консультации. Пожалуйста, укажите phone_number в данных клиента."
+            )
+        
+        # Проверка корректности данных: если company_name пустое, но name похоже на название компании
+        if not owner_client_company_name and owner_client_name:
+            if _is_company_name(owner_client_name):
+                logger.warning(
+                    f"Клиент {owner_client_id} имеет название компании в поле 'name': '{owner_client_name}'. "
+                    f"Поле 'company_name' пустое. Это может указывать на некорректность данных. "
+                    f"Рекомендуется заполнить поле 'company_name' отдельно от 'name' (ФИО)."
+                )
         
         if not client_key:
             logger.error(
@@ -1204,10 +1336,14 @@ async def create_consultation(
             # Для других типов консультаций (если появятся) также не подбираем автоматически
             logger.info(f"Skipping auto-assignment for consultation_type={consultation_type}")
         
-        # Если менеджер не выбран автоматически, используем дефолтного
+        # Если менеджер не выбран автоматически, используем менеджера "не определено"
         # ВАЖНО: Для "Техническая поддержка" менеджер не назначается автоматически
         if not selected_manager_key and consultation_type == "Консультация по ведению учёта":
-            selected_manager_key = await _get_default_manager_key(db, consultation_type=consultation_type)
+            logger.warning(
+                f"No suitable manager found for consultation. "
+                f"Using 'не определено' manager ({UNDEFINED_MANAGER_KEY})"
+            )
+            selected_manager_key = UNDEFINED_MANAGER_KEY
         
         # ВАЖНО: Корректируем scheduled_at на ближайшее рабочее время после выбора менеджера
         if payload.consultation.scheduled_at:
@@ -1857,7 +1993,7 @@ async def create_consultation(
                     logger.warning(f"Failed to assign agent to conversation: {agent_error}")
             
             # Добавляем labels отдельно (если нужно)
-            if labels:
+            if labels and is_valid_chatwoot_conversation_id(chatwoot_cons_id):
                 try:
                     await chatwoot_client.add_conversation_labels(
                         conversation_id=chatwoot_cons_id,
@@ -1865,7 +2001,12 @@ async def create_consultation(
                     )
                     logger.info(f"✓ Added labels to conversation {chatwoot_cons_id}")
                 except Exception as labels_error:
-                    logger.warning(f"Failed to add labels: {labels_error}")
+                    logger.warning(f"Failed to add labels to conversation {chatwoot_cons_id}: {labels_error}")
+            elif labels:
+                logger.debug(
+                    f"Skipping labels for conversation {chatwoot_cons_id}: "
+                    f"cons_id is not a valid Chatwoot conversation ID"
+                )
             
             # ВАЖНО: pubsub_token НЕ возвращается в ответе создания conversation
             # pubsub_token возвращается ТОЛЬКО в ответе POST создания contact через Public API
@@ -2086,7 +2227,31 @@ async def create_consultation(
                 # Название клиента для АбонентПредставление
                 # ВАЖНО: Используем сохраненные значения, а не обращаемся к owner_client напрямую
                 # (после возможного rollback owner_client может быть не доступен)
-                base_name = owner_client_company_name or owner_client_name or owner_client_contact_name or "Клиент"
+                # Приоритет: company_name для названия компании, contact_name/name для ФИО
+                base_name = None
+                
+                if owner_client_company_name:
+                    # Если есть company_name - используем его
+                    base_name = owner_client_company_name
+                elif owner_client_contact_name:
+                    # contact_name обычно содержит ФИО
+                    base_name = owner_client_contact_name
+                elif owner_client_name:
+                    # name может быть как ФИО, так и названием компании
+                    # Проверяем, не является ли это названием компании
+                    if _is_company_name(owner_client_name):
+                        # Это похоже на название компании - используем как company_name
+                        base_name = owner_client_name
+                        logger.warning(
+                            f"Используется поле 'name' как название компании для клиента {owner_client_id}: "
+                            f"'{owner_client_name}'. Рекомендуется заполнить поле 'company_name' отдельно."
+                        )
+                    else:
+                        # Это похоже на ФИО
+                        base_name = owner_client_name
+                else:
+                    base_name = "Клиент"
+                
                 client_display_name_parts = ["Clobus", base_name]
                 if owner_client_code_abonent:
                     client_display_name_parts.append(owner_client_code_abonent)
@@ -2628,13 +2793,19 @@ async def create_redate(
         if payload.comment:
             note_content += f"\nКомментарий: {payload.comment}"
         
-        await chatwoot_client.send_message(
-            conversation_id=cons_id,
-            content=note_content,
-            message_type="outgoing",
-            private=False
-        )
-        logger.info(f"Sent redate note to Chatwoot for consultation {cons_id}")
+        if is_valid_chatwoot_conversation_id(cons_id):
+            await chatwoot_client.send_message(
+                conversation_id=cons_id,
+                content=note_content,
+                message_type="outgoing",
+                private=False
+            )
+            logger.info(f"Sent redate note to Chatwoot for consultation {cons_id}")
+        else:
+            logger.debug(
+                f"Skipping Chatwoot message for redate consultation {cons_id}: "
+                f"cons_id is not a valid Chatwoot conversation ID"
+            )
     except Exception as e:
         logger.error(f"Failed to send redate note to Chatwoot: {e}", exc_info=True)
     
@@ -2765,12 +2936,18 @@ async def submit_ratings(
             note_content += f"\nКоличество вопросов: {len(payload.answers)}"
         
         # Используем send_message вместо send_note, так как note сообщения не видны клиенту
-        await chatwoot_client.send_message(
-            conversation_id=cons_id,
-            content=note_content,
-            message_type="outgoing"
-        )
-        logger.info(f"Sent rating message to Chatwoot for consultation {cons_id}")
+        if is_valid_chatwoot_conversation_id(cons_id):
+            await chatwoot_client.send_message(
+                conversation_id=cons_id,
+                content=note_content,
+                message_type="outgoing"
+            )
+            logger.info(f"Sent rating message to Chatwoot for consultation {cons_id}")
+        else:
+            logger.debug(
+                f"Skipping Chatwoot message for rating consultation {cons_id}: "
+                f"cons_id is not a valid Chatwoot conversation ID"
+            )
     except Exception as e:
         logger.error(f"Failed to send rating note to Chatwoot: {e}", exc_info=True)
     
@@ -2961,30 +3138,36 @@ async def cancel_consultation(
             # Продолжаем выполнение даже если пометка в 1C не удалась
     
     # Закрываем беседу в Chatwoot и отправляем сообщение
-    chatwoot_client = ChatwootClient()
-    try:
-        # Закрываем беседу со статусом "resolved" и пометкой "closed_without_con": true
-        await chatwoot_client.update_conversation(
-            conversation_id=cons_id,
-            status="resolved",
-            custom_attributes={"closed_without_con": True}
-        )
-        logger.info(f"✓ Closed Chatwoot conversation {cons_id} with 'closed_without_con' flag")
-        
-        # Отправляем сообщение в чат о том, что заявка аннулирована
+    if is_valid_chatwoot_conversation_id(cons_id):
+        chatwoot_client = ChatwootClient()
         try:
-            await chatwoot_client.send_message(
+            # Закрываем беседу со статусом "resolved" и пометкой "closed_without_con": true
+            await chatwoot_client.update_conversation(
                 conversation_id=cons_id,
-                content="Заявка аннулирована клиентом.",
-                message_type="outgoing"
+                status="resolved",
+                custom_attributes={"closed_without_con": True}
             )
-            logger.info(f"✓ Sent cancellation message to Chatwoot conversation {cons_id}")
-        except Exception as msg_error:
-            logger.warning(f"Failed to send cancellation message to Chatwoot conversation {cons_id}: {msg_error}")
-            # Не критично, продолжаем выполнение
-    except Exception as e:
-        logger.error(f"✗ Failed to update Chatwoot conversation {cons_id}: {e}", exc_info=True)
-        # Продолжаем выполнение даже если обновление в Chatwoot не удалось
+            logger.info(f"✓ Closed Chatwoot conversation {cons_id} with 'closed_without_con' flag")
+            
+            # Отправляем сообщение в чат о том, что заявка аннулирована
+            try:
+                await chatwoot_client.send_message(
+                    conversation_id=cons_id,
+                    content="Заявка аннулирована клиентом.",
+                    message_type="outgoing"
+                )
+                logger.info(f"✓ Sent cancellation message to Chatwoot conversation {cons_id}")
+            except Exception as msg_error:
+                logger.warning(f"Failed to send cancellation message to Chatwoot conversation {cons_id}: {msg_error}")
+                # Не критично, продолжаем выполнение
+        except Exception as e:
+            logger.error(f"✗ Failed to update Chatwoot conversation {cons_id}: {e}", exc_info=True)
+            # Продолжаем выполнение даже если обновление в Chatwoot не удалось
+    else:
+        logger.warning(
+            f"Skipping Chatwoot update for cancelled consultation {cons_id}: "
+            f"cons_id is not a valid Chatwoot conversation ID (UUID or temporary)"
+        )
     
     # Обновляем статус в БД
     consultation.status = "cancelled"

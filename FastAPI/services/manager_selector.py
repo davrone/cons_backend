@@ -417,7 +417,8 @@ class ManagerSelector:
                 f"language={language}, current_time={current_time}. "
                 f"Check: managers must have con_limit > 0, consultation_enabled=True, "
                 f"and for 'Консультация по ведению учёта' also department='ИТС консультанты', "
-                f"start_hour/end_hour must be set, and must have matching skills and language."
+                f"start_hour/end_hour must be set, and must have matching skills and language. "
+                f"Will use 'не определено' manager as fallback."
             )
             return None
         
@@ -468,14 +469,47 @@ class ManagerSelector:
             if abs(m["priority"] - best_priority) < 0.1
         ]
         
-        # Если есть несколько кандидатов с одинаковой загрузкой, выбираем случайно
-        # Это обеспечивает равномерное распределение
-        import random
+        # УЛУЧШЕНИЕ: Если есть несколько кандидатов, выбираем того, у кого меньше всего последних назначений
+        # Это обеспечивает более равномерное распределение во времени
         if len(candidates) > 1:
-            selected = random.choice(candidates)
+            # Получаем статистику последних назначений для каждого кандидата
+            candidate_stats = []
+            for candidate in candidates:
+                manager_key = candidate["manager"].cl_ref_key
+                
+                # Считаем количество консультаций, назначенных этому менеджеру за последний час
+                recent_assignments_query = select(func.count(Consultation.cons_id)).where(
+                    Consultation.manager == manager_key,
+                    Consultation.create_date >= current_time - timedelta(hours=1),
+                    Consultation.denied == False,
+                )
+                recent_result = await self.db.execute(recent_assignments_query)
+                recent_count = recent_result.scalar() or 0
+                
+                candidate_stats.append({
+                    "candidate": candidate,
+                    "recent_assignments": recent_count,
+                    "priority": candidate["priority"],
+                })
+            
+            # Сортируем по количеству последних назначений (меньше = лучше), затем по приоритету
+            candidate_stats.sort(key=lambda x: (x["recent_assignments"], x["priority"]))
+            
+            # Выбираем из кандидатов с наименьшим количеством последних назначений
+            best_recent_count = candidate_stats[0]["recent_assignments"]
+            best_candidates = [
+                cs["candidate"] for cs in candidate_stats
+                if cs["recent_assignments"] == best_recent_count
+            ]
+            
+            # Если все еще несколько кандидатов, выбираем случайно из лучших
+            import random
+            selected = random.choice(best_candidates)
+            
             logger.info(
                 f"Selected manager {selected['manager'].cl_ref_key} from {len(candidates)} candidates "
-                f"with similar load for consultation {consultation.cons_id if consultation else 'N/A (not created yet)'}. "
+                f"(best recent assignments: {best_recent_count}) "
+                f"for consultation {consultation.cons_id if consultation else 'N/A (not created yet)'}. "
                 f"Queue: {selected['queue_count']}/{selected['limit']}, priority: {selected['priority']:.2f}"
             )
         else:
@@ -582,10 +616,61 @@ class ManagerSelector:
         logger.debug(f"Average consultation duration for manager {manager_key}: {avg_minutes} minutes")
         return avg_minutes
     
+    async def get_consultation_queue_position(
+        self,
+        cons_id: str,
+        manager_key: str,
+    ) -> Optional[int]:
+        """
+        Получить позицию конкретной консультации в очереди менеджера.
+        
+        ВАЖНО: Использует ту же логику подсчета, что и get_manager_queue_count,
+        чтобы позиция совпадала с общим количеством консультаций в очереди.
+        
+        Args:
+            cons_id: ID консультации
+            manager_key: cl_ref_key менеджера
+        
+        Returns:
+            Позиция в очереди (1-based) или None если консультация не найдена
+        """
+        # ВАЖНО: Используем ту же логику, что и get_manager_queue_count
+        # Получаем все консультации менеджера в очереди, отсортированные по дате создания
+        # Считаются только консультации со статусом "pending" или "open" и не отмененные
+        query = select(Consultation.cons_id).where(
+            Consultation.manager == manager_key,
+            Consultation.status.in_(["pending", "open"]),
+            Consultation.denied == False,
+        ).order_by(Consultation.create_date.asc())  # Сортируем по дате создания
+        
+        result = await self.db.execute(query)
+        queue_cons_ids = [row[0] for row in result.all()]
+        
+        # Проверяем, что консультация есть в списке
+        if cons_id not in queue_cons_ids:
+            # Консультация не найдена в очереди (возможно, уже обработана или статус изменился)
+            logger.debug(f"Consultation {cons_id} not found in queue for manager {manager_key}")
+            return None
+        
+        # Находим позицию текущей консультации (1-based)
+        position = queue_cons_ids.index(cons_id) + 1
+        
+        # ВАЖНО: Проверяем, что позиция соответствует общему количеству
+        # Если позиция меньше общего количества, значит что-то не так с логикой
+        total_count = len(queue_cons_ids)
+        if position > total_count:
+            logger.warning(
+                f"Position {position} is greater than total queue count {total_count} "
+                f"for consultation {cons_id} and manager {manager_key}"
+            )
+        
+        return position
+    
     async def calculate_wait_time(
         self,
         manager_key: str,
         average_consultation_duration_minutes: Optional[int] = None,
+        cons_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Рассчитать примерное время ожидания для менеджера.
@@ -593,6 +678,7 @@ class ManagerSelector:
         Args:
             manager_key: cl_ref_key менеджера
             average_consultation_duration_minutes: Средняя длительность консультации в минутах (опционально, если не указано - вычисляется из статистики)
+            cons_id: ID консультации (если указан, возвращает позицию именно этой консультации в очереди)
         
         Returns:
             Dict с информацией о времени ожидания:
@@ -603,8 +689,27 @@ class ManagerSelector:
             - estimated_wait_hours: примерное время ожидания в часах (округлено)
             - show_range: нужно ли показывать диапазон (True если статистика < 15 минут)
         """
-        load_info = await self.get_manager_current_load(manager_key)
-        queue_count = load_info["queue_count"]
+        # Если указан cons_id, получаем позицию конкретной консультации в очереди
+        if cons_id:
+            queue_position = await self.get_consultation_queue_position(cons_id, manager_key)
+            if queue_position is None:
+                # Консультация не найдена в очереди (возможно, уже обработана)
+                return {
+                    "queue_position": None,
+                    "estimated_wait_minutes_min": 0,
+                    "estimated_wait_minutes_max": 0,
+                    "estimated_wait_minutes": 0,
+                    "estimated_wait_hours": 0,
+                    "show_range": False,
+                }
+            # Для расчета времени ожидания используем количество консультаций ДО этой позиции
+            consultations_before = queue_position - 1
+        else:
+            # Старая логика - общее количество + 1 (для новых консультаций, которые еще не в БД)
+            load_info = await self.get_manager_current_load(manager_key)
+            queue_count = load_info["queue_count"]
+            queue_position = queue_count + 1
+            consultations_before = queue_count
         
         # Получаем реальную статистику (без применения минимума)
         stats_query = select(
@@ -637,11 +742,11 @@ class ManagerSelector:
             stats_minutes = average_consultation_duration_minutes
             show_range = stats_minutes < 15
         
-        # Минимальное время ожидания = очередь * статистика
-        estimated_wait_minutes_min = queue_count * stats_minutes
+        # Минимальное время ожидания = количество консультаций ДО * статистика
+        estimated_wait_minutes_min = consultations_before * stats_minutes
         
-        # Максимальное время ожидания = очередь * 15 минут (запас)
-        estimated_wait_minutes_max = queue_count * 15
+        # Максимальное время ожидания = количество консультаций ДО * 15 минут (запас)
+        estimated_wait_minutes_max = consultations_before * 15
         
         # Среднее время для обратной совместимости
         estimated_wait_minutes = estimated_wait_minutes_max if show_range else estimated_wait_minutes_min
@@ -652,7 +757,7 @@ class ManagerSelector:
             estimated_wait_hours = 1  # Минимум 1 час если есть очередь
         
         return {
-            "queue_position": queue_count + 1,  # +1 потому что новая консультация будет следующей
+            "queue_position": queue_position,  # Используем queue_position, который вычислен в обоих случаях
             "estimated_wait_minutes_min": estimated_wait_minutes_min,
             "estimated_wait_minutes_max": estimated_wait_minutes_max,
             "estimated_wait_minutes": estimated_wait_minutes,

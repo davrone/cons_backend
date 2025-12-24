@@ -1471,8 +1471,8 @@ class ChatwootClient:
         
         Перед добавлением убеждается, что все labels существуют в Chatwoot.
         
-        ВАЖНО: Chatwoot API требует передачи labels как массива строк в теле запроса.
-        Используем PUT метод для замены всех labels или POST для добавления.
+        ВАЖНО: Согласно документации Chatwoot API, для добавления labels используется POST метод
+        с телом {"labels": ["label1", "label2"]}.
         
         Args:
             conversation_id: ID беседы
@@ -1490,36 +1490,39 @@ class ChatwootClient:
             if label:
                 await self.ensure_label_exists(label)
         
-        # Chatwoot API требует передачи labels как массива строк
-        # Используем PUT для замены всех labels беседы
-        payload = labels  # Передаем массив напрямую, не в объекте
-        
         import json
         logger.info(f"Adding labels to conversation {conversation_id}: {json.dumps(labels, ensure_ascii=False)}")
         
+        # Согласно документации Chatwoot API, используется POST метод
+        # с телом {"labels": ["label1", "label2"]}
         try:
-            # Пробуем PUT метод (замена всех labels)
             response = await self._request(
-                "PUT",
+                "POST",
                 f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/labels",
-                data=payload
+                data={"labels": labels}  # Chatwoot API требует объект с полем labels
             )
             logger.info(f"✓ Successfully added labels to conversation {conversation_id}")
             return response
-        except Exception as e:
-            # Если PUT не работает, пробуем POST (добавление labels)
-            logger.warning(f"PUT method failed for labels, trying POST: {e}")
-            try:
-                response = await self._request(
-                    "POST",
-                    f"/api/v1/accounts/{self.account_id}/conversations/{conversation_id}/labels",
-                    data={"labels": payload}  # Для POST используем объект с полем labels
+        except httpx.HTTPStatusError as http_error:
+            # Обработка HTTP ошибок (404, 403 и т.д.)
+            if http_error.response.status_code == 404:
+                # Conversation не найдена в Chatwoot (возможно, была удалена)
+                logger.warning(
+                    f"Conversation {conversation_id} not found in Chatwoot (404). "
+                    f"Possibly deleted. Skipping labels update."
                 )
-                logger.info(f"✓ Successfully added labels to conversation {conversation_id} via POST")
-                return response
-            except Exception as post_error:
-                logger.error(f"Failed to add labels via both PUT and POST: {post_error}", exc_info=True)
+                # Не пробрасываем исключение, просто логируем предупреждение
+                return {}
+            else:
+                # Другие HTTP ошибки
+                logger.error(
+                    f"HTTP error {http_error.response.status_code} while adding labels "
+                    f"to conversation {conversation_id}: {http_error}"
+                )
                 raise
+        except Exception as e:
+            logger.error(f"Failed to add labels to conversation {conversation_id}: {e}", exc_info=True)
+            raise
     
     async def send_message(
         self,
