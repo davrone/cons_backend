@@ -281,10 +281,23 @@ async def pull_queue_closing():
                 from_date = f"{INITIAL_FROM_DATE}T00:00:00"
                 logger.info("First run — loading from %s", from_date)
             
+            # ВАЖНО: Получаем текущую дату ДО инициализации last_processed_at
+            # Это нужно для ограничения last_sync текущей датой (не используем будущие даты)
+            current_date = datetime.now(timezone.utc)
+            current_date_str = current_date.strftime("%Y-%m-%d")
+            
             total_processed = 0
             skip = 0
             error_logs = 0
             last_processed_at: Optional[datetime] = None
+            # ВАЖНО: Инициализируем last_processed_at текущей датой, если нет last_sync
+            # Это гарантирует, что мы не будем использовать будущие даты
+            if last_sync:
+                # Если есть last_sync, используем его, но ограничиваем текущей датой
+                last_processed_at = min(last_sync, current_date)
+            else:
+                # Если нет last_sync, используем текущую дату
+                last_processed_at = current_date
             
             # Инициализируем ChatwootClient для отправки уведомлений
             chatwoot_client = None
@@ -296,9 +309,6 @@ async def pull_queue_closing():
                     logger.warning("Chatwoot credentials not configured, skipping notifications")
             except Exception as e:
                 logger.warning(f"Failed to initialize Chatwoot client: {e}, continuing without notifications")
-            
-            current_date = datetime.now(timezone.utc)
-            current_date_str = current_date.strftime("%Y-%m-%d")
             
             while True:
                 # Формируем фильтр по полю "Дата" (не Period)
@@ -338,10 +348,26 @@ async def pull_queue_closing():
                         await process_queue_closing_item(db, item, chatwoot_client, current_date)
                         
                         # Обновляем last_processed_at по полю "Дата"
+                        # ВАЖНО: Ограничиваем last_processed_at текущей датой (не используем будущие даты)
+                        # Это предотвращает сдвиг last_sync в будущее из-за запланированных закрытий очереди
                         date_value = clean_datetime(item.get("Дата"))
                         if date_value:
-                            if last_processed_at is None or date_value > last_processed_at:
-                                last_processed_at = date_value
+                            # Ограничиваем дату текущей датой
+                            if date_value > current_date:
+                                logger.debug(
+                                    f"Skipping future date for last_sync: {date_value} (current: {current_date}) "
+                                    f"for queue closing item"
+                                )
+                                # Если last_processed_at еще не установлен, устанавливаем текущую дату
+                                if last_processed_at is None:
+                                    last_processed_at = current_date
+                                # Если last_processed_at уже установлен, но меньше current_date, обновляем до current_date
+                                elif last_processed_at < current_date:
+                                    last_processed_at = current_date
+                            else:
+                                # Дата в прошлом или настоящем - используем её
+                                if last_processed_at is None or date_value > last_processed_at:
+                                    last_processed_at = date_value
                         
                         total_processed += 1
                     except Exception as e:
@@ -354,11 +380,14 @@ async def pull_queue_closing():
                 await db.commit()
                 
                 # ВАЖНО: Сохраняем sync_state после каждого батча для устойчивости при прерывании
+                # ВАЖНО: Ограничиваем last_processed_at текущей датой перед сохранением
                 if last_processed_at:
+                    # Ограничиваем текущей датой (не используем будущие даты)
+                    sync_date_to_save = min(last_processed_at, current_date)
                     try:
-                        await save_sync_date(db, last_processed_at)
+                        await save_sync_date(db, sync_date_to_save)
                         await db.commit()
-                        logger.debug(f"✓ Sync state saved after batch: {last_processed_at}")
+                        logger.debug(f"✓ Sync state saved after batch: {sync_date_to_save}")
                     except Exception as sync_error:
                         logger.warning(f"Failed to save sync state after batch: {sync_error}")
                         # Не прерываем выполнение, продолжаем обработку
@@ -369,10 +398,13 @@ async def pull_queue_closing():
                 skip += PAGE_SIZE
             
             # Финальное сохранение даты синхронизации (на случай если последний батч не сохранил)
+            # ВАЖНО: Ограничиваем last_processed_at текущей датой перед сохранением
             if last_processed_at:
-                await save_sync_date(db, last_processed_at)
+                # Ограничиваем текущей датой (не используем будущие даты)
+                sync_date_to_save = min(last_processed_at, current_date)
+                await save_sync_date(db, sync_date_to_save)
                 await db.commit()
-                logger.info("✓ Final sync date saved: %s", last_processed_at)
+                logger.info("✓ Final sync date saved: %s", sync_date_to_save)
             
             logger.info("Queue closing sync completed. Total processed: %s", total_processed)
     

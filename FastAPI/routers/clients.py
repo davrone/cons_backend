@@ -495,33 +495,33 @@ async def _sync_client_to_onec(
     onec_client = OneCClient()
     
     try:
-        # Если у клиента есть cl_ref_key, проверяем его Parent_Key в ЦЛ
+        # Если у клиента есть cl_ref_key, проверяем его Parent_Key в ЦЛ напрямую
         if client.cl_ref_key:
             logger.info(f"Client {client.client_id} has cl_ref_key={client.cl_ref_key[:20]}, checking Parent_Key in ЦЛ")
             
-            # Получаем данные клиента из ЦЛ для проверки Parent_Key
-            # Используем поиск по ИНН и коду абонента для получения актуальных данных
-            existing_client_data = await onec_client.find_client_by_code_and_inn(
-                code_abonent=client.code_abonent,
-                org_inn=client.org_inn
-            )
+            # ВАЖНО: Получаем данные клиента напрямую по Ref_Key для проверки Parent_Key
+            # Это предотвращает создание дублей, когда клиент уже существует с правильным Parent_Key
+            existing_client_data = await onec_client.get_client_by_ref_key(client.cl_ref_key)
             
-            # Если не найден по коду и ИНН, пробуем найти по cl_ref_key через поиск по ИНН
-            if not existing_client_data:
-                existing_client_data = await onec_client.find_client_by_inn(client.org_inn)
-            
-            # Проверяем Parent_Key найденного клиента
             if existing_client_data:
                 existing_parent_key = existing_client_data.get("Parent_Key")
                 existing_ref_key = existing_client_data.get("Ref_Key")
                 
-                # Если найденный клиент имеет другой Ref_Key или другой Parent_Key - создаем дубль
-                if existing_ref_key != client.cl_ref_key or existing_parent_key != REQUIRED_PARENT_KEY:
+                # Проверяем, что Ref_Key совпадает (на всякий случай)
+                if existing_ref_key != client.cl_ref_key:
                     logger.warning(
                         f"Client {client.client_id} has cl_ref_key={client.cl_ref_key[:20]}, "
-                        f"but found client in ЦЛ with Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
-                        f"Parent_Key={existing_parent_key}. "
-                        f"Required Parent_Key={REQUIRED_PARENT_KEY}. "
+                        f"but ЦЛ returned different Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}. "
+                        f"This should not happen. Resetting cl_ref_key and searching again."
+                    )
+                    client.cl_ref_key = None
+                    await db.flush()
+                    # Продолжаем выполнение - найдем клиента по коду и ИНН ниже
+                elif existing_parent_key != REQUIRED_PARENT_KEY:
+                    # Parent_Key не тот - создаем дубль с нужным Parent_Key
+                    logger.warning(
+                        f"Client {client.client_id} has cl_ref_key={client.cl_ref_key[:20]}, "
+                        f"but Parent_Key in ЦЛ={existing_parent_key} (incorrect, required: {REQUIRED_PARENT_KEY}). "
                         f"Creating duplicate client with correct Parent_Key."
                     )
                     # Сбрасываем cl_ref_key и создаем нового клиента
@@ -558,6 +558,15 @@ async def _sync_client_to_onec(
                     else:
                         logger.debug(f"No fields to update for client {client.client_id} in 1C")
                     return
+            else:
+                # Клиент не найден по Ref_Key - возможно был удален в ЦЛ
+                logger.warning(
+                    f"Client {client.client_id} has cl_ref_key={client.cl_ref_key[:20]}, "
+                    f"but client not found in ЦЛ. Resetting cl_ref_key and searching again."
+                )
+                client.cl_ref_key = None
+                await db.flush()
+                # Продолжаем выполнение - найдем клиента по коду и ИНН ниже
         
         # Клиента нет в 1C или нужно создать дубль - ищем существующего по коду абонента и ИНН
         # Для создания нужен code_abonent

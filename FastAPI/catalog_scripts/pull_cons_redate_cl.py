@@ -18,13 +18,15 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from urllib.parse import quote
 
 import requests
+import asyncpg
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.exc import OperationalError
 
 # Добавляем корень проекта для корректного импорта
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -329,6 +331,11 @@ async def update_cl_consultation_date(
 
 
 async def process_batch(db: AsyncSession, batch: List[Dict[str, Any]]):
+    """
+    Обрабатывает батч записей о переносах консультаций.
+    
+    ВАЖНО: Сортирует записи по cons_key для предотвращения deadlocks при параллельной обработке.
+    """
     rows: List[Dict[str, Any]] = []
     latest_period: Optional[datetime] = None
     for item in batch:
@@ -362,6 +369,10 @@ async def process_batch(db: AsyncSession, batch: List[Dict[str, Any]]):
                 latest_period = period_dt
 
     if rows:
+        # ВАЖНО: Сортируем по cons_key для предотвращения deadlocks
+        # Это гарантирует, что все процессы обрабатывают записи в одинаковом порядке
+        rows.sort(key=lambda r: r["cons_key"] or "")
+        
         # Вставляем записи и получаем ключи новых записей
         new_keys = await upsert_redate_rows(db, rows)
         
@@ -463,26 +474,69 @@ async def pull_cons_redate():
                 if not batch:
                     break
 
-                try:
-                    processed, latest_period = await process_batch(db, batch)
-                    if latest_period:
-                        # Нормализуем оба datetime к UTC перед сравнением
-                        if latest_period.tzinfo is None:
-                            latest_period = latest_period.replace(tzinfo=timezone.utc)
-                        if last_period_processed is None:
-                            last_period_processed = latest_period
-                        else:
-                            if last_period_processed.tzinfo is None:
-                                last_period_processed = last_period_processed.replace(tzinfo=timezone.utc)
-                            if latest_period > last_period_processed:
+                # Обрабатываем батч с retry для deadlock ошибок
+                max_deadlock_retries = 3
+                deadlock_retry_delay = 0.1  # Начальная задержка в секундах
+                processed = None
+                latest_period = None
+                
+                for deadlock_attempt in range(1, max_deadlock_retries + 1):
+                    try:
+                        processed, latest_period = await process_batch(db, batch)
+                        if latest_period:
+                            # Нормализуем оба datetime к UTC перед сравнением
+                            if latest_period.tzinfo is None:
+                                latest_period = latest_period.replace(tzinfo=timezone.utc)
+                            if last_period_processed is None:
                                 last_period_processed = latest_period
-                except Exception as exc:
-                    if error_logs < MAX_ERROR_LOGS:
-                        etl_logger.batch_error(batch_num, exc, skip)
-                    elif error_logs == MAX_ERROR_LOGS:
-                        logger.warning("[pull_cons_redate_cl] Further redate processing errors suppressed")
-                    error_logs += 1
-                    await db.rollback()
+                            else:
+                                if last_period_processed.tzinfo is None:
+                                    last_period_processed = last_period_processed.replace(tzinfo=timezone.utc)
+                                if latest_period > last_period_processed:
+                                    last_period_processed = latest_period
+                        
+                        # Успешно обработали, выходим из retry цикла
+                        break
+                    except Exception as exc:
+                        # Проверяем, является ли это deadlock ошибкой
+                        is_deadlock = False
+                        
+                        # Проверяем различные варианты deadlock ошибок
+                        if isinstance(exc, OperationalError):
+                            # SQLAlchemy оборачивает asyncpg исключения в OperationalError
+                            orig_exc = getattr(exc, 'orig', None)
+                            if isinstance(orig_exc, asyncpg.exceptions.DeadlockDetectedError):
+                                is_deadlock = True
+                        elif isinstance(exc, asyncpg.exceptions.DeadlockDetectedError):
+                            # Прямое исключение asyncpg (маловероятно, но возможно)
+                            is_deadlock = True
+                        elif "deadlock detected" in str(exc).lower():
+                            # Fallback: проверка по тексту ошибки
+                            is_deadlock = True
+                        
+                        if is_deadlock and deadlock_attempt < max_deadlock_retries:
+                            # Deadlock - делаем rollback и retry с задержкой
+                            await db.rollback()
+                            wait_time = deadlock_retry_delay * (2 ** (deadlock_attempt - 1))
+                            logger.warning(
+                                f"[pull_cons_redate_cl] Deadlock detected in batch {batch_num} "
+                                f"(attempt {deadlock_attempt}/{max_deadlock_retries}). "
+                                f"Retrying in {wait_time:.2f}s..."
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            # Не deadlock или исчерпаны попытки - логируем и прерываем
+                            if error_logs < MAX_ERROR_LOGS:
+                                etl_logger.batch_error(batch_num, exc, skip)
+                            elif error_logs == MAX_ERROR_LOGS:
+                                logger.warning("[pull_cons_redate_cl] Further redate processing errors suppressed")
+                            error_logs += 1
+                            await db.rollback()
+                            break
+                
+                # Если не удалось обработать батч после всех retry, прерываем цикл
+                if processed is None:
                     break
 
                 await db.commit()

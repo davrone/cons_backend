@@ -57,12 +57,16 @@ class ManagerSelector:
             current_time = datetime.now(timezone.utc)
         
         # Базовый запрос: активные менеджеры с лимитами и разрешением на консультации
+        # ВАЖНО: Исключаем менеджера "<не определено>" из основного выбора
+        # Он используется только как fallback, если нет других доступных менеджеров
+        UNDEFINED_MANAGER_KEY = "062699c7-24b2-11e9-a1e3-60a44cafb67d"
         query = select(User).where(
             User.deletion_mark == False,
             User.invalid == False,
             User.consultation_enabled == True,  # Только менеджеры с разрешением на консультации
             User.con_limit.isnot(None),
             User.con_limit > 0,
+            User.cl_ref_key != UNDEFINED_MANAGER_KEY,  # Исключаем "<не определено>" из основного выбора
         )
         
         # ВАЖНО: Для "Консультация по ведению учёта" применяем дополнительные фильтры:

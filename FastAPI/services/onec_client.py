@@ -590,6 +590,33 @@ class OneCClient:
         logger.info(f"Marked 1C consultation as deleted (DeletionMark=true): Ref_Key={ref_key}")
         return response
 
+    async def get_client_by_ref_key(self, ref_key: str) -> Optional[Dict[str, Any]]:
+        """
+        Получить клиента (Catalog_Контрагенты) по Ref_Key напрямую.
+        
+        Args:
+            ref_key: Ref_Key клиента в 1C:ЦЛ
+        
+        Returns:
+            Dict с данными клиента, включая Parent_Key, или None если не найден
+        """
+        if not ref_key:
+            return None
+        
+        endpoint = f"/{self.clients_entity}(guid'{ref_key}')"
+        params = {
+            "$format": "json",
+            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
+        }
+        try:
+            response = await self._odata_request("GET", endpoint, params=params)
+            return response if isinstance(response, dict) else None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                # Клиент не найден
+                return None
+            raise
+
     async def find_client_by_inn(self, org_inn: Optional[str]) -> Optional[Dict[str, Any]]:
         """Поиск клиента (Catalog_Контрагенты) по ИНН."""
         if not org_inn:

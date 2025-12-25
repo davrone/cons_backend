@@ -615,11 +615,22 @@ def _build_client_display_name(client: Client) -> str:
     Читаемое имя клиента для 1С по правилу: CLOBUS + Наименование + КодАбонентаClobus + ИНН.
     
     Использует company_name если есть, иначе name или contact_name.
+    
+    ВАЖНО: Если company_name уже содержит "Clobus" или "CLOBUS" (регистронезависимо),
+    не добавляем префикс "Clobus" повторно, чтобы избежать дублирования.
     """
     # Используем company_name если есть, иначе name или contact_name
     base_name = client.company_name or client.name or client.contact_name or "Клиент"
     
-    parts = ["Clobus", base_name]
+    # ВАЖНО: Проверяем, начинается ли base_name с "Clobus" или "CLOBUS" (регистронезависимо)
+    # Если да, не добавляем префикс "Clobus" повторно
+    base_name_lower = base_name.strip().lower()
+    if base_name_lower.startswith("clobus"):
+        # Уже содержит Clobus - используем как есть
+        parts = [base_name]
+    else:
+        # Не содержит Clobus - добавляем префикс
+        parts = ["Clobus", base_name]
     
     # Добавляем код абонента если есть
     if client.code_abonent:
