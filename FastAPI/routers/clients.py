@@ -511,11 +511,13 @@ async def _sync_client_to_onec(
         logger.info(f"  org_inn (БД): '{client.org_inn}' (type: {type(client.org_inn).__name__})")
         logger.info(f"  client_id (БД): {client.client_id}")
         logger.info(f"  cl_ref_key (БД): {client.cl_ref_key[:20] if client.cl_ref_key else 'None'}")
+        logger.info(f"  parent_key (БД): {client.parent_key if hasattr(client, 'parent_key') else 'None'}")
         
-        # Ищем клиента по коду абонента и ИНН
+        # Ищем клиента по коду абонента и ИНН в папке CLOBUS
         existing_client = await onec_client.find_client_by_code_and_inn(
             code_abonent=client.code_abonent,
-            org_inn=client.org_inn
+            org_inn=client.org_inn,
+            parent_key=REQUIRED_PARENT_KEY  # Ищем ТОЛЬКО в папке CLOBUS
         )
         
         logger.info(f"Search result for client {client.client_id}: existing_client={'Found' if existing_client else 'NOT FOUND'}")
@@ -554,7 +556,9 @@ async def _sync_client_to_onec(
                         f"updating to correct Ref_Key={existing_ref_key[:20]} found by INN+code"
                     )
                 
+                # Сохраняем cl_ref_key и parent_key
                 client.cl_ref_key = existing_ref_key
+                client.parent_key = existing_parent_key
                 await db.flush()
                 
                 display_name = _build_client_display_name(client)
@@ -603,8 +607,9 @@ async def _sync_client_to_onec(
         ref_key = response.get("Ref_Key")
         if ref_key:
             client.cl_ref_key = ref_key
+            client.parent_key = REQUIRED_PARENT_KEY  # Сохраняем parent_key после создания
             await db.flush()
-            logger.info(f"✓ Created client {client.client_id} in 1C:ЦЛ (Ref_Key={ref_key[:20]})")
+            logger.info(f"✓ Created client {client.client_id} in 1C:ЦЛ (Ref_Key={ref_key[:20]}, Parent_Key={REQUIRED_PARENT_KEY})")
         else:
             logger.warning(f"1C returned response without Ref_Key for client {client.client_id}: {response}")
     except Exception as e:

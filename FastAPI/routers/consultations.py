@@ -695,12 +695,13 @@ async def _ensure_owner_synced_with_cl(
     # ВАЖНО: Всегда ищем клиента по коду абонента и ИНН, НЕ по cl_ref_key
     # cl_ref_key может указывать на удаленного дубля в ЦЛ
     try:
-        # Ищем клиента по коду абонента и ИНН (приоритетно)
+        # Ищем клиента по коду абонента и ИНН в папке CLOBUS (приоритетно)
         if owner.code_abonent:
             logger.info(f"Searching for existing client in 1C by code_abonent={owner.code_abonent} and INN={owner.org_inn}")
             existing = await onec_client.find_client_by_code_and_inn(
                 code_abonent=owner.code_abonent,
-                org_inn=owner.org_inn
+                org_inn=owner.org_inn,
+                parent_key=REQUIRED_PARENT_KEY  # Ищем ТОЛЬКО в папке CLOBUS
             )
         else:
             logger.info(f"Searching for existing client in 1C by INN: {owner.org_inn}")
@@ -728,10 +729,12 @@ async def _ensure_owner_synced_with_cl(
                     f"updating to correct Ref_Key={ref_key[:20]} found by INN+code"
                 )
             
+            # Сохраняем cl_ref_key и parent_key
             owner.cl_ref_key = ref_key
+            owner.parent_key = existing_parent_key
             owner.code_abonent = owner.code_abonent or existing.get("КодАбонентаClobus")
             await db.flush()
-            logger.info(f"✓ Saved cl_ref_key to owner: {ref_key}")
+            logger.info(f"✓ Saved cl_ref_key and parent_key to owner: {ref_key}")
             return owner
         else:
             # Parent_Key не тот - создаем дубль с правильным Parent_Key
@@ -776,10 +779,12 @@ async def _ensure_owner_synced_with_cl(
         logger.error(f"✗ 1C returned response without Ref_Key: {created}")
         return owner
     
+    # Сохраняем cl_ref_key и parent_key
     owner.cl_ref_key = ref_key
+    owner.parent_key = REQUIRED_PARENT_KEY
     owner.code_abonent = created.get("КодАбонентаClobus") or owner.code_abonent
     await db.flush()
-    logger.info(f"✓ Saved cl_ref_key to owner: {ref_key}")
+    logger.info(f"✓ Saved cl_ref_key and parent_key to owner: {ref_key}, {REQUIRED_PARENT_KEY}")
     return owner
 
 

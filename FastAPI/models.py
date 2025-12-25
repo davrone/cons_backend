@@ -30,7 +30,8 @@ class Client(Base):
 
     client_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.uuid_generate_v4())
     client_id_hash = Column(Text, unique=True, nullable=True)
-    cl_ref_key = Column(Text, nullable=True)  # TEXT из ЦЛ
+    cl_ref_key = Column(Text, nullable=True)  # TEXT из ЦЛ (Ref_Key)
+    parent_key = Column(Text, nullable=True)  # Parent_Key из ЦЛ (папка контрагента)
     email = Column(Text, nullable=True)
     phone_number = Column(Text, nullable=True)
     country = Column(Text, nullable=True)

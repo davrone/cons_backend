@@ -157,6 +157,9 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
     if not ref_key:
         return False, False
     
+    # ВАЖНО: Извлекаем Parent_Key из ЦЛ
+    parent_key = clean_uuid(item.get("Parent_Key"))
+    
     # Извлекаем code_abonent для проверки дублей
     code_abonent = item.get("КодАбонентаClobus")
     if code_abonent == "0" or not code_abonent:
@@ -340,6 +343,10 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
         if existing_client.cl_ref_key and existing_client.is_parent != is_parent:
             existing_client.is_parent = is_parent
             updated = True
+        # ВАЖНО: Обновляем parent_key из ЦЛ
+        if parent_key and existing_client.parent_key != parent_key:
+            existing_client.parent_key = parent_key
+            updated = True
         
         return False, updated
     else:
@@ -348,6 +355,7 @@ async def upsert_client(db: AsyncSession, item: Dict[str, Any]) -> Tuple[bool, b
         # ВАЖНО: Используем очищенное название компании (без маски)
         new_client = Client(
             cl_ref_key=ref_key,
+            parent_key=parent_key,  # Сохраняем Parent_Key из ЦЛ
             email=email,
             phone_number=phone,
             org_inn=org_inn,

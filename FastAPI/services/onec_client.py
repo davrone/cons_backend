@@ -606,7 +606,7 @@ class OneCClient:
         endpoint = f"/{self.clients_entity}(guid'{ref_key}')"
         params = {
             "$format": "json",
-            "$select": "Ref_Key,Description,ИНН,ИННФизЛица,КодАбонентаClobus,Parent_Key",
+            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key,DeletionMark",
         }
         try:
             response = await self._odata_request("GET", endpoint, params=params)
@@ -628,9 +628,8 @@ class OneCClient:
         filter_value = org_inn.replace("'", "''")
         params = {
             "$format": "json",
-            "$top": "1",
-            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
-            "$filter": f"ИНН eq '{filter_value}'",
+            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key,DeletionMark",
+            "$filter": f"ИНН eq '{filter_value}' and DeletionMark eq false",
         }
         response = await self._odata_request("GET", f"/{self.clients_entity}", params=params)
         rows = response.get("value", []) if isinstance(response, dict) else []
@@ -639,7 +638,8 @@ class OneCClient:
     async def find_client_by_code_and_inn(
         self, 
         code_abonent: Optional[str], 
-        org_inn: Optional[str]
+        org_inn: Optional[str],
+        parent_key: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Поиск клиента (Catalog_Контрагенты) по коду абонента и ИНН.
@@ -647,7 +647,14 @@ class OneCClient:
         Возвращает клиента, если найден по обоим параметрам.
         Если code_abonent не указан, ищет только по ИНН.
         
-        ВАЖНО: В 1С:ЦЛ есть только одно поле ИНН (используется и для юр. лиц, и для физ. лиц)
+        ВАЖНО: 
+        - В 1С:ЦЛ есть только одно поле ИНН (используется и для юр. лиц, и для физ. лиц)
+        - Если parent_key указан, ищет ТОЛЬКО в этой папке (предотвращает изменение клиентов из чужих папок)
+        
+        Args:
+            code_abonent: Код абонента
+            org_inn: ИНН клиента
+            parent_key: Parent_Key папки (по умолчанию CLOBUS)
         
         Returns:
             Dict с данными клиента, включая Parent_Key, или None если не найден
@@ -655,20 +662,33 @@ class OneCClient:
         if not org_inn:
             return None
         
+        # По умолчанию ищем в папке CLOBUS
+        if parent_key is None:
+            parent_key = "7ccd31ca-887b-11eb-938b-00e04cd03b68"
+        
         filter_value_inn = org_inn.replace("'", "''")
         
-        # Формируем фильтр - ищем по КодАбонентаClobus И ИНН
+        # Формируем фильтр - ищем по КодАбонентаClobus И ИНН И Parent_Key
+        filter_parts = []
+        
+        # ВАЖНО: КодАбонентаClobus - это числовое поле, передаем БЕЗ кавычек
         if code_abonent:
-            filter_value_code = code_abonent.replace("'", "''")
-            filter_str = f"КодАбонентаClobus eq '{filter_value_code}' and ИНН eq '{filter_value_inn}'"
-        else:
-            filter_str = f"ИНН eq '{filter_value_inn}'"
+            # Убираем кавычки - это число, а не строка
+            filter_parts.append(f"КодАбонентаClobus eq {code_abonent}")
+        
+        # ИНН - строковое поле, передаем В кавычках
+        filter_value_inn = org_inn.replace("'", "''")
+        filter_parts.append(f"ИНН eq '{filter_value_inn}'")
+        
+        # Parent_Key - GUID
+        filter_parts.append(f"Parent_Key eq guid'{parent_key}'")
+        
+        filter_str = " and ".join(filter_parts)
         
         params = {
             "$format": "json",
-            "$top": "1",
-            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
-            "$filter": filter_str,
+            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key,DeletionMark",
+            "$filter": f"{filter_str} and DeletionMark eq false",
         }
         
         logger.info(f"=== Searching client in 1C ===")
@@ -681,15 +701,35 @@ class OneCClient:
         
         if rows:
             logger.info(f"=== Found {len(rows)} client(s) in 1C ===")
-            for row in rows:
-                logger.info(f"  Ref_Key: {row.get('Ref_Key')}")
-                logger.info(f"  КодАбонентаClobus (ЦЛ): '{row.get('КодАбонентаClobus')}' (type: {type(row.get('КодАбонентаClobus')).__name__})")
-                logger.info(f"  ИНН (ЦЛ): '{row.get('ИНН')}' (type: {type(row.get('ИНН')).__name__})")
-                logger.info(f"  Parent_Key: {row.get('Parent_Key')}")
+            
+            # Если найдено несколько клиентов - проверяем на дубли
+            if len(rows) > 1:
+                logger.warning(f"!!! DUPLICATES DETECTED: Found {len(rows)} clients with same INN+Parent_Key !!!")
+                
+                # Если указан code_abonent, фильтруем по нему на стороне Python
+                # (т.к. OData фильтр по КодАбонентаClobus может не работать если поле пустое в 1C)
+                if code_abonent:
+                    matching_clients = [r for r in rows if r.get('КодАбонентаClobus') == code_abonent]
+                    if matching_clients:
+                        logger.info(f"  Found {len(matching_clients)} client(s) matching code_abonent='{code_abonent}'")
+                        rows = matching_clients
+                    else:
+                        logger.warning(f"  No clients have КодАбонентаClobus='{code_abonent}', will use first found")
+                
+                # Если все еще дубли - берем первого и логируем
+                if len(rows) > 1:
+                    logger.warning(f"  Still {len(rows)} duplicates after filtering, using first one")
+            
+            for i, row in enumerate(rows[:3]):  # Логируем первые 3 для дебага
+                logger.info(f"  Client {i+1}: Ref_Key={row.get('Ref_Key')}")
+                logger.info(f"    КодАбонентаClobus (ЦЛ): '{row.get('КодАбонентаClobus')}' (type: {type(row.get('КодАбонентаClobus')).__name__})")
+                logger.info(f"    ИНН (ЦЛ): '{row.get('ИНН')}' (type: {type(row.get('ИНН')).__name__})")
+                logger.info(f"    Parent_Key: {row.get('Parent_Key')}")
+                logger.info(f"    DeletionMark: {row.get('DeletionMark')}")
         else:
             logger.warning(f"=== NO client found in 1C ===")
             logger.warning(f"  Searched with: code_abonent='{code_abonent}', org_inn='{org_inn}'")
-            logger.warning(f"  Filter used: {filter_str}")
+            logger.warning(f"  Filter used: {filter_str} and DeletionMark eq false")
         
         return rows[0] if rows else None
 
@@ -705,7 +745,7 @@ class OneCClient:
         payload: Dict[str, Any] = {
             "Description": name,
             "ИНН": org_inn,
-            "КодАбонентаClobus": code_abonent,
+            "КодАбонентаClobus": int(code_abonent),
             "Parent_Key": "7ccd31ca-887b-11eb-938b-00e04cd03b68",  # Родитель по умолчанию
         }
         
@@ -789,7 +829,7 @@ class OneCClient:
             elif len(inn_cleaned) == 14:
                 payload["ЮридическоеФизическоеЛицо"] = "ФизическоеЛицо"
         if code_abonent:
-            payload["КодАбонентаClobus"] = code_abonent
+            payload["КодАбонентаClobus"] = int(code_abonent)
         
         # Обновление контактной информации (если указаны phone или email)
         if phone or email:
