@@ -505,6 +505,13 @@ async def _sync_client_to_onec(
         
         logger.info(f"Searching/updating client {client.client_id} in 1C:ЦЛ (org_inn={client.org_inn}, code_abonent={client.code_abonent})")
         
+        # КРИТИЧЕСКИ ВАЖНО: Логируем точные значения и типы перед поиском
+        logger.info(f"=== ПОИСК КЛИЕНТА В 1C ===")
+        logger.info(f"  code_abonent (БД): '{client.code_abonent}' (type: {type(client.code_abonent).__name__})")
+        logger.info(f"  org_inn (БД): '{client.org_inn}' (type: {type(client.org_inn).__name__})")
+        logger.info(f"  client_id (БД): {client.client_id}")
+        logger.info(f"  cl_ref_key (БД): {client.cl_ref_key[:20] if client.cl_ref_key else 'None'}")
+        
         # Ищем клиента по коду абонента и ИНН
         existing_client = await onec_client.find_client_by_code_and_inn(
             code_abonent=client.code_abonent,
@@ -519,12 +526,18 @@ async def _sync_client_to_onec(
             existing_inn = existing_client.get("ИНН")
             existing_code = existing_client.get("КодАбонентаClobus")
             
+            logger.info(f"=== КЛИЕНТ НАЙДЕН В 1C ===")
             logger.info(
-                f"Found client in 1C: Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
-                f"Parent_Key={existing_parent_key}, "
-                f"ИНН (ЦЛ)='{existing_inn}', "
-                f"КодАбонентаClobus (ЦЛ)='{existing_code}'"
+                f"  Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
+                f"Parent_Key={existing_parent_key}"
             )
+            logger.info(
+                f"  ИНН (ЦЛ)='{existing_inn}' (type: {type(existing_inn).__name__}), "
+                f"КодАбонентаClobus (ЦЛ)='{existing_code}' (type: {type(existing_code).__name__})"
+            )
+            logger.info(f"  Сравнение: БД ИНН='{client.org_inn}' == ЦЛ ИНН='{existing_inn}' -> {client.org_inn == existing_inn}")
+            logger.info(f"  Сравнение: БД код='{client.code_abonent}' == ЦЛ код='{existing_code}' -> {client.code_abonent == existing_code}")
+
             
             # Проверяем Parent_Key найденного клиента
             if existing_parent_key == REQUIRED_PARENT_KEY:
@@ -568,10 +581,12 @@ async def _sync_client_to_onec(
                 await db.flush()
                 # Продолжаем выполнение - создадим нового клиента ниже
         else:
+            logger.info(f"=== КЛИЕНТ НЕ НАЙДЕН В 1C ===")
             logger.info(
-                f"Client not found in 1C with code_abonent={client.code_abonent} and org_inn={client.org_inn}. "
-                f"Will create new client."
+                f"  Искали: code_abonent='{client.code_abonent}' (type: {type(client.code_abonent).__name__}), "
+                f"org_inn='{client.org_inn}' (type: {type(client.org_inn).__name__})"
             )
+            logger.info(f"  Будет создан новый клиент")
         
         # Создаем нового клиента в 1C (или дубль, если найденный имел неправильный Parent_Key)
         logger.info(f"Creating new client in 1C for client_id={client.client_id}, org_inn={client.org_inn}, code_abonent={client.code_abonent}")
@@ -832,7 +847,11 @@ async def find_or_create_client(
     # Определяем финальное значение is_parent
     final_is_parent = parent_uuid is None
     
-    logger.debug(f"Normalized values: normalized_inn={normalized_inn}, normalized_code_abonent={normalized_code_abonent}, parent_id={parent_uuid}, is_parent={final_is_parent}")
+    logger.info(f"=== НОРМАЛИЗОВАННЫЕ ЗНАЧЕНИЯ ===")
+    logger.info(f"  normalized_inn: '{normalized_inn}' (type: {type(normalized_inn).__name__ if normalized_inn else 'None'})")
+    logger.info(f"  normalized_code_abonent: '{normalized_code_abonent}' (type: {type(normalized_code_abonent).__name__ if normalized_code_abonent else 'None'})")
+    logger.info(f"  final_is_parent: {final_is_parent}")
+    logger.info(f"  parent_id: {parent_uuid}")
 
     if parent_client:
         if normalized_inn and normalized_inn != parent_client.org_inn:
@@ -1328,9 +1347,27 @@ async def create_or_update_client(
     После создания/обновления синхронизирует контакт в Chatwoot.
     """
     try:
+        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: что пришло от фронта
+        logger.info(f"=== ЗАПРОС ОТ ФРОНТА ===")
+        logger.info(f"  client_id: {payload.client_id}")
+        logger.info(f"  org_inn: '{payload.org_inn}' (type: {type(payload.org_inn).__name__ if payload.org_inn else 'None'})")
+        logger.info(f"  subscriber_id: '{payload.subscriber_id}' (type: {type(payload.subscriber_id).__name__ if payload.subscriber_id else 'None'})")
+        logger.info(f"  code_abonent: '{payload.code_abonent}' (type: {type(payload.code_abonent).__name__ if payload.code_abonent else 'None'})")
+        logger.info(f"  company_name: '{payload.company_name}'")
+        logger.info(f"  is_parent: {payload.is_parent}")
+        logger.info(f"  parent_id: {payload.parent_id}")
+        
         client = await find_or_create_client(db, payload)
         await db.commit()
         await db.refresh(client)
+        
+        logger.info(f"=== РЕЗУЛЬТАТ find_or_create_client ===")
+        logger.info(f"  client_id: {client.client_id}")
+        logger.info(f"  org_inn: '{client.org_inn}' (type: {type(client.org_inn).__name__ if client.org_inn else 'None'})")
+        logger.info(f"  code_abonent: '{client.code_abonent}' (type: {type(client.code_abonent).__name__ if client.code_abonent else 'None'})")
+        logger.info(f"  is_parent: {client.is_parent}")
+        logger.info(f"  cl_ref_key: {client.cl_ref_key[:20] if client.cl_ref_key else 'None'}")
+        logger.info(f"  company_name: '{client.company_name}'")
         
         # Получаем владельца для синхронизации в Chatwoot
         owner_client = client
