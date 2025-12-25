@@ -49,194 +49,160 @@ CLOBUS_PARENT_KEY = "7ccd31ca-887b-11eb-938b-00e04cd03b68"
 
 
 async def migrate_parent_keys():
-    """Миграция parent_key для всех клиентов (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ с batch обработкой)"""
-    onec_client = OneCClient()
+    """
+    Миграция parent_key для всех клиентов.
+    
+    ПОДХОД:
+    1. Загружаем ВСЕХ клиентов из 1C батчами ($top/$skip по 1000)
+    2. Индексируем в памяти по Ref_Key, code+inn
+    3. Загружаем клиентов из БД
+    4. Сравниваем и обновляем в памяти
+    5. Сохраняем батчами в БД
+    """
+    import requests
+    from FastAPI.config import settings
+    
+    logger.info("=" * 80)
+    logger.info("ШАГ 1: Загрузка ВСЕХ клиентов из 1C")
+    logger.info("=" * 80)
+    
+    # Загружаем всех клиентов из 1C
+    all_onec_clients = []
+    PAGE_SIZE = 1000
+    skip = 0
+    
+    while True:
+        url = f"{settings.ODATA_BASEURL_CL}/Catalog_Контрагенты"
+        params = {
+            "$format": "json",
+            "$select": "Ref_Key,Parent_Key,ИНН,КодАбонентаClobus,DeletionMark,Description",
+            "$top": PAGE_SIZE,
+            "$skip": skip,
+            "$orderby": "Ref_Key"
+        }
+        
+        try:
+            logger.info(f"Загрузка из 1C: skip={skip}, top={PAGE_SIZE}")
+            response = requests.get(
+                url,
+                params=params,
+                auth=(settings.ODATA_USER, settings.ODATA_PASSWORD),
+                timeout=120
+            )
+            response.raise_for_status()
+            data = response.json()
+            batch = data.get("value", [])
+            
+            if not batch:
+                break
+            
+            all_onec_clients.extend(batch)
+            logger.info(f"  Загружено {len(batch)} записей (всего: {len(all_onec_clients)})")
+            
+            if len(batch) < PAGE_SIZE:
+                break
+            
+            skip += PAGE_SIZE
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки из 1C: {e}")
+            break
+    
+    logger.info(f"\nВсего загружено из 1C: {len(all_onec_clients)} клиентов")
+    
+    # Индексируем клиентов из 1C
+    logger.info("\nИндексация данных из 1C...")
+    onec_by_ref = {}      # {ref_key: data}
+    onec_by_code_inn = {} # {(code, inn): data}
+    
+    for item in all_onec_clients:
+        ref_key = item.get("Ref_Key")
+        code = item.get("КодАбонентаClobus")
+        inn = item.get("ИНН")
+        
+        if ref_key:
+            onec_by_ref[ref_key] = item
+        
+        if code and code != "0" and inn:
+            key = (str(code), str(inn))
+            onec_by_code_inn[key] = item
+    
+    logger.info(f"  Индексировано по Ref_Key: {len(onec_by_ref)}")
+    logger.info(f"  Индексировано по code+inn: {len(onec_by_code_inn)}")
+    
+    # ШАГ 2: Обрабатываем клиентов из БД
+    logger.info("\n" + "=" * 80)
+    logger.info("ШАГ 2: Обработка клиентов из БД")
+    logger.info("=" * 80)
     
     async with AsyncSessionLocal() as db:
-        # Получаем всех клиентов с cl_ref_key
-        result = await db.execute(
-            select(Client).where(Client.cl_ref_key.isnot(None))
-        )
-        clients_with_ref = result.scalars().all()
+        # Загружаем ВСЕХ клиентов из БД
+        result = await db.execute(select(Client))
+        all_db_clients = result.scalars().all()
         
-        logger.info(f"Найдено {len(clients_with_ref)} клиентов с cl_ref_key")
+        logger.info(f"Всего клиентов в БД: {len(all_db_clients)}")
         
         total_updated = 0
         total_reset = 0
+        total_linked = 0
         total_not_found = 0
-        total_errors = 0
         
-        # ОПТИМИЗАЦИЯ: обрабатываем батчами по 100 штук
         BATCH_SIZE = 100
         
-        for batch_start in range(0, len(clients_with_ref), BATCH_SIZE):
-            batch = clients_with_ref[batch_start:batch_start + BATCH_SIZE]
-            logger.info(f"\n=== Обработка батча {batch_start//BATCH_SIZE + 1} ({len(batch)} клиентов) ===")
+        for batch_start in range(0, len(all_db_clients), BATCH_SIZE):
+            batch = all_db_clients[batch_start:batch_start + BATCH_SIZE]
             
-            # 1. Собираем все ref_keys из батча
-            ref_keys = [c.cl_ref_key for c in batch]
-            
-            # 2. Запрашиваем ВСЕ клиенты из батча ОДНИМ запросом к 1C
-            # Используем filter по Ref_Key с оператором in (через несколько запросов, т.к. OData не поддерживает большие in)
-            clients_data = {}
-            
-            # Делим на подбатчи по 50 (ограничение OData $filter длины)
-            for sub_batch_start in range(0, len(ref_keys), 50):
-                sub_batch_keys = ref_keys[sub_batch_start:sub_batch_start + 50]
-                
-                # Формируем фильтр: Ref_Key eq guid'...' or Ref_Key eq guid'...'
-                filter_parts = [f"Ref_Key eq guid'{key}'" for key in sub_batch_keys]
-                filter_str = " or ".join(filter_parts)
-                
-                try:
-                    import requests
-                    from FastAPI.config import settings
+            for client in batch:
+                # СЛУЧАЙ 1: У клиента есть cl_ref_key - проверяем в 1C
+                if client.cl_ref_key:
+                    onec_data = onec_by_ref.get(client.cl_ref_key)
                     
-                    url = f"{settings.ODATA_BASEURL_CL}/Catalog_Контрагенты"
-                    params = {
-                        "$format": "json",
-                        "$select": "Ref_Key,Parent_Key,ИНН,КодАбонентаClobus,DeletionMark",
-                        "$filter": filter_str
-                    }
-                    
-                    response = requests.get(
-                        url,
-                        params=params,
-                        auth=(settings.ODATA_USER, settings.ODATA_PASSWORD),
-                        timeout=60
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    # Индексируем результаты по Ref_Key
-                    for item in data.get("value", []):
-                        ref_key = item.get("Ref_Key")
-                        if ref_key:
-                            clients_data[ref_key] = item
-                    
-                    logger.info(f"  Загружено {len(data.get('value', []))} записей из 1C (подбатч {sub_batch_start//50 + 1})")
-                    
-                except Exception as e:
-                    logger.error(f"  Ошибка загрузки подбатча из 1C: {e}")
-                    continue
-            
-            # 3. Обрабатываем каждого клиента из батча В ПАМЯТИ (без await)
-            for i, client in enumerate(batch, 1):
-                try:
-                    client_data = clients_data.get(client.cl_ref_key)
-                    
-                    if not client_data:
-                        logger.warning(
-                            f"  [{batch_start + i}] Клиент {client.client_id} не найден в ЦЛ "
-                            f"(cl_ref_key={client.cl_ref_key[:20]}). Сбрасываем cl_ref_key."
-                        )
+                    if not onec_data:
+                        # Не найден в 1C - сбрасываем cl_ref_key
                         client.cl_ref_key = None
                         total_not_found += 1
                         continue
                     
-                    parent_key = client_data.get("Parent_Key")
-                    inn = client_data.get("ИНН")
-                    code = client_data.get("КодАбонентаClobus")
+                    parent_key = onec_data.get("Parent_Key")
                     
-                    if (batch_start + i) % 20 == 0:  # Логируем каждого 20-го
-                        logger.info(
-                            f"  [{batch_start + i}] Клиент {client.client_id}: "
-                            f"Parent_Key={parent_key[:20] if parent_key else None}, код={code}"
-                        )
+                    # Обновляем parent_key
+                    if client.parent_key != parent_key:
+                        client.parent_key = parent_key
+                        total_updated += 1
                     
-                    # Сохраняем parent_key
-                    client.parent_key = parent_key
-                    
-                    # Проверяем, что Parent_Key правильный
+                    # Если Parent_Key НЕ CLOBUS - сбрасываем cl_ref_key
                     if parent_key != CLOBUS_PARENT_KEY:
-                        logger.warning(
-                            f"  [{batch_start + i}] Parent_Key неправильный "
-                            f"(expected: {CLOBUS_PARENT_KEY[:20]}, got: {parent_key[:20] if parent_key else None}). "
-                            f"Сбрасываем cl_ref_key."
-                        )
                         client.cl_ref_key = None
                         total_reset += 1
-                    else:
-                        total_updated += 1
-                        
-                except Exception as e:
-                    logger.error(f"  Ошибка обработки клиента {client.client_id}: {e}")
-                    total_errors += 1
-                    continue
-            
-            # 4. Коммитим батч
-            await db.commit()
-            logger.info(f"Батч сохранен ({batch_start + len(batch)} / {len(clients_with_ref)})")
-        
-        logger.info("=" * 80)
-        logger.info("ИТОГОВАЯ СТАТИСТИКА (клиенты с cl_ref_key):")
-        logger.info(f"  Обработано клиентов: {len(clients_with_ref)}")
-        logger.info(f"  Обновлено parent_key (правильный Parent_Key): {total_updated}")
-        logger.info(f"  Сброшено cl_ref_key (неправильный Parent_Key): {total_reset}")
-        logger.info(f"  Сброшено cl_ref_key (не найдено в ЦЛ): {total_not_found}")
-        logger.info(f"  Ошибок: {total_errors}")
-        logger.info("=" * 80)
-        
-        # Теперь обработаем клиентов БЕЗ cl_ref_key, но с code_abonent и org_inn
-        logger.info("\nОбработка клиентов БЕЗ cl_ref_key...")
-        result = await db.execute(
-            select(Client).where(
-                Client.cl_ref_key.is_(None),
-                Client.code_abonent.isnot(None),
-                Client.org_inn.isnot(None)
-            )
-        )
-        clients_without_ref = result.scalars().all()
-        
-        logger.info(f"Найдено {len(clients_without_ref)} клиентов без cl_ref_key (но с code+inn)")
-        
-        total_found_and_linked = 0
-        total_search_errors = 0
-        
-        # ОПТИМИЗАЦИЯ: обрабатываем батчами
-        for batch_start in range(0, len(clients_without_ref), BATCH_SIZE):
-            batch = clients_without_ref[batch_start:batch_start + BATCH_SIZE]
-            logger.info(f"\n=== Поиск батча {batch_start//BATCH_SIZE + 1} ({len(batch)} клиентов) ===")
-            
-            # Для каждого клиента в батче делаем поиск (здесь сложно оптимизировать, т.к. поиск по двум полям)
-            # Но хотя бы коммитим батчами, а не по одному
-            for i, client in enumerate(batch, 1):
-                try:
-                    # Ищем клиента в ЦЛ по code+inn в папке CLOBUS
-                    client_data = await onec_client.find_client_by_code_and_inn(
-                        code_abonent=client.code_abonent,
-                        org_inn=client.org_inn,
-                        parent_key=CLOBUS_PARENT_KEY  # Ищем только в папке CLOBUS
-                    )
+                
+                # СЛУЧАЙ 2: Нет cl_ref_key, но есть code+inn - ищем в индексе
+                elif client.code_abonent and client.org_inn:
+                    key = (str(client.code_abonent), str(client.org_inn))
+                    onec_data = onec_by_code_inn.get(key)
                     
-                    if client_data:
-                        ref_key = client_data.get("Ref_Key")
-                        parent_key = client_data.get("Parent_Key")
+                    if onec_data:
+                        parent_key = onec_data.get("Parent_Key")
+                        ref_key = onec_data.get("Ref_Key")
                         
-                        if (batch_start + i) % 20 == 0:  # Логируем каждого 20-го
-                            logger.info(
-                                f"  [{batch_start + i}] Найден: Ref_Key={ref_key[:20]}, Parent_Key={parent_key[:20]}"
-                            )
-                        
-                        # Связываем клиента
-                        client.cl_ref_key = ref_key
-                        client.parent_key = parent_key
-                        total_found_and_linked += 1
-                        
-                except Exception as e:
-                    logger.error(f"  Ошибка поиска клиента {client.client_id}: {e}")
-                    total_search_errors += 1
-                    continue
+                        # Связываем ТОЛЬКО если клиент из папки CLOBUS
+                        if parent_key == CLOBUS_PARENT_KEY:
+                            client.cl_ref_key = ref_key
+                            client.parent_key = parent_key
+                            total_linked += 1
             
             # Коммитим батч
             await db.commit()
-            logger.info(f"Батч сохранен ({batch_start + len(batch)} / {len(clients_without_ref)}, найдено: {total_found_and_linked})")
+            
+            if (batch_start + len(batch)) % 1000 == 0 or (batch_start + len(batch)) == len(all_db_clients):
+                logger.info(f"Обработано {batch_start + len(batch)} / {len(all_db_clients)} клиентов")
         
-        logger.info("=" * 80)
-        logger.info("ИТОГОВАЯ СТАТИСТИКА (клиенты без cl_ref_key):")
-        logger.info(f"  Обработано клиентов: {len(clients_without_ref)}")
-        logger.info(f"  Найдено и связано с ЦЛ: {total_found_and_linked}")
-        logger.info(f"  Ошибок поиска: {total_search_errors}")
+        logger.info("\n" + "=" * 80)
+        logger.info("ИТОГОВАЯ СТАТИСТИКА:")
+        logger.info(f"  Всего клиентов в БД: {len(all_db_clients)}")
+        logger.info(f"  Обновлено parent_key: {total_updated}")
+        logger.info(f"  Сброшено cl_ref_key (не в CLOBUS): {total_reset}")
+        logger.info(f"  Сброшено cl_ref_key (не найдено в 1C): {total_not_found}")
+        logger.info(f"  Связано по code+inn: {total_linked}")
         logger.info("=" * 80)
 
 
