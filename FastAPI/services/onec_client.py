@@ -618,7 +618,11 @@ class OneCClient:
             raise
 
     async def find_client_by_inn(self, org_inn: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Поиск клиента (Catalog_Контрагенты) по ИНН."""
+        """
+        Поиск клиента (Catalog_Контрагенты) по ИНН.
+        
+        ВАЖНО: В 1С:ЦЛ есть только одно поле ИНН (используется и для юр. лиц, и для физ. лиц)
+        """
         if not org_inn:
             return None
         filter_value = org_inn.replace("'", "''")
@@ -643,6 +647,8 @@ class OneCClient:
         Возвращает клиента, если найден по обоим параметрам.
         Если code_abonent не указан, ищет только по ИНН.
         
+        ВАЖНО: В 1С:ЦЛ есть только одно поле ИНН (используется и для юр. лиц, и для физ. лиц)
+        
         Returns:
             Dict с данными клиента, включая Parent_Key, или None если не найден
         """
@@ -651,10 +657,10 @@ class OneCClient:
         
         filter_value_inn = org_inn.replace("'", "''")
         
-        # Формируем фильтр
+        # Формируем фильтр - ищем по КодАбонентаClobus И ИНН
         if code_abonent:
             filter_value_code = code_abonent.replace("'", "''")
-            filter_str = f"ИНН eq '{filter_value_inn}' and КодАбонентаClobus eq '{filter_value_code}'"
+            filter_str = f"КодАбонентаClobus eq '{filter_value_code}' and ИНН eq '{filter_value_inn}'"
         else:
             filter_str = f"ИНН eq '{filter_value_inn}'"
         
@@ -664,8 +670,27 @@ class OneCClient:
             "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
             "$filter": filter_str,
         }
+        
+        logger.info(f"=== Searching client in 1C ===")
+        logger.info(f"  Filter: {filter_str}")
+        logger.info(f"  code_abonent (БД): '{code_abonent}' (type: {type(code_abonent).__name__})")
+        logger.info(f"  org_inn (БД): '{org_inn}' (type: {type(org_inn).__name__})")
+        
         response = await self._odata_request("GET", f"/{self.clients_entity}", params=params)
         rows = response.get("value", []) if isinstance(response, dict) else []
+        
+        if rows:
+            logger.info(f"=== Found {len(rows)} client(s) in 1C ===")
+            for row in rows:
+                logger.info(f"  Ref_Key: {row.get('Ref_Key')}")
+                logger.info(f"  КодАбонентаClobus (ЦЛ): '{row.get('КодАбонентаClobus')}' (type: {type(row.get('КодАбонентаClobus')).__name__})")
+                logger.info(f"  ИНН (ЦЛ): '{row.get('ИНН')}' (type: {type(row.get('ИНН')).__name__})")
+                logger.info(f"  Parent_Key: {row.get('Parent_Key')}")
+        else:
+            logger.warning(f"=== NO client found in 1C ===")
+            logger.warning(f"  Searched with: code_abonent='{code_abonent}', org_inn='{org_inn}'")
+            logger.warning(f"  Filter used: {filter_str}")
+        
         return rows[0] if rows else None
 
     async def create_client_odata(

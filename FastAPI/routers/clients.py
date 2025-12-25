@@ -511,9 +511,20 @@ async def _sync_client_to_onec(
             org_inn=client.org_inn
         )
         
+        logger.info(f"Search result for client {client.client_id}: existing_client={'Found' if existing_client else 'NOT FOUND'}")
+        
         if existing_client:
             existing_ref_key = existing_client.get("Ref_Key")
             existing_parent_key = existing_client.get("Parent_Key")
+            existing_inn = existing_client.get("ИНН")
+            existing_code = existing_client.get("КодАбонентаClobus")
+            
+            logger.info(
+                f"Found client in 1C: Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
+                f"Parent_Key={existing_parent_key}, "
+                f"ИНН (ЦЛ)='{existing_inn}', "
+                f"КодАбонентаClobus (ЦЛ)='{existing_code}'"
+            )
             
             # Проверяем Parent_Key найденного клиента
             if existing_parent_key == REQUIRED_PARENT_KEY:
@@ -556,8 +567,14 @@ async def _sync_client_to_onec(
                 client.cl_ref_key = None
                 await db.flush()
                 # Продолжаем выполнение - создадим нового клиента ниже
+        else:
+            logger.info(
+                f"Client not found in 1C with code_abonent={client.code_abonent} and org_inn={client.org_inn}. "
+                f"Will create new client."
+            )
         
         # Создаем нового клиента в 1C (или дубль, если найденный имел неправильный Parent_Key)
+        logger.info(f"Creating new client in 1C for client_id={client.client_id}, org_inn={client.org_inn}, code_abonent={client.code_abonent}")
         display_name = _build_client_display_name(client)
         response = await onec_client.create_client_odata(
             name=display_name,
