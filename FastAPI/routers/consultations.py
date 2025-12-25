@@ -688,47 +688,12 @@ async def _ensure_owner_synced_with_cl(
     logger.info(f"  Owner org_inn: {owner.org_inn}")
     logger.info(f"  Owner code_abonent: {owner.code_abonent}")
     
-    if owner.cl_ref_key:
-        # Проверяем Parent_Key существующего клиента в ЦЛ
-        try:
-            # Ищем клиента по коду абонента и ИНН для проверки Parent_Key
-            existing_client_data = await onec_client.find_client_by_code_and_inn(
-                code_abonent=owner.code_abonent,
-                org_inn=owner.org_inn
-            )
-            
-            if existing_client_data:
-                existing_parent_key = existing_client_data.get("Parent_Key")
-                existing_ref_key = existing_client_data.get("Ref_Key")
-                
-                # Если найденный клиент имеет другой Ref_Key или другой Parent_Key - создаем дубль
-                if existing_ref_key != owner.cl_ref_key or existing_parent_key != REQUIRED_PARENT_KEY:
-                    logger.warning(
-                        f"Owner client {owner.client_id} has cl_ref_key={owner.cl_ref_key[:20]}, "
-                        f"but found client in ЦЛ with Ref_Key={existing_ref_key[:20] if existing_ref_key else 'None'}, "
-                        f"Parent_Key={existing_parent_key}. "
-                        f"Required Parent_Key={REQUIRED_PARENT_KEY}. "
-                        f"Creating duplicate client with correct Parent_Key."
-                    )
-                    # Сбрасываем cl_ref_key и создадим нового клиента ниже
-                    owner.cl_ref_key = None
-                    await db.flush()
-                else:
-                    logger.info(f"✓ Owner already has correct cl_ref_key: {owner.cl_ref_key}")
-                    return owner
-            else:
-                # Клиент не найден в ЦЛ - возможно был удален, создадим нового
-                logger.warning(f"Owner client {owner.client_id} has cl_ref_key={owner.cl_ref_key[:20]}, but client not found in ЦЛ. Creating new client.")
-                owner.cl_ref_key = None
-                await db.flush()
-        except Exception as e:
-            logger.warning(f"Failed to verify cl_ref_key in ЦЛ: {e}. Proceeding with existing cl_ref_key.")
-            return owner
-    
     if not owner.org_inn:
         logger.error(f"✗ Owner client {owner.client_id} has no org_inn - cannot sync with 1C")
         raise HTTPException(status_code=400, detail="Owner client requires INN")
 
+    # ВАЖНО: Всегда ищем клиента по коду абонента и ИНН, НЕ по cl_ref_key
+    # cl_ref_key может указывать на удаленного дубля в ЦЛ
     try:
         # Ищем клиента по коду абонента и ИНН (приоритетно)
         if owner.code_abonent:
@@ -755,6 +720,14 @@ async def _ensure_owner_synced_with_cl(
         # Проверяем Parent_Key найденного клиента
         if existing_parent_key == REQUIRED_PARENT_KEY:
             logger.info(f"✓ Found existing client in 1C with Ref_Key: {ref_key}, Parent_Key: {existing_parent_key} (correct)")
+            
+            # Проверяем, изменился ли cl_ref_key
+            if owner.cl_ref_key and owner.cl_ref_key != ref_key:
+                logger.warning(
+                    f"Owner client {owner.client_id} had old cl_ref_key={owner.cl_ref_key[:20]}, "
+                    f"updating to correct Ref_Key={ref_key[:20]} found by INN+code"
+                )
+            
             owner.cl_ref_key = ref_key
             owner.code_abonent = owner.code_abonent or existing.get("КодАбонентаClobus")
             await db.flush()
@@ -767,6 +740,9 @@ async def _ensure_owner_synced_with_cl(
                 f"Parent_Key: {existing_parent_key} (incorrect, required: {REQUIRED_PARENT_KEY}). "
                 f"Creating duplicate client with correct Parent_Key."
             )
+            # Сбрасываем cl_ref_key перед созданием нового
+            owner.cl_ref_key = None
+            await db.flush()
             # Продолжаем выполнение - создадим нового клиента ниже
 
     if not owner.code_abonent:
