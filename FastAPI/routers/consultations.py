@@ -1245,10 +1245,17 @@ async def create_consultation(
                 detail="Client data or client_id is required"
             )
         
+        consultation_type = payload.consultation.consultation_type
+
         try:
             owner_client = await _get_owner_client(db, client)
             onec_client = OneCClient()
-            owner_client = await _ensure_owner_synced_with_cl(db, owner_client, onec_client)
+
+            # Для технической поддержки не создаем/не обновляем клиента в ЦЛ
+            if consultation_type == "Техническая поддержка":
+                logger.info("Skipping 1C client sync for technical support consultation")
+            else:
+                owner_client = await _ensure_owner_synced_with_cl(db, owner_client, onec_client)
         except HTTPException:
             raise
         except Exception as e:
@@ -2193,7 +2200,18 @@ async def create_consultation(
         logger.info(f"  owner_client.org_inn: {owner_client_org_inn}")
         logger.info(f"  owner_client.code_abonent: {owner_client_code_abonent}")
         
-        if client_key and should_send_to_cl:
+        if should_send_to_cl and not client_key:
+            logger.warning(
+                "⚠ Skipping 1C consultation creation because client is not synced with 1C yet."
+            )
+            logger.warning(f"  Owner client {owner_client_id} has no cl_ref_key (client_key is None or empty)")
+            logger.warning(
+                f"  This means the client was not created in 1C or cl_ref_key was not saved to DB"
+            )
+            logger.warning(
+                f"  Owner client details: org_inn={owner_client_org_inn}, code_abonent={owner_client_code_abonent}, name={owner_client_name}"
+            )
+        elif client_key and should_send_to_cl:
             try:
                 # Проверяем лимит консультаций в бэкенде перед отправкой в ЦЛ
                 # ВАЖНО: Приоритетно проверяем по code_abonent (выдается системой и не может быть изменен),
@@ -2342,10 +2360,9 @@ async def create_consultation(
             except Exception as e:
                 logger.error(f"✗ Failed to create 1C consultation: {e}", exc_info=True)
         else:
-            logger.warning("⚠ Skipping 1C consultation creation because client is not synced with 1C yet.")
-            logger.warning(f"  Owner client {owner_client_id} has no cl_ref_key (client_key is None or empty)")
-            logger.warning(f"  This means the client was not created in 1C or cl_ref_key was not saved to DB")
-            logger.warning(f"  Owner client details: org_inn={owner_client_org_inn}, code_abonent={owner_client_code_abonent}, name={owner_client_name}")
+            logger.info(
+                "Skipping 1C consultation creation because consultation_type does not require CL sync"
+            )
         
         # ВАЖНО: Консультация всегда сохраняется в БД, даже если внешние сервисы недоступны
         # Это позволяет системе продолжать работать при проблемах с внешними сервисами

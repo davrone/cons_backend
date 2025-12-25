@@ -606,7 +606,7 @@ class OneCClient:
         endpoint = f"/{self.clients_entity}(guid'{ref_key}')"
         params = {
             "$format": "json",
-            "$select": "Ref_Key,Description,ИНН,КодАбонентаClobus,Parent_Key",
+            "$select": "Ref_Key,Description,ИНН,ИННФизЛица,КодАбонентаClobus,Parent_Key",
         }
         try:
             response = await self._odata_request("GET", endpoint, params=params)
