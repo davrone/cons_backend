@@ -37,6 +37,8 @@ INITIAL_FROM_DATE = os.getenv("ETL_INITIAL_FROM_DATE", "2025-01-01")
 MAX_ERROR_LOGS = int(os.getenv("ETL_MAX_ERROR_LOGS", "10"))  # Максимум ошибок для логирования
 INCREMENTAL_BUFFER_DAYS = int(os.getenv("ETL_CONS_INCREMENTAL_BUFFER_DAYS", "7"))  # Буфер для инкремента
 REF_KEY_BATCH_SIZE = int(os.getenv("ETL_CONS_REF_KEY_BATCH_SIZE", "50"))  # Размер батча для запросов по Ref_Key
+# Ограничиваем длину URL: при слишком большом батче IIS/1C возвращает 404. Значение 40 ~ 1.6KB фильтр.
+MAX_REF_KEYS_PER_REQUEST = int(os.getenv("ETL_CONS_MAX_KEYS_PER_REQUEST", "40"))
 
 # Режим работы ETL: "incremental" (по умолчанию) или "open_update"
 ETL_MODE = os.getenv("ETL_CONS_MODE", "incremental")
@@ -801,9 +803,11 @@ async def pull_open_consultations_by_ref_key(db: AsyncSession, auth: tuple):
     total_created = 0
     total_errors = 0
     
-    for batch_start in range(0, len(open_ref_keys), REF_KEY_BATCH_SIZE):
-        batch_ref_keys = open_ref_keys[batch_start:batch_start + REF_KEY_BATCH_SIZE]
-        batch_num = batch_start // REF_KEY_BATCH_SIZE + 1
+    # Берем минимальный батч между настроечным и безопасным порогом по длине URL
+    effective_batch_size = max(1, min(REF_KEY_BATCH_SIZE, MAX_REF_KEYS_PER_REQUEST))
+    for batch_start in range(0, len(open_ref_keys), effective_batch_size):
+        batch_ref_keys = open_ref_keys[batch_start:batch_start + effective_batch_size]
+        batch_num = batch_start // effective_batch_size + 1
         
         # Формируем фильтр по Ref_Key: Ref_Key eq 'guid1' or Ref_Key eq 'guid2' or ...
         ref_key_filters = [f"Ref_Key eq guid'{key}'" for key in batch_ref_keys]
