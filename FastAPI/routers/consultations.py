@@ -1012,7 +1012,8 @@ def _build_chatwoot_contact_custom_attrs(
 def _build_chatwoot_labels(
     language: Optional[str],
     source: Optional[str],
-    consultation_type: Optional[str] = None
+    consultation_type: Optional[str] = None,
+    selected_software: Optional[str] = None
 ) -> List[str]:
     """
     Формируем labels для Conversation (типовое поле Chatwoot).
@@ -1058,6 +1059,18 @@ def _build_chatwoot_labels(
         consultation_type_lower = consultation_type.lower()
         if "техническая" in consultation_type_lower or "тех" in consultation_type_lower:
             labels.append("тех")
+    
+    # Маппинг выбранного ПО (бух, рт, ук)
+    if selected_software:
+        software_map = {
+            "бух": "бух",  # Бухгалтерия
+            "рт": "рт",    # Розница
+            "ук": "ук",    # Управление компанией
+        }
+        software_lower = selected_software.lower().strip()
+        label_name = software_map.get(software_lower)
+        if label_name:
+            labels.append(label_name)
     
     return labels
 
@@ -1530,17 +1543,22 @@ async def create_consultation(
             # Маппинг importance в priority (типовое поле Chatwoot)
             priority = _map_importance_to_priority(payload.consultation.importance)
             
-            # Формируем labels для language, source и consultation_type (типовое поле Chatwoot)
+            # Формируем labels для language, source, consultation_type и selected_software (типовое поле Chatwoot)
             consultation_type_for_labels = None
             if consultation and consultation.consultation_type:
                 consultation_type_for_labels = consultation.consultation_type
             elif payload.consultation.consultation_type:
                 consultation_type_for_labels = payload.consultation.consultation_type
             
+            selected_software_for_labels = None
+            if hasattr(payload.consultation, "selected_software") and payload.consultation.selected_software:
+                selected_software_for_labels = payload.consultation.selected_software
+            
             labels = _build_chatwoot_labels(
                 language=payload.consultation.lang,
                 source=source,  # Используем определенный выше source (TELEGRAM, SITE, BACKEND)
-                consultation_type=consultation_type_for_labels
+                consultation_type=consultation_type_for_labels,
+                selected_software=selected_software_for_labels
             )
             
             # Подготавливаем данные контакта (используются для поиска, создания контакта и conversation)
@@ -2492,10 +2510,19 @@ async def create_consultation(
                         wait_hours = wait_info["estimated_wait_hours"]
                         
                         if queue_position > 1:
-                            info_message_parts.append(
-                                f"Вы в очереди #{queue_position}. "
-                                f"Примерное время ожидания: {wait_hours} {'час' if wait_hours == 1 else 'часа' if wait_hours < 5 else 'часов'}."
-                            )
+                            # Формируем базовое сообщение об очереди
+                            queue_message = f"Вы в очереди #{queue_position}."
+                            
+                            # ВАЖНО: Добавляем информацию о времени ожидания если она разрешена в settings
+                            if settings.SEND_QUEUE_WAIT_TIME_MESSAGE:
+                                queue_message += (
+                                    f" Примерное время ожидания: {wait_hours} "
+                                    f"{'час' if wait_hours == 1 else 'часа' if wait_hours < 5 else 'часов'}."
+                                )
+                            else:
+                                queue_message += " (Подробнее время ожидания вы узнаете в чате)"
+                            
+                            info_message_parts.append(queue_message)
                     except Exception as e:
                         logger.warning(f"Failed to calculate wait time: {e}")
                 

@@ -2,6 +2,7 @@
 import logging
 import hashlib
 import httpx
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -34,6 +35,47 @@ def compute_client_hash(email: Optional[str], phone: Optional[str], org_inn: Opt
     
     s = "|".join(sorted(parts))
     return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def _clean_company_name(name_str: str) -> str:
+    """
+    Очищает название компании от маски "Clobus + код + ИНН".
+    Рекурсивно убирает все части маски, чтобы избежать двойной маски.
+    
+    Формат маски в 1C: "Clobus <название> <код> (<ИНН>)"
+    
+    ВАЖНО: Эта функция используется при обновлении company_name от фронта,
+    чтобы избежать дублирования маски при пересохранении в 1C.
+    """
+    if not name_str:
+        return ""
+    
+    cleaned = name_str.strip()
+    
+    # Убираем префикс "Clobus" (может быть несколько раз)
+    while True:
+        cleaned_before = cleaned
+        cleaned = re.sub(r'^Clobus\s+', '', cleaned, flags=re.IGNORECASE).strip()
+        if cleaned == cleaned_before:
+            break
+    
+    # Убираем ИНН в скобках в конце (может быть несколько раз)
+    while True:
+        cleaned_before = cleaned
+        cleaned = re.sub(r'\s*\(\d+\)\s*$', '', cleaned).strip()
+        if cleaned == cleaned_before:
+            break
+    
+    # Убираем код абонента (число в конце, может быть несколько раз)
+    # Код абонента - это число, которое стоит отдельно в конце строки
+    while True:
+        cleaned_before = cleaned
+        # Убираем число в конце, если оно стоит отдельно (перед ним пробел)
+        cleaned = re.sub(r'\s+\d+\s*$', '', cleaned).strip()
+        if cleaned == cleaned_before:
+            break
+    
+    return cleaned
 
 
 def _build_chatwoot_contact_custom_attrs(
@@ -950,7 +992,10 @@ async def find_or_create_client(
                     client.code_abonent = normalized_code_abonent
                 # ВАЖНО: Обновляем company_name только если это владелец
                 if client_data.company_name and final_is_parent:
-                    client.company_name = client_data.company_name.strip() if client_data.company_name else None
+                    # ВАЖНО: Очищаем company_name от маски перед сохранением
+                    # если фронт отправил полное название с маской
+                    cleaned_company_name = _clean_company_name(client_data.company_name.strip()) if client_data.company_name else None
+                    client.company_name = cleaned_company_name if cleaned_company_name else None
                 # Обновляем географические поля
                 if client_data.country is not None:
                     client.country = client_data.country
@@ -1031,7 +1076,9 @@ async def find_or_create_client(
                 client.code_abonent = normalized_code_abonent
             # ВАЖНО: Обновляем company_name только если это владелец
             if client_data.company_name and final_is_parent:
-                client.company_name = client_data.company_name.strip() if client_data.company_name else None
+                # ВАЖНО: Очищаем company_name от маски перед сохранением
+                cleaned_company_name = _clean_company_name(client_data.company_name.strip()) if client_data.company_name else None
+                client.company_name = cleaned_company_name if cleaned_company_name else None
             # Обновляем partner (обслуживающая организация)
             if client_data.partner is not None:
                 client.partner = client_data.partner
@@ -1124,7 +1171,9 @@ async def find_or_create_client(
             client.code_abonent = normalized_code_abonent
         # ВАЖНО: Обновляем company_name только если это владелец
         if client_data.company_name and final_is_parent:
-            client.company_name = client_data.company_name.strip() if client_data.company_name else None
+            # ВАЖНО: Очищаем company_name от маски перед сохранением
+            cleaned_company_name = _clean_company_name(client_data.company_name.strip()) if client_data.company_name else None
+            client.company_name = cleaned_company_name if cleaned_company_name else None
         # Обновляем partner (обслуживающая организация)
         if client_data.partner is not None:
             client.partner = client_data.partner
@@ -1211,7 +1260,9 @@ async def find_or_create_client(
                 client_by_code.org_inn = normalized_inn
             # ВАЖНО: Обновляем company_name только если это владелец
             if client_data.company_name and final_is_parent:
-                client_by_code.company_name = client_data.company_name.strip() if client_data.company_name else None
+                # ВАЖНО: Очищаем company_name от маски перед сохранением
+                cleaned_company_name = _clean_company_name(client_data.company_name.strip()) if client_data.company_name else None
+                client_by_code.company_name = cleaned_company_name if cleaned_company_name else None
             # Обновляем географические поля
             if client_data.country is not None:
                 client_by_code.country = client_data.country

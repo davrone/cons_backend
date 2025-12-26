@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     TECH_SUPPORT_WORKING_HOURS_START: str = Field(default="09:00", description="Время начала рабочего дня для технической поддержки (формат: HH:MM)")
     TECH_SUPPORT_WORKING_HOURS_END: str = Field(default="18:00", description="Время окончания рабочего дня для технической поддержки (формат: HH:MM)")
     
+    # Отправка сообщения об примерном времени ожидания в очереди
+    SEND_QUEUE_WAIT_TIME_MESSAGE: bool = Field(default=True, description="Отправлять ли сообщение об примерном времени ожидания в очереди (если false, отправляется только номер очереди)")
+    
     # Автор по умолчанию для создания ТелефонныйЗвонок в ЦЛ
     ONEC_DEFAULT_AUTHOR_NAME: str = Field(default="<не определено>", description="Название менеджера (description) из справочника users для использования как Автор_Key при создании консультаций в ЦЛ")
     

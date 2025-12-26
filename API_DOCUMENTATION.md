@@ -140,6 +140,7 @@ Authorization: Bearer <FRONT_BEARER_TOKEN>
     "scheduled_at": "2025-02-01T10:00:00Z",
     "lang": "ru",
     "consultation_type": "Техническая поддержка",
+    "selected_software": "бух",
     "comment": "Вопрос о работе системы",
     "online_question_cat": "uuid-категории",
     "online_question": "uuid-вопроса",
@@ -155,6 +156,11 @@ Authorization: Bearer <FRONT_BEARER_TOKEN>
 **Поля Request Body:**
 - `client` (опционально): Данные клиента. Если не указан, используется `client_id` из `consultation`.
 - `consultation`: Данные консультации (обязательно).
+  - `selected_software` (опционально): выбор ПО клиента для проставления label в Chatwoot. Допустимые значения:
+    - `"бух"` — 1С:Бухгалтерия
+    - `"рт"` — 1С:Розница
+    - `"ук"` — 1С:Управление компанией
+    При указании этого поля к созданной беседе в Chatwoot автоматически добавится соответствующий label (если метка отсутствует в Chatwoot, бэкенд попытается её создать).
 - `source` (опционально): Источник создания. Возможные значения:
   - `"SITE"` - создано через сайт (по умолчанию)
   - `"TELEGRAM"` - создано через Telegram Web App

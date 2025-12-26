@@ -61,6 +61,7 @@ class ConsultationCreate(BaseModel):
     online_question_cat: Optional[str] = None  # КатегорияВопроса_Key
     online_question: Optional[str] = None  # ВопросНаКонсультацию_Key
     consultation_type: Optional[str] = None  # Вид обращения: "Техническая поддержка" или "Консультация по ведению учёта"
+    selected_software: Optional[str] = None  # Выбранное ПО: "бух" (бухгалтерия), "рт" (розница), "ук" (управление компанией)
     importance: Optional[int] = None
     scheduled_at: Optional[datetime] = None  # Желаемая дата/время консультации
     

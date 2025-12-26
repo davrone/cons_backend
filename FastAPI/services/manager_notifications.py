@@ -10,6 +10,7 @@ from ..services.chatwoot_client import ChatwootClient
 from ..services.manager_selector import ManagerSelector
 from ..models import Consultation, User, UserMapping
 from ..utils.notification_helpers import check_and_log_notification
+from ..config import settings
 from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
@@ -252,24 +253,41 @@ async def send_queue_update_notification(
             wait_min_hours = round(wait_min_minutes / 60)
             wait_max_hours = round(wait_max_minutes / 60)
             
-            if wait_min_hours == 0 and wait_max_hours == 0:
-                message = f"📊 Вы в очереди #{queue_position}. Примерное время ожидания: от {wait_min_minutes} до {wait_max_minutes} минут."
-            elif wait_min_hours == 0:
-                hours_text_max = "час" if wait_max_hours == 1 else "часа" if wait_max_hours < 5 else "часов"
-                message = f"📊 Вы в очереди #{queue_position}. Примерное время ожидания: от {wait_min_minutes} минут до {wait_max_hours} {hours_text_max}."
+            # Формируем сообщение в зависимости от settings.SEND_QUEUE_WAIT_TIME_MESSAGE
+            queue_message = f"📊 Вы в очереди #{queue_position}."
+            
+            if settings.SEND_QUEUE_WAIT_TIME_MESSAGE:
+                # Добавляем информацию о времени ожидания
+                if wait_min_hours == 0 and wait_max_hours == 0:
+                    queue_message += f" Примерное время ожидания: от {wait_min_minutes} до {wait_max_minutes} минут."
+                elif wait_min_hours == 0:
+                    hours_text_max = "час" if wait_max_hours == 1 else "часа" if wait_max_hours < 5 else "часов"
+                    queue_message += f" Примерное время ожидания: от {wait_min_minutes} минут до {wait_max_hours} {hours_text_max}."
+                else:
+                    hours_text_min = "час" if wait_min_hours == 1 else "часа" if wait_min_hours < 5 else "часов"
+                    hours_text_max = "час" if wait_max_hours == 1 else "часа" if wait_max_hours < 5 else "часов"
+                    queue_message += f" Примерное время ожидания: от {wait_min_hours} {hours_text_min} до {wait_max_hours} {hours_text_max}."
             else:
-                hours_text_min = "час" if wait_min_hours == 1 else "часа" if wait_min_hours < 5 else "часов"
-                hours_text_max = "час" if wait_max_hours == 1 else "часа" if wait_max_hours < 5 else "часов"
-                message = f"📊 Вы в очереди #{queue_position}. Примерное время ожидания: от {wait_min_hours} {hours_text_min} до {wait_max_hours} {hours_text_max}."
+                queue_message += " (Подробнее время ожидания вы узнаете в чате)"
+            
+            message = queue_message
         else:
             # Показываем одно значение
             wait_hours = wait_info["estimated_wait_hours"]
-            if wait_hours == 0:
-                wait_minutes = wait_info["estimated_wait_minutes"]
-                message = f"✅ Вы в очереди #{queue_position}. Примерное время ожидания: {wait_minutes} минут."
+            queue_message = f"📊 Вы в очереди #{queue_position}."
+            
+            if settings.SEND_QUEUE_WAIT_TIME_MESSAGE:
+                # Добавляем информацию о времени ожидания
+                if wait_hours == 0:
+                    wait_minutes = wait_info["estimated_wait_minutes"]
+                    queue_message = f"✅ Вы в очереди #{queue_position}. Примерное время ожидания: {wait_minutes} минут."
+                else:
+                    hours_text = "час" if wait_hours == 1 else "часа" if wait_hours < 5 else "часов"
+                    queue_message = f"📊 Вы в очереди #{queue_position}. Примерное время ожидания: {wait_hours} {hours_text}."
             else:
-                hours_text = "час" if wait_hours == 1 else "часа" if wait_hours < 5 else "часов"
-                message = f"📊 Вы в очереди #{queue_position}. Примерное время ожидания: {wait_hours} {hours_text}."
+                queue_message += " (Подробнее время ожидания вы узнаете в чате)"
+            
+            message = queue_message
         
         # Генерируем уникальный ключ уведомления
         # ВАЖНО: Нормализуем manager_key для стабильного хеша (None -> "")
